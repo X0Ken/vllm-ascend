@@ -873,7 +873,31 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 )
             if current_event is not None:
                 current_event.synchronize()
+            if self.token_database.transfer_audit is not None:
+                self.token_database.transfer_audit.record(
+                    "save",
+                    req_id,
+                    group_id,
+                    keys,
+                    starts,
+                    ends,
+                    key_block_ids,
+                    addrs,
+                    sizes,
+                )
             self.m_store.put(keys, addrs, sizes)
+            if self.token_database.transfer_audit is not None:
+                self.token_database.transfer_audit.record(
+                    "save_after_put",
+                    req_id,
+                    group_id,
+                    keys,
+                    starts,
+                    ends,
+                    key_block_ids,
+                    addrs,
+                    sizes,
+                )
             if self.enable_kv_event and stored_events:
                 self.update_kv_event(stored_events)
 

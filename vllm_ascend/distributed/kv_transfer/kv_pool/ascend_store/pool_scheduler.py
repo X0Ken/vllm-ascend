@@ -39,6 +39,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     get_block_hashes,
     get_cache_family_granularity,
     infer_cache_family_ratio,
+    infer_cache_key_config,
     infer_group_cache_families,
     infer_tp_mismatch_info,
     normalize_block_ids_by_group,
@@ -182,16 +183,11 @@ class KVPoolScheduler:
         self.use_mla = False
         if hasattr(model_config, "use_mla") and isinstance(model_config.use_mla, bool) and model_config.use_mla:
             self.use_mla = True
-        if self.use_mla:
-            self.num_kv_head = 1
-        else:
-            self.num_kv_head = model_config.get_total_num_kv_heads()
-        if self.num_kv_head < self.tp_size:
-            self.put_step = self.tp_size // self.num_kv_head
-        else:
-            self.put_step = 1
+        key_config = infer_cache_key_config(model_config, self.tp_size)
+        self.num_kv_head = key_config.num_kv_heads
+        self.put_step = key_config.put_step
         self.num_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
-        self.model_name = model_config.model.split("/")[-1]
+        self.model_name = key_config.model_name
 
         # Keep this in sync with pool_worker.py because it affects GVA allocation size.
         num_layer_keys = self.num_layers if self.use_gva_layerwise else 1

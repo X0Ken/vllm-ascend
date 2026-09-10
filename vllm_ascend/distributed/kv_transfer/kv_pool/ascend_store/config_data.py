@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
@@ -13,6 +13,38 @@ from vllm.v1.core.kv_cache_utils import BlockHash, BlockHashList
 from vllm.v1.core.sched.output import NewRequestData
 
 from vllm_ascend.memcache_comm_fence import AttentionComputeStartGate
+
+if TYPE_CHECKING:
+    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.transfer_audit import KVTransferAudit
+
+
+@dataclass(frozen=True)
+class CacheKeyConfig:
+    num_kv_heads: int
+    put_step: int
+    rank_local: bool
+    model_name: str
+
+
+def infer_cache_key_config(model_config: Any, tp_size: int) -> CacheKeyConfig:
+    """Use the same key ownership on scheduler, lookup worker and I/O workers.
+
+    Sparse MLA includes indexer/compressor state whose TP replicas cannot be
+    assumed identical. Until individual buffers declare their sharing semantics,
+    keep the entire model's payload rank local, including its MLA latent buffers.
+    Ordinary MLA and replicated GQA retain their shared-key storage savings.
+    """
+    use_mla = getattr(model_config, "use_mla", False) is True
+    hf_config = getattr(model_config, "hf_text_config", None)
+    rank_local = hasattr(hf_config, "index_topk")
+    num_kv_heads = 1 if use_mla else model_config.get_total_num_kv_heads()
+    put_step = 1 if rank_local else max(tp_size // num_kv_heads, 1)
+    model_name = model_config.model.rstrip("/").split("/")[-1]
+    if rank_local:
+        # Never consume rank 0 entries left by the old shared-key scheme, or
+        # state produced using a different TP partition of the model.
+        model_name += f"@rank_local_v1_tp:{tp_size}"
+    return CacheKeyConfig(num_kv_heads, put_step, rank_local, model_name)
 
 
 @dataclass(frozen=True)
@@ -262,6 +294,7 @@ class ChunkedTokenDatabase:
         hash_block_size: int | None = None,
     ):
         self.metadata = metadata
+        self.transfer_audit: KVTransferAudit | None = None
         self.block_size = block_size
         self.group_kv_caches_base_addr: dict[int, list[int]] = {}
         self.group_block_len: dict[int, list[int]] = {}

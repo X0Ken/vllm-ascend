@@ -40,6 +40,40 @@ When `MultiConnector` is used, configure `kv_load_failure_policy` on the `MultiC
 | `consumer_is_to_load` | Whether Decode node load KV cache from KV Pool. The default value is false. |
 | `prefill_pp_size` | Prefill PP size, needs to be set when Prefill node enables PP. |
 | `prefill_pp_layer_partition` | Prefill PP layer partition, needs to be set when Prefill node enables PP. |
+| `transfer_audit_dir` | Optional diagnostic directory for per-group tensor layouts and per-block SHA-256 checksums. Requires synchronous, non-layerwise `kv_both` transfers. Disabled by default. |
+
+### Sparse MLA key ownership and diagnostics
+
+Models with `index_topk` in their text configuration can contain TP-local
+indexer or compressor state alongside the MLA latent cache. Ascend Store gives
+each TP rank its own keys for these models. Every rank saves and loads its own
+payload, and prefix lookup requires all TP ranks' keys. Ordinary MLA models
+retain shared keys. The sparse-model key namespace includes a layout version
+and TP size, so existing shared-key entries and entries from other TP sizes are
+not reused. No `force_tp_rank_keys` option is required.
+
+This conservative policy also duplicates latent buffers that might be shareable;
+at TP8, plan for up to eight times the shared-key storage footprint. Non-layerwise
+sparse saves also wait for the sender to finish reading the source buffers before
+the next forward can update or reuse them. This reduces compute/transfer overlap.
+Key ownership alone does not establish correctness of a model's group/block mapping.
+
+To diagnose that mapping, set `transfer_audit_dir` to a writable directory in
+`kv_connector_extra_config`. Each worker creates a restricted JSONL file with
+tensor shapes, strides, layer names, group/rank, key, logical cache range,
+physical block ID, byte lengths and per-buffer SHA-256 values. Save checksums
+are captured after the compute event and before `put`, then again after `put`
+returns (`save_after_put`) to detect changes to the source during transfer. Load
+checksums are captured after a successful synchronous `get`. The save records
+describe source bytes, not acknowledgements from the backend. No prompt text or
+KV contents are recorded.
+
+Checksumming copies the complete transferred payload to the host and adds
+synchronization. Enable it only for correctness diagnostics and disable it for
+performance measurements. Matching checksums verify bytes for the selected
+addresses; they do not prove that all required model state was selected. Also
+compare generated token IDs with an uncached baseline after evicting the NPU
+prefix, including long contexts and external-cache eviction.
 
 ### Environment Variable Configuration
 

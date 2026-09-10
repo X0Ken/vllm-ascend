@@ -43,6 +43,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     get_block_hashes,
     get_cache_family_granularity,
     infer_cache_family_ratio,
+    infer_cache_key_config,
     infer_group_cache_families,
     infer_tp_mismatch_info,
 )
@@ -62,6 +63,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import
     _circular_shift,
     record_failed_blocks,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.transfer_audit import KVTransferAudit
 from vllm_ascend.distributed.utils import (
     get_decode_context_model_parallel_rank,
     get_decode_context_model_parallel_world_size,
@@ -180,17 +182,12 @@ class KVPoolWorker:
         self.current_layer = 0
         self.num_layers = model_config.get_num_layers(parallel_config)
 
-        if self.use_mla:
-            self.num_kv_head = 1
-        else:
-            self.num_kv_head = model_config.get_total_num_kv_heads()
-
-        if self.num_kv_head < self.tp_size:
-            self.put_step = self.tp_size // self.num_kv_head
-            self.head_or_tp_rank = self.tp_rank // self.put_step
-        else:
-            self.head_or_tp_rank = self.tp_rank
-            self.put_step = 1
+        key_config = infer_cache_key_config(model_config, self.tp_size)
+        self.num_kv_head = key_config.num_kv_heads
+        self.put_step = key_config.put_step
+        self.rank_local_cache = key_config.rank_local
+        self.model_name = key_config.model_name
+        self.head_or_tp_rank = self.tp_rank // self.put_step
         self.my_key_index = (
             self.pcp_rank * self.dcp_size * (self.tp_size // self.put_step)
             + self.dcp_rank * (self.tp_size // self.put_step)
@@ -276,7 +273,7 @@ class KVPoolWorker:
             group_tp_rank = self.tp_rank if self.group_uses_align_state[group_id] else self.head_or_tp_rank
             self.metadata.append(
                 KeyMetadata(
-                    model_config.model.rstrip("/").split("/")[-1],
+                    self.model_name,
                     group_tp_rank,
                     self.pcp_rank,
                     self.dcp_rank,
@@ -288,6 +285,13 @@ class KVPoolWorker:
         self.token_database = ChunkedTokenDatabase(
             self.metadata, self.grouped_block_size, partitions, self.use_hybrid, self.hash_block_size
         )
+        audit_dir = extra_config.get("transfer_audit_dir")
+        if audit_dir:
+            if self.use_layerwise or self.load_async or self.kv_role != "kv_both":
+                raise ValueError("transfer_audit_dir requires non-layerwise, synchronous kv_both I/O")
+            self.token_database.transfer_audit = KVTransferAudit(
+                audit_dir, self.tp_rank, self.pp_rank, self.pcp_rank, self.dcp_rank
+            )
         self.cache_coordinator = self._build_cache_coordinator(vllm_config)
         self.token_database.cache_coordinator = self.cache_coordinator
 
@@ -663,6 +667,7 @@ class KVPoolWorker:
         group_addrs: list[int] = []
         group_block_lens: list[int] = []
         group_block_strides: list[int] = []
+        audit_layout = []
         physical_layers = set()
         for layer_name in layer_names:
             phys = self._extract_physical_layer_index(layer_name)
@@ -676,10 +681,23 @@ class KVPoolWorker:
                 group_addrs.append(base_addr)
                 group_block_lens.append(block_len)
                 group_block_strides.append(block_stride)
+                if self.token_database.transfer_audit is not None:
+                    audit_layout.append(
+                        {
+                            "layer": layer_name,
+                            "shape": list(cache.shape),
+                            "stride": list(cache.stride()),
+                            "dtype": str(cache.dtype),
+                            "block_bytes": block_len,
+                            "block_stride_bytes": block_stride,
+                        }
+                    )
         self.group_kv_caches_base_addr[group_id] = group_addrs
         self.group_block_len[group_id] = group_block_lens
         self.group_block_stride[group_id] = group_block_strides
         self.group_num_layers[group_id] = len(physical_layers)
+        if self.token_database.transfer_audit is not None:
+            self.token_database.transfer_audit.layout(group_id, audit_layout)
 
     def _align_kv_ptrs(self, registered_regions: dict[int, tuple[int, int]]):
         """
@@ -859,6 +877,8 @@ class KVPoolWorker:
             size_list = []
             key_list = []
             block_id_list: list[int] = []
+            audit = self.token_database.transfer_audit
+            audit_groups = []
             load_masks = self.token_database.load_mask(request.block_hashes, token_len)
             for group_id in load_group_ids:
                 if group_id >= len(request.block_ids_by_group):
@@ -867,6 +887,9 @@ class KVPoolWorker:
                 group_block_size = self.grouped_block_size[group_id]
                 mask_num = load_spec.vllm_cached_tokens // group_block_size * group_block_size
                 skip_null = group_id < len(self.group_uses_align_state) and self.group_uses_align_state[group_id]
+                audit_offset = len(key_list)
+                audit_starts = []
+                audit_ends = []
 
                 def chunk_filter(start: int, group_id=group_id, load_masks=load_masks) -> bool:
                     return self.token_database.mask_allows_chunk(load_masks, group_id, start)
@@ -897,6 +920,11 @@ class KVPoolWorker:
                     addr_list.append(addr)
                     size_list.append(size)
                     block_id_list.append(block_id)
+                    if audit is not None:
+                        audit_starts.append(start)
+                        audit_ends.append(end)
+                if audit is not None:
+                    audit_groups.append((group_id, audit_offset, len(key_list), audit_starts, audit_ends))
             if not key_list:
                 continue
             key_list_c = _circular_shift(key_list, self.tp_rank % len(key_list))
@@ -912,6 +940,19 @@ class KVPoolWorker:
                 key_list_c[:3],
             )
             ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
+            if audit is not None and ret is not None and len(ret) == len(key_list_c) and all(r == 0 for r in ret):
+                for group, first, last, starts, ends in audit_groups:
+                    audit.record(
+                        "load",
+                        request.req_id,
+                        group,
+                        key_list[first:last],
+                        starts,
+                        ends,
+                        block_id_list[first:last],
+                        addr_list[first:last],
+                        size_list[first:last],
+                    )
             if ret is not None and any(r != 0 for r in ret):
                 missing_block_ids = record_failed_blocks(
                     block_id_list_c,
@@ -1511,6 +1552,14 @@ class KVPoolWorker:
             send_thread.add_stored_request(request.req_id)
             send_thread.add_request(request)
 
+        if self.rank_local_cache:
+            # A later forward can update/reuse sparse cache buffers while the
+            # background sender is still reading them. The compute event above
+            # orders earlier writes only; it does not protect the source from
+            # subsequent forwards. Finish these reads before returning to the
+            # model runner. Ordinary shared MLA keeps its asynchronous path.
+            send_thread.request_queue.join()
+
     def retrieve_layer(
         self,
         request: ReqMeta,
@@ -1953,7 +2002,7 @@ class KVPoolWorker:
     def get_group_tp_size(self, kv_cache_group_id: int):
         if self.tp_mismatch:
             return self.effective_tp_size
-        if self.group_uses_align_state[kv_cache_group_id]:
+        if self.rank_local_cache or self.group_uses_align_state[kv_cache_group_id]:
             return self.tp_size
         return min(self.tp_size, self._get_group_num_kv_heads(kv_cache_group_id))
 
