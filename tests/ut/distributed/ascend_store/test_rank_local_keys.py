@@ -165,7 +165,7 @@ class TestRankLocalKeys(unittest.TestCase):
         shared = self.worker(0, sparse=False)
         shared.kv_send_thread = MagicMock()
         shared.wait_for_save(meta)
-        shared.kv_send_thread.request_queue.join.assert_not_called()
+        shared.kv_send_thread.request_queue.join.assert_called_once()
 
     def test_scheduler_and_worker_generate_identical_keys(self):
         config = MagicMock()

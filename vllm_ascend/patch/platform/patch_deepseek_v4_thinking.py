@@ -14,9 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from functools import wraps
 from typing import Any
 
 from vllm.entrypoints.chat_utils import ChatCompletionMessageParam
+from vllm.parser.deepseek_v4 import DeepSeekV4Parser
 from vllm.tokenizers import deepseek_v4, deepseek_v4_encoding
 
 REASONING_EFFORT_PROMPTS = {
@@ -43,9 +45,11 @@ REASONING_EFFORT_PROMPTS = {
         "remains unchecked and no error remains undiscovered.\n\n"
     ),
 }
+DEFAULT_REASONING_EFFORT = "low"
 
 _original_render_message = deepseek_v4_encoding.render_message
 _original_get_deepseek_v4_tokenizer = deepseek_v4.get_deepseek_v4_tokenizer
+_original_deepseek_v4_parser_init = DeepSeekV4Parser.__init__
 
 
 def _patched_render_message(
@@ -55,7 +59,7 @@ def _patched_render_message(
     drop_thinking: bool = True,
     reasoning_effort: str | None = None,
 ) -> str:
-    reasoning_effort = reasoning_effort or "low"
+    reasoning_effort = reasoning_effort or DEFAULT_REASONING_EFFORT
     if reasoning_effort not in REASONING_EFFORT_PROMPTS:
         raise ValueError(
             f"Invalid reasoning effort: {reasoning_effort}, expected one of {list(REASONING_EFFORT_PROMPTS)}"
@@ -76,7 +80,6 @@ def _patched_render_message(
 def _patched_get_deepseek_v4_tokenizer(tokenizer: deepseek_v4.HfTokenizer):
     dsv4_tokenizer = _original_get_deepseek_v4_tokenizer(tokenizer)
     tokenizer_cls = type(dsv4_tokenizer)
-    original_apply_chat_template = tokenizer_cls.apply_chat_template
 
     def apply_chat_template(
         self,
@@ -84,21 +87,78 @@ def _patched_get_deepseek_v4_tokenizer(tokenizer: deepseek_v4.HfTokenizer):
         tools: list[dict[str, Any]] | None = None,
         **kwargs,
     ) -> str | list[int]:
-        if kwargs.get("reasoning_effort") == "low":
-            kwargs = dict(kwargs)
-            kwargs["reasoning_effort"] = None
-        return original_apply_chat_template(
-            self,
+        thinking = kwargs.get("thinking")
+        enable_thinking = kwargs.get("enable_thinking")
+        thinking_enabled = bool(thinking) or bool(enable_thinking)
+        if "thinking" not in kwargs and "enable_thinking" not in kwargs:
+            thinking_enabled = True
+        thinking_mode = "thinking" if thinking_enabled else "chat"
+
+        conversation = kwargs.get("conversation", messages)
+        messages = conversation.copy()
+        if tools is not None and len(tools) > 0:
+            system_index = next(
+                (index for index, message in enumerate(messages) if message.get("role") == "system"),
+                None,
+            )
+            if system_index is None:
+                messages.insert(0, {"role": "system", "tools": tools})
+            else:
+                system_message = messages[system_index].copy()
+                system_message["tools"] = tools  # type: ignore[typeddict-unknown-key]
+                messages[system_index] = system_message
+
+        reasoning_effort = kwargs.get("reasoning_effort")
+        if not isinstance(reasoning_effort, str):
+            reasoning_effort = "high" if thinking_enabled else None
+        elif reasoning_effort == "none":
+            thinking_mode = "chat"
+            reasoning_effort = None
+        elif reasoning_effort == "max":
+            reasoning_effort = "max"
+        elif reasoning_effort in ("low", "minimal", "medium"):
+            reasoning_effort = "low"
+        else:
+            reasoning_effort = "high"
+
+        prompt_str = deepseek_v4.encode_messages(
             messages,
-            tools=tools,
-            **kwargs,
+            thinking_mode=thinking_mode,
+            drop_thinking=kwargs.get("drop_thinking", True),
+            reasoning_effort=reasoning_effort,
         )
+
+        if kwargs.get("tokenize", True):
+            tokenizer_kwargs = {key: kwargs[key] for key in ("truncation", "max_length") if key in kwargs}
+            return self.encode(
+                prompt_str,
+                add_special_tokens=False,
+                **tokenizer_kwargs,
+            )
+
+        return prompt_str
 
     tokenizer_cls.apply_chat_template = apply_chat_template
     return dsv4_tokenizer
+
+
+@wraps(_original_deepseek_v4_parser_init)
+def _patched_deepseek_v4_parser_init(
+    self: DeepSeekV4Parser,
+    *args: Any,
+    **kwargs: Any,
+) -> None:
+    chat_kwargs = kwargs.get("chat_template_kwargs") or {}
+    if "thinking" not in chat_kwargs and "enable_thinking" not in chat_kwargs:
+        chat_kwargs = dict(chat_kwargs)
+        chat_kwargs["enable_thinking"] = True
+        kwargs["chat_template_kwargs"] = chat_kwargs
+
+    _original_deepseek_v4_parser_init(self, *args, **kwargs)
 
 
 if not hasattr(deepseek_v4_encoding, "REASONING_EFFORT_PROMPTS"):
     deepseek_v4_encoding.REASONING_EFFORT_PROMPTS = REASONING_EFFORT_PROMPTS
     deepseek_v4_encoding.render_message = _patched_render_message
     deepseek_v4.get_deepseek_v4_tokenizer = _patched_get_deepseek_v4_tokenizer
+    DeepSeekV4Parser.__init__ = _patched_deepseek_v4_parser_init

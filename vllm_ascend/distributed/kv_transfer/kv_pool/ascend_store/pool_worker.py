@@ -1552,12 +1552,9 @@ class KVPoolWorker:
             send_thread.add_stored_request(request.req_id)
             send_thread.add_request(request)
 
-        if self.rank_local_cache:
-            # A later forward can update/reuse sparse cache buffers while the
-            # background sender is still reading them. The compute event above
-            # orders earlier writes only; it does not protect the source from
-            # subsequent forwards. Finish these reads before returning to the
-            # model runner. Ordinary shared MLA keeps its asynchronous path.
+        if current_event is not None:
+            # Complete source reads before the next forward can reuse cache
+            # buffers, including the rank-local sparse cache buffers.
             send_thread.request_queue.join()
 
     def retrieve_layer(
