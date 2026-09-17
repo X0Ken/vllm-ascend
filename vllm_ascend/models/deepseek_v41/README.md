@@ -117,6 +117,82 @@ and are overwritten when those positions are recomputed.
 Target eager and `FULL_DECODE_ONLY` modes retain their existing dispatch;
 the V1 DSpark proposer runs eagerly. Draft graph capture is not enabled.
 
+### Engram Host Offload
+
+Add the following options to the V4.1 launch command:
+
+```bash
+--safetensors-load-strategy lazy \
+--additional-config '{"enable_engram_ple_offload":true,"engram_storage":"int8"}' \
+--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
+```
+
+`engram_storage=int8` keeps INT8 weights and FP32 group32 scales on CPU. Fused
+gather/dequant decodes only requested rows directly into reusable pinned BF16
+staging buffers. FP8/MXFP8 retain E4M3 weights and UE8M0 group32 scales without
+expanding the full table to BF16. Offload defaults to FP8 when no storage format
+is specified. Use `engram_model_path` to select a separate Engram checkpoint.
+Explicit `engram_storage=bf16` preserves BF16 CPU storage and gathers directly
+into the same pinned double buffers, without quantization or a full-table copy.
+The loader selects a compatible safetensors index using the source dtype and
+required scale keys, then validates tensor shapes and dtypes. BF16/INT8 prefer
+the quant index; FP8/MXFP8 prefer the model index.
+
+The supported scope is single-node model runner V1 with EP and PP=PCP=DCP=1.
+All ranks, including idle DP replicas, participate in routing in the same order.
+Merged metadata, merged TP broadcast, CPU history/hash optimizations, and cache
+limits are retained. Pinned buffers cannot be overwritten or evicted until
+their H2D transfers complete.
+
+Prefill and decode prepare lookups synchronously by default. Capture only binds
+fixed-address device buffers; valid rows and current padding are refreshed before
+each replay. SP trims inputs to the current token count before sharding.
+
+Set `enable_engram_prefetch=true` to overlap the offloaded lookup with eager
+execution instead: the model thread computes the hashes and routing, submits the
+per-layer CPU lookups to a dedicated worker pool, and each layer consumes its own
+result inside the forward. Only the CPU lookup is asynchronous; every HCCL
+collective is still submitted by the model thread in layer order. Outstanding
+jobs are drained when the forward ends, including on the error path.
+
+Captured decode (`FULL` replay) keeps the synchronous refresh, so replay remains
+a complete NPU graph with no host callback and no graph break. That is also the
+split used by a prefill/decode deployment: the eager prefill half
+(`--enforce-eager`) runs with prefetch enabled, the decode half keeps it disabled
+and refreshes the same persistent device buffers before every replay. Keep
+`VLLM_USE_BREAKABLE_CUDAGRAPH=0`.
+
+The offloaded lookup never resizes the process-wide intra-op pool. It uses its
+own worker pool sized by `engram_cpu_lookup_threads` (default 20 per rank) and
+leaves `OMP_NUM_THREADS` to the rest of the engine. Set `ENGRAM_CPU_LOOKUP_CPUS`
+(for example `40-59`) to pin those workers when the launcher already partitions
+CPUs per rank; otherwise they inherit the rank's CPU binding.
+`ENGRAM_CPU_LOOKUP_MIN_ROWS` sets the row count where the dedicated pool takes
+over; the default follows the process intra-op width, because the worker
+hand-off costs about 40 us more than a synchronous call at tiny decode batches.
+The extension must link OpenMP: ATen's `parallel_for` is a header template whose
+pragmas are compiled into this module, and without `-fopenmp` the row loop
+silently runs on a single thread.
+
+Both layers share one request all-to-all (`ENGRAM_PREFETCH_FUSE_REQUEST_A2A=0`
+restores the per-layer calls); the payload interleaves each destination's layer
+chunks because the split sizes are per destination. Response and TP-broadcast
+collectives stay per layer: fusing them would need the L14 lookup to finish
+before the L1 response.
+
+`enable_engram_trace=true` logs one line per 64 eager forwards with the
+`hash`/`lookup`/`upload` stage split and one line per prefetch forward with the
+per-layer `lookup`/`response`/`blocked` durations. It adds nothing to the
+captured decode graph.
+
+Run the component tests with:
+
+```bash
+pytest --confcutdir=tests/ut/models \
+  tests/ut/models/test_engram_hbm.py tests/ut/models/test_engram_inputs.py \
+  tests/ut/models/test_engram_prefetch.py
+```
+
 ### Earlier design comparisons
 
 The original block-outermost implementation reserved 393216 bytes per ID

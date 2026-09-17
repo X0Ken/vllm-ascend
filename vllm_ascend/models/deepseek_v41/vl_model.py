@@ -219,8 +219,18 @@ class AscendDeepseekV41ForConditionalGeneration(
             is_multimodal=is_multimodal,
         )
 
+    def prepare_engram_graph_inputs(self, padded_tokens=None):
+        return self.language_model.prepare_engram_graph_inputs(padded_tokens)
+
     def prepare_engram_inputs(self, input_ids, positions, padded_tokens=None):
         return self.language_model.prepare_engram_inputs(
+            input_ids,
+            positions,
+            padded_tokens,
+        )
+
+    def prepare_engram_prefetch_inputs(self, input_ids, positions, padded_tokens=None):
+        return self.language_model.prepare_engram_prefetch_inputs(
             input_ids,
             positions,
             padded_tokens,

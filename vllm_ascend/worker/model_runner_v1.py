@@ -2982,22 +2982,87 @@ class NPUModelRunner(GPUModelRunner):
             "inputs_embeds": inputs_embeds,
             **model_kwargs,
         }
-        # Variable Engram routing must run on every DP before ACLGraph capture
-        # or replay; only its persistent BF16 inputs enter the model graph.
-        prepare_engram = getattr(self.model, "prepare_engram_inputs", None)
-        if prepare_engram is not None:
-            model_inputs.update(prepare_engram(input_ids, positions, num_tokens_padded))
+        # Variable Engram routing runs outside graph capture/replay; full graph
+        # replay consumes only the buffers prepared at an eager boundary.  The
+        # dispatch is shared with other runner versions in engram_runner.py.
+        from vllm_ascend.models.deepseek_v41.engram_runner import prepare_engram_for_forward
+
+        trace = get_ascend_config().enable_engram_trace
+        begin = time.perf_counter() if trace else 0.0
+        prep = prepare_engram_for_forward(
+            self.model,
+            forward_context,
+            input_ids,
+            positions,
+            num_tokens_padded,
+            capture_active=getattr(self, "_engram_capture_active", False),
+            prefetch_flag=get_ascend_config().enable_engram_prefetch,
+        )
+        if prep.inputs:
+            model_inputs.update(prep.inputs)
+            if trace and prep.selected != "prepare_engram_graph_inputs":
+                from vllm_ascend.models.deepseek_v41 import model as engram_model_module
+
+                self._record_engram_refresh(
+                    # Real token count separates keeper dummies (0) from
+                    # forwards that pad to the same num_tokens_padded.
+                    (
+                        num_tokens_padded
+                        if engram_model_module.LAST_ENGRAM_TOKENS is None
+                        else engram_model_module.LAST_ENGRAM_TOKENS
+                    ),
+                    (time.perf_counter() - begin) * 1e3,
+                    engram_model_module.LAST_ENGRAM_STAGE_MS,
+                )
         run_model = partial(self.model, **model_inputs)
 
-        if self.enable_enpu:
-            # The soft segmentation scenario requires event.record first, then event.wait
-            self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
-            hidden_states = run_model()
-        else:
-            hidden_states = run_model()
-            self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
+        try:
+            if self.enable_enpu:
+                # The soft segmentation scenario requires event.record first, then event.wait
+                self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
+                hidden_states = run_model()
+            else:
+                hidden_states = run_model()
+                self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
+        finally:
+            # Join the asynchronous Engram lookup even when the forward raises:
+            # a pending batch blocks the next ``begin``.
+            if (prefetcher := model_inputs.get("engram_prefetch")) is not None:
+                prefetcher.drain()
 
         return hidden_states
+
+    def _record_engram_refresh(self, tokens: int, elapsed_ms: float, stage_ms: tuple | None = None) -> None:
+        """Opt-in eager Engram timing: one line per 64 forwards, by size."""
+        window = getattr(self, "_engram_refresh_window", None)
+        if window is None:
+            window = self._engram_refresh_window = []
+        window.append((tokens, elapsed_ms, stage_ms))
+        if len(window) < 64:
+            return
+        groups: dict[int, list[tuple[float, tuple | None]]] = {}
+        for count, value, stage in window:
+            groups.setdefault(count, []).append((value, stage))
+        parts = []
+        for count, samples in sorted(groups.items()):
+            ordered = sorted(value for value, _ in samples)
+            staged = [stage for _, stage in samples if stage is not None]
+            detail = ""
+            if staged:
+                means = [
+                    sum(stage[index] for stage in staged if len(stage) > index) / len(staged)
+                    for index in range(max(len(stage) for stage in staged))
+                ]
+                detail = (
+                    f" hash={means[0]:.2f}ms lookup={means[1]:.2f}ms upload={means[2]:.2f}ms"
+                    + (f" tail={means[3]:.2f}ms" if len(means) > 3 else "")
+                )
+            parts.append(
+                f"tokens={count} n={len(ordered)} mean={sum(ordered) / len(ordered):.2f}ms "
+                f"p50={ordered[len(ordered) // 2]:.2f}ms max={ordered[-1]:.2f}ms{detail}"
+            )
+        logger.info("engram eager refresh %s", "; ".join(parts))
+        window.clear()
 
     def _prepare_device_metadata_for_forward(
         self, cudagraph_runtime_mode: CUDAGraphMode
@@ -5591,8 +5656,12 @@ class NPUModelRunner(GPUModelRunner):
     def capture_model(self) -> int:
         """Capture NPU graphs and return actual graph pool memory bytes consumed."""
         parent_module_name = _get_gpu_model_runner_module_name(self)
-        with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
-            cuda_graph_size = GPUModelRunner.capture_model(self)
+        self._engram_capture_active = True
+        try:
+            with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
+                cuda_graph_size = GPUModelRunner.capture_model(self)
+        finally:
+            self._engram_capture_active = False
 
         mgr = self.encoder_cudagraph_manager
         if mgr is not None and self.update_stream is not None:
