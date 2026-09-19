@@ -114,5 +114,7 @@ def prepare_engram_for_forward(
         prepare = getattr(model, "prepare_engram_prefetch_inputs", prepare)
     result.inputs = prepare(input_ids, positions, num_tokens_padded)
     result.prefetcher = result.inputs.get("engram_prefetch")
-    result.selected = getattr(prepare, "__name__", str(prepare))
+    result.selected = getattr(prepare, "__name__", None)
+    if result.selected is None:
+        result.selected = str(prepare)
     return result

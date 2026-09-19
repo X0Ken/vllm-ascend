@@ -638,9 +638,7 @@ class DeepseekV41EagerAttentionImpl:
             positions = metadata.positions[:num_tokens]
             cos, sin = metadata.rope(attn.rotary_emb.layername, num_tokens)
             q, qr = self._prepare_queries(attn, hidden_states, positions, cos, sin, metadata)
-            compressed_indices = self._select_sparse_indices(
-                attn, hidden_states, qr, positions, cos, sin, metadata
-            )
+            compressed_indices = self._select_sparse_indices(attn, hidden_states, qr, positions, cos, sin, metadata)
             attention_output = self._attention(attn, q, metadata, compressed_indices)
             torch.ops._C_ascend.inplace_partial_rotary_mul(
                 attention_output.unsqueeze(1),
@@ -658,8 +656,14 @@ class DeepseekV41EagerAttentionImpl:
 
 class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
     def __init__(
-        self, kv_cache_spec, layer_names, vllm_config, device, *,
-        build_query_metadata=True, build_compressor_metadata=True,
+        self,
+        kv_cache_spec,
+        layer_names,
+        vllm_config,
+        device,
+        *,
+        build_query_metadata=True,
+        build_compressor_metadata=True,
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         max_tokens = getattr(vllm_config.scheduler_config, "max_num_batched_tokens", 4096)
@@ -691,7 +695,9 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             )
         )
         c2_rope_rows = (
-            compressor_tokens if self._supports_device_ops and isinstance(kv_cache_spec, DeepseekV41CompressorStateSpec) else 0
+            compressor_tokens
+            if self._supports_device_ops and isinstance(kv_cache_spec, DeepseekV41CompressorStateSpec)
+            else 0
         )
         self._c2_source_cos = torch.ones(
             (c2_rope_rows, 1, 1, rope_dim),
@@ -861,40 +867,19 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             slot_key = f"slot:c{ratio}:b{spec.storage_block_size}"
             prepared_slots = shared.get(slot_key)
             if prepared_slots is None:
-                active_slots = common.slot_mapping[:num_input_tokens]
-                if compressed and ratio != 1:
-                    active_slots = compressed_slot_mapping(active_slots, ratio)
-                valid = active_slots >= 0
-                if compressed and ratio == 2:
-                    # Prepare the C2 store mask once per cache group, before
-                    # forward. Match the ring compressor's completion policy.
-                    if kwargs.get("skip_ring_state_update", False):
-                        valid.zero_()
-                    else:
-                        valid_end = common.query_start_loc[num_actual_reqs].clamp_max(num_actual_tokens)
-                        valid &= torch.arange(num_input_tokens, device=active_slots.device) < valid_end
-                        if positions is not None:
-                            valid &= positions.remainder(2) == 1
-                physical = active_slots.clamp_min(0)
-                self._slot_mapping_2d[:num_input_tokens, 0].copy_(
-                    torch.where(
-                        valid,
-                        torch.div(
-                            physical,
-                            spec.storage_block_size,
-                            rounding_mode="floor",
-                        ),
-                        -1,
-                    )
+                from vllm_ascend.attention.deepseek_v41_slots import slot_coordinates
+
+                prepared_slots = slot_coordinates(
+                    self,
+                    common,
+                    positions,
+                    num_input_tokens,
+                    num_actual_reqs,
+                    num_actual_tokens,
+                    ratio,
+                    compressed,
+                    kwargs.get("skip_ring_state_update", False),
                 )
-                self._slot_mapping_2d[:num_input_tokens, 1].copy_(
-                    torch.where(
-                        valid,
-                        physical.remainder(spec.storage_block_size),
-                        -1,
-                    )
-                )
-                prepared_slots = self._slot_mapping_2d[:num_input_tokens]
                 shared[slot_key] = prepared_slots
             slots = prepared_slots
         plane_ratio = ratio if compressed else 1
@@ -937,14 +922,15 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
                 self.vllm_config.speculative_config.num_speculative_tokens,
                 window_size,
                 spec.storage_block_size,
-                common.query_start_loc[:num_reqs + 1],
+                common.query_start_loc[: num_reqs + 1],
                 seq_lens,
                 num_actual_tokens,
                 use_logical_indices=True,
             )
         ori_topk_length = (
             (ori_sparse_indices >= 0).sum(dim=-1, dtype=torch.int32)
-            if ori_sparse_indices is not None and noncausal else None
+            if ori_sparse_indices is not None and noncausal
+            else None
         )
         ori_mask_mode = 0 if noncausal else 4
         ori_win_left = max(0, window_size - 1)

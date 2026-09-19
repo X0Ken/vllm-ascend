@@ -740,3 +740,38 @@ def test_missing_engram_inputs_fail_fast_only_during_capture():
     engram_runner.check_engram_inputs_prepared(capturing, engram_enabled=False)
     with pytest.raises(RuntimeError, match="prepare_engram_for_forward"):
         engram_runner.check_engram_inputs_prepared(capturing, engram_enabled=True)
+
+
+@pytest.mark.parametrize("named", [True, False])
+def test_runner_only_formats_unnamed_prepare(named):
+    """Bound method repr can recursively format the entire model every round."""
+    from types import SimpleNamespace
+
+    from vllm.config import CUDAGraphMode
+
+    from vllm_ascend.models.deepseek_v41 import engram_runner
+
+    class Prepare:
+        def __init__(self):
+            self.formatted = 0
+            if named:
+                self.__name__ = "prepare_named"
+
+        def __call__(self, *args):
+            return {}
+
+        def __str__(self):
+            self.formatted += 1
+            return "unnamed preparation"
+
+    prepare = Prepare()
+    result = engram_runner.prepare_engram_for_forward(
+        SimpleNamespace(prepare_engram_inputs=prepare),
+        SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.FULL, capturing=False),
+        None,
+        torch.arange(4),
+        4,
+        prefetch_flag=False,
+    )
+    assert result.selected == ("prepare_named" if named else "unnamed preparation")
+    assert prepare.formatted == (0 if named else 1)
