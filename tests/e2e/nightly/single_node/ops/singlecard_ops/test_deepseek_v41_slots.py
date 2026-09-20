@@ -8,7 +8,7 @@ import pytest
 import torch
 import torch_npu  # noqa: F401
 
-from vllm_ascend.attention.deepseek_v41_slots import slot_coordinates
+from vllm_ascend.attention.deepseek_v41_slots import _slots, slot_coordinates
 
 
 @pytest.mark.parametrize("n", [0, 1, 5, 6, 24, 129, 512])
@@ -47,3 +47,33 @@ def test_slot_coordinates(n, ratio, compressed, skip, storage, has_positions):
     assert torch.all(buffer[n:] == -99)
     if n:
         assert got.data_ptr() == buffer.data_ptr()
+
+
+def test_dynamic_lengths_reuse_compiled_kernel():
+    raw = torch.arange(4096, device="npu", dtype=torch.int64) - 3
+    positions = torch.arange(4096, device="npu", dtype=torch.int64)
+    common = SimpleNamespace(
+        slot_mapping=raw,
+        query_start_loc=torch.arange(17, device="npu", dtype=torch.int32) * 257,
+    )
+    buffer = torch.full((4099, 2), -99, device="npu", dtype=torch.int32)
+    builder = SimpleNamespace(_slot_mapping_2d=buffer, kv_cache_spec=SimpleNamespace(storage_block_size=128))
+    cases = [(4096, 16, 4095), (1, 0, 0), (1, 1, 1), (5, 2, 3), (129, 8, 127), (512, 16, 511), (4096, 3, 1025)]
+    compiled_variants = None
+    for n, actual_reqs, actual_tokens in cases:
+        buffer.fill_(-99)
+        got = slot_coordinates(builder, common, positions, n, actual_reqs, actual_tokens, 2, True, False)
+        active = raw[:n]
+        valid = (active >= 0) & ((active + 1) % 2 == 0)
+        valid &= torch.arange(n, device="npu") < min(actual_reqs * 257, actual_tokens)
+        valid &= positions[:n] % 2 == 1
+        physical = (active // 2).clamp_min(0)
+        expected = torch.stack(
+            [torch.where(valid, physical // 128, -1), torch.where(valid, physical % 128, -1)], dim=1
+        ).int()
+        assert torch.equal(got, expected)
+        assert torch.all(buffer[n:] == -99)
+        current_variants = sum(len(cache) for cache in _slots.cache.values())
+        if compiled_variants is None:
+            compiled_variants = current_variants
+        assert current_variants == compiled_variants

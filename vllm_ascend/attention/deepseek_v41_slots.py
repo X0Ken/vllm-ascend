@@ -2,19 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Fused slot coordinates; no changes to cache ownership or update policy."""
 
-import triton
-import triton.language as tl
+from vllm.triton_utils import tl, triton
 
 
-@triton.jit
+# Batch lengths are runtime metadata, not separate kernel variants.
+@triton.jit(do_not_specialize=["N", "ACTUAL_REQS", "ACTUAL_TOKENS"])
 def _slots(
     raw,
     pos,
     qsl,
     output,
-    N: tl.constexpr,
-    ACTUAL_REQS: tl.constexpr,
-    ACTUAL_TOKENS: tl.constexpr,
+    N,
+    ACTUAL_REQS,
+    ACTUAL_TOKENS,
     RATIO: tl.constexpr,
     COMPRESSED: tl.constexpr,
     HAS_POS: tl.constexpr,
