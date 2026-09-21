@@ -97,7 +97,6 @@ def test_forward_context_exposes_device_metadata_executor(monkeypatch):
     monkeypatch.setattr(afc, "set_forward_context", fake_set_forward_context)
     monkeypatch.setattr(afc, "get_forward_context", lambda: forward_context)
     monkeypatch.setattr(afc, "select_moe_comm_method", lambda *args, **kwargs: None)
-    monkeypatch.setattr(afc, "use_cann_megamoe", lambda config: False)
     monkeypatch.setattr(afc, "is_moe_model", lambda config: False)
     monkeypatch.setattr(afc, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(afc, "has_layer_idx", lambda model: False)
