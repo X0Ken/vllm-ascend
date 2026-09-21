@@ -1,4 +1,5 @@
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, TypeAlias
 
@@ -7,7 +8,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import torch_npu
 import vllm.envs as envs_vllm
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.triton_utils import HAS_TRITON
@@ -41,6 +42,11 @@ from vllm_ascend.utils import (
     olora_tp_enable,
     oproj_tp_enable,
 )
+from vllm_ascend.worker.device_metadata import (
+    DeviceMetadataStage,
+    DeviceMetadataTask,
+    wait_for_device_metadata,
+)
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
 if TYPE_CHECKING:
@@ -57,6 +63,96 @@ BUILD_METADATA_STEP_PREFILL = 0
 BUILD_METADATA_STEP_DECODE = 1
 
 _DSV4_DSA_OVERLAP_STREAM = None
+CompressorMetadataOutput = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+CompressorForwardOutput = tuple[torch.Tensor, torch.Tensor]
+CompressorOverlapOutput = tuple[CompressorForwardOutput, torch.npu.Event]
+_COMPRESSOR_METADATA_CACHE_KEY = "dsv4_compressor_metadata_cache"
+
+
+def build_compressor_metadata_out(
+    metadata: Any,
+    compress_ratio: int,
+    outputs: CompressorMetadataOutput,
+) -> None:
+    assert metadata.full_compress_cos is not None
+    assert metadata.full_compress_sin is not None
+    assert metadata.start_pos is not None
+    assert metadata.num_reqs_actual is not None
+    full_compress_cos = metadata.full_compress_cos.view(
+        metadata.full_compress_cos.shape[0],
+        metadata.full_compress_cos.shape[-1],
+    )
+    full_compress_sin = metadata.full_compress_sin.view(
+        metadata.full_compress_sin.shape[0],
+        metadata.full_compress_sin.shape[-1],
+    )
+    torch.ops._C_ascend.compressor_metadata_out(
+        full_compress_cos,
+        full_compress_sin,
+        metadata.query_start_loc,
+        metadata.start_pos,
+        metadata.block_table,
+        metadata.block_size,
+        DeviceOperator.get_dsa_compressor_slot_mapping_format(),
+        compress_ratio,
+        metadata.num_reqs_actual,
+        *outputs,
+    )
+
+
+def reset_compressor_metadata_cache() -> None:
+    """Release metadata outputs before a composite forward changes substeps."""
+    get_forward_context().additional_kwargs.pop(_COMPRESSOR_METADATA_CACHE_KEY, None)
+
+
+def get_or_compute_compressor_metadata(
+    metadata: Any,
+    compress_ratio: int,
+) -> CompressorMetadataOutput:
+    """Build compressor metadata once per cache group in the current substep."""
+    forward_context = get_forward_context()
+    cache: dict[tuple[str, type], CompressorMetadataOutput] = forward_context.additional_kwargs.setdefault(
+        _COMPRESSOR_METADATA_CACHE_KEY,
+        {},
+    )
+    cache_group_key = metadata.cache_group_key
+    if not cache_group_key:
+        raise ValueError("DSV4 compressor metadata requires a cache-group key")
+    # The pre-refactor v0.26 DSA path invokes prefill and decode separately
+    # within one mixed-batch forward. They share a cache group but require
+    # different compressor metadata, so keep the metadata phases isolated.
+    cache_key = (cache_group_key, type(metadata))
+    cached_metadata = cache.get(cache_key)
+    if cached_metadata is not None:
+        return cached_metadata
+
+    assert metadata.full_compress_cos is not None
+    assert metadata.full_compress_sin is not None
+    assert metadata.num_compressed_tokens is not None
+    assert metadata.start_pos is not None
+    assert metadata.num_reqs_actual is not None
+    full_compress_cos = metadata.full_compress_cos.view(
+        metadata.full_compress_cos.shape[0],
+        metadata.full_compress_cos.shape[-1],
+    )
+    full_compress_sin = metadata.full_compress_sin.view(
+        metadata.full_compress_sin.shape[0],
+        metadata.full_compress_sin.shape[-1],
+    )
+    computed_metadata = torch.ops._C_ascend.compressor_metadata(
+        full_compress_cos,
+        full_compress_sin,
+        metadata.query_start_loc,
+        metadata.start_pos,
+        metadata.block_table,
+        metadata.block_size,
+        DeviceOperator.get_dsa_compressor_slot_mapping_format(),
+        compress_ratio,
+        metadata.num_compressed_tokens,
+        metadata.num_reqs_actual,
+    )
+    cache[cache_key] = computed_metadata
+    return computed_metadata
 
 
 def dsv4_dsa_overlap_stream() -> torch.npu.Stream:
@@ -247,6 +343,7 @@ class AscendDSAPrefillMetadata:
     max_query_len: int
     max_seq_lens: int
 
+    cache_group_key: str = ""
     num_compressed_tokens: int | None = None
     sin: torch.Tensor = None
     cos: torch.Tensor = None
@@ -256,6 +353,8 @@ class AscendDSAPrefillMetadata:
     num_reqs_actual: int | None = None
     sas_metadata: torch.Tensor = None
     qli_metadata: torch.Tensor = None
+    compressor_metadata: CompressorMetadataOutput | None = None
+    compressor_metadata_group_id: int | None = None
     cu_c4_cmp_seqlen_list: torch.Tensor = None
     cu_c128_cmp_seqlen_list: torch.Tensor = None
     ori_win_left: int | None = None
@@ -277,6 +376,7 @@ class AscendDSADecodeMetadata:
     slot_mapping: torch.Tensor | None
     block_size: int
 
+    cache_group_key: str = ""
     num_compressed_tokens: int | None = None
     query_start_loc: torch.tensor = None
     query_start_loc_cpu: torch.tensor = None
@@ -291,6 +391,8 @@ class AscendDSADecodeMetadata:
     num_reqs_actual: int | None = None
     sas_metadata: torch.Tensor = None
     qli_metadata: torch.Tensor = None
+    compressor_metadata: CompressorMetadataOutput | None = None
+    compressor_metadata_group_id: int | None = None
     ori_win_left: int | None = None
     ori_win_right: int | None = None
     dspark_swa_indices: torch.Tensor | None = None
@@ -503,6 +605,10 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
 
         self.compressor_ratio = getattr(kv_cache_spec, "compress_ratio", 0)
+        if not layer_names:
+            raise ValueError("DSA metadata builder requires at least one layer name")
+        # vLLM assigns one builder result to every layer in an attention group.
+        self.cache_group_key = layer_names[0]
         hf_config = self.model_config.hf_config
 
         if AscendDSAMetadataBuilder.hadamard is None:
@@ -530,8 +636,14 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                     ).to(torch.bfloat16)
         self.start_pos_prefill = torch.zeros(scheduler_config.max_num_seqs, dtype=torch.int32, device=self.device)
         self.start_pos_decode = torch.zeros(scheduler_config.max_num_seqs, dtype=torch.int32, device=self.device)
+        self.prefill_sas_metadata = torch.zeros(1024, dtype=torch.int32, device=self.device)
+        self.prefill_qli_metadata = torch.zeros(1024, dtype=torch.int32, device=self.device)
         self.decode_sas_metadata = torch.zeros(1024, dtype=torch.int32, device=self.device)
         self.decode_qli_metadata = torch.zeros(1024, dtype=torch.int32, device=self.device)
+        self._device_metadata_enabled = False
+        self._device_metadata_tasks: tuple[DeviceMetadataTask, ...] = ()
+        self.prefill_compressor_metadata_buffers: CompressorMetadataOutput | None = None
+        self.decode_compressor_metadata_buffers: CompressorMetadataOutput | None = None
         self.cu_seqlens_ori_kv = torch.tensor([], device=self.device)
         self.cu_seqlens_cmp_kv = torch.tensor([], device=self.device)
         self.seqused_q = torch.tensor([], device=self.device)
@@ -603,6 +715,32 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
     ):
         self.num_actual_tokens = common_attn_metadata.num_actual_tokens
 
+    def enable_device_metadata(self) -> None:
+        self._device_metadata_enabled = True
+        if self.compressor_ratio <= 1 or self.vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL:
+            return
+        output_shape = (
+            self.vllm_config.scheduler_config.max_num_batched_tokens,
+            1,
+            1,
+            self.model_config.hf_config.qk_rope_head_dim,
+        )
+        self.prefill_compressor_metadata_buffers = (
+            torch.empty(output_shape, dtype=torch.float32, device=self.device),
+            torch.empty(output_shape, dtype=torch.float32, device=self.device),
+            torch.empty(self.slot_mapping_shape, dtype=torch.int32, device=self.device),
+        )
+        self.decode_compressor_metadata_buffers = (
+            torch.empty(output_shape, dtype=torch.float32, device=self.device),
+            torch.empty(output_shape, dtype=torch.float32, device=self.device),
+            torch.empty(self.slot_mapping_shape, dtype=torch.int32, device=self.device),
+        )
+
+    def take_device_metadata_tasks(self) -> tuple[DeviceMetadataTask, ...]:
+        tasks = self._device_metadata_tasks
+        self._device_metadata_tasks = ()
+        return tasks
+
     def _num_compressor_metadata_rows(
         self,
         build_step: int,
@@ -625,9 +763,11 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         fast_build: bool = False,
         **kwargs,
     ) -> AscendDSAMetadata:
+        self._device_metadata_tasks = ()
         num_reqs = common_attn_metadata.num_reqs
         query_start_loc = common_attn_metadata.query_start_loc
         num_reqs_actual = kwargs.get("num_reqs_actual")
+        full_graph_mode = kwargs.get("full_graph_mode", False)
         self.prefill_ratio_to_sas_metadata = kwargs.get("prefill_ratio_to_sas_metadata")
         self.decode_ratio_to_sas_metadata = kwargs.get("decode_ratio_to_sas_metadata")
         assert self.prefill_ratio_to_sas_metadata is not None
@@ -691,12 +831,18 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 common_prefix_len,
                 common_attn_metadata,
                 num_reqs_actual,
+                full_graph_mode,
             )
 
         decode_metadata = None
 
         if self.num_decodes > 0:
-            decode_metadata = self.build_decode_metadata(common_prefix_len, common_attn_metadata, num_reqs_actual)
+            decode_metadata = self.build_decode_metadata(
+                common_prefix_len,
+                common_attn_metadata,
+                num_reqs_actual,
+                full_graph_mode,
+            )
 
         return self.metadata_cls(  # type: ignore
             num_input_tokens=common_attn_metadata.num_input_tokens,
@@ -724,6 +870,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         common_prefix_len: int,
         common_attn_metadata: AscendCommonAttentionMetadata,
         num_reqs_actual: int | None,
+        full_graph_mode: bool = False,
     ) -> AscendDSAPrefillMetadata:
         assert self.prefill_ratio_to_sas_metadata is not None
         assert self.decode_ratio_to_sas_metadata is not None
@@ -793,10 +940,15 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         if self.compressor_ratio > 1:
             # Keep only graph inputs here. The compressor metadata op itself is
             # launched in forward at the real compressor consumer.
-            num_compressed_tokens = self._num_compressor_metadata_rows(
-                BUILD_METADATA_STEP_PREFILL,
-                common_attn_metadata,
-            )
+            if full_graph_mode and self._device_metadata_enabled:
+                num_tokens = common_attn_metadata.num_input_tokens
+                num_compressed_tokens = min(num_tokens, num_tokens // self.compressor_ratio + num_prefill)
+                num_prefills_actual = num_prefill
+            else:
+                num_compressed_tokens = self._num_compressor_metadata_rows(
+                    BUILD_METADATA_STEP_PREFILL,
+                    common_attn_metadata,
+                )
             full_compress_cos, full_compress_sin = get_full_cos_and_sin_dsa(layer_name)
             prefill_slot_mapping = None
         else:
@@ -812,109 +964,140 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
 
         metadata_op = DeviceOperator.get_dsa_sparse_attn_metadata_op()
         metadata_kwargs = DeviceOperator.get_dsa_sparse_attn_metadata_kwargs(self.seqused_q.device)
-        if self.compressor_ratio <= 1:
-            if self.prefill_ratio_to_sas_metadata.get(layer_name) is None:
-                self.prefill_ratio_to_sas_metadata[layer_name] = metadata_op(
-                    **metadata_kwargs,
-                    num_heads_q=n_local_heads,
-                    num_heads_kv=1,
-                    head_dim=self.model_config.get_head_size(),
-                    cu_seqlens_q=prefill_query_start_loc,
-                    cu_seqlens_ori_kv=prefill_query_start_loc,
-                    cu_seqlens_cmp_kv=None,
-                    seqused_q=self.seqused_q,
-                    seqused_kv=self.seq_lens[reqs_start:],
-                    max_seqlen_q=seq_lens_q.max(),
-                    max_seqlen_kv=self.seq_lens[reqs_start:].max(),
-                    batch_size=len(self.seq_lens[reqs_start:]),
-                    cmp_ratio=1,
-                    ori_mask_mode=4,  # 4:sliding window
-                    ori_win_left=self.model_config.hf_config.sliding_window - 1,
-                    ori_win_right=0,
-                    layout_q="TND",
-                    layout_kv="PA_ND",
-                    has_ori_kv=True,
-                    has_cmp_kv=False,
-                )
-            sas_metadata = self.prefill_ratio_to_sas_metadata[layer_name]
-        elif self.compressor_ratio == 4:
-            if self.prefill_ratio_to_sas_metadata.get(layer_name) is None:
-                self.prefill_ratio_to_sas_metadata[layer_name] = metadata_op(
-                    **metadata_kwargs,
-                    num_heads_q=n_local_heads,
-                    num_heads_kv=1,
-                    head_dim=self.model_config.get_head_size(),
-                    cu_seqlens_q=prefill_query_start_loc,
-                    cu_seqlens_ori_kv=prefill_query_start_loc,
-                    cu_seqlens_cmp_kv=cu_c4_cmp_seqlen_list,
-                    seqused_q=self.seqused_q,
-                    seqused_kv=self.seq_lens[reqs_start:],
-                    max_seqlen_q=seq_lens_q.max(),
-                    max_seqlen_kv=self.seq_lens[reqs_start:].max(),
-                    batch_size=len(self.seq_lens[reqs_start:]),
-                    cmp_topk=index_topk,
-                    # topk=index_topk,
-                    cmp_ratio=4,
-                    ori_mask_mode=4,
-                    cmp_mask_mode=3,
-                    ori_win_left=self.model_config.hf_config.sliding_window - 1,
-                    ori_win_right=0,
-                    layout_q="TND",
-                    layout_kv="PA_ND",
-                    has_ori_kv=True,
-                    has_cmp_kv=True,
-                )
-            sas_metadata = self.prefill_ratio_to_sas_metadata[layer_name]
-        else:
-            if self.prefill_ratio_to_sas_metadata.get(layer_name) is None:
-                self.prefill_ratio_to_sas_metadata[layer_name] = metadata_op(
-                    **metadata_kwargs,
-                    num_heads_q=n_local_heads,
-                    num_heads_kv=1,
-                    head_dim=self.model_config.get_head_size(),
-                    cu_seqlens_q=prefill_query_start_loc,
-                    cu_seqlens_ori_kv=prefill_query_start_loc,
-                    cu_seqlens_cmp_kv=cu_c128_cmp_seqlen_list,
-                    seqused_q=self.seqused_q,
-                    seqused_kv=self.seq_lens[reqs_start:],
-                    max_seqlen_q=seq_lens_q.max(),
-                    max_seqlen_kv=self.seq_lens[reqs_start:].max(),
-                    batch_size=len(self.seq_lens[reqs_start:]),
-                    cmp_ratio=128,  #
-                    ori_mask_mode=4,  # 4:sliding window
-                    cmp_mask_mode=3,  # 3:causal
-                    ori_win_left=self.model_config.hf_config.sliding_window - 1,
-                    ori_win_right=0,
-                    layout_q="TND",
-                    layout_kv="PA_ND",
-                    has_ori_kv=True,
-                    has_cmp_kv=True,
-                )
-            sas_metadata = self.prefill_ratio_to_sas_metadata[layer_name]
-        if self.prefill_ratio_to_sas_metadata.get("qli") is None:
-            self.prefill_ratio_to_sas_metadata["qli"] = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer_metadata(
-                actual_seq_lengths_query=prefill_query_start_loc[1:].clone(),
-                actual_seq_lengths_key=self.seq_lens[reqs_start:].clone(),
-                num_heads_q=self.model_config.hf_config.index_n_heads,  # 64
-                num_heads_k=1,
-                head_dim=self.model_config.hf_config.index_head_dim,  # 128
-                query_quant_mode=0,
-                key_quant_mode=0,
-                batch_size=len(self.seq_lens[reqs_start:]),
-                max_seqlen_q=seq_lens_q.max().item(),
-                max_seqlen_k=self.seq_lens[reqs_start:].max().item(),
-                layout_query="TND",
-                layout_key="PA_BSND",
-                sparse_count=self.model_config.hf_config.index_topk,  # 512
-                sparse_mode=3,
-                pre_tokens=(1 << 63) - 1,
-                next_tokens=(1 << 63) - 1,
-                cmp_ratio=4,
-                device=str(self.seqused_q.device),
-            )
-        qli_metadata = self.prefill_ratio_to_sas_metadata.get("qli")
+        prefill_metadata_cache = self.prefill_ratio_to_sas_metadata
 
-        return AscendDSAPrefillMetadata(
+        def get_sas_metadata() -> torch.Tensor:
+            if self.compressor_ratio <= 1:
+                if prefill_metadata_cache.get(layer_name) is None:
+                    prefill_metadata_cache[layer_name] = metadata_op(
+                        **metadata_kwargs,
+                        num_heads_q=n_local_heads,
+                        num_heads_kv=1,
+                        head_dim=self.model_config.get_head_size(),
+                        cu_seqlens_q=prefill_query_start_loc,
+                        cu_seqlens_ori_kv=prefill_query_start_loc,
+                        cu_seqlens_cmp_kv=None,
+                        seqused_q=self.seqused_q,
+                        seqused_kv=self.seq_lens[reqs_start:],
+                        max_seqlen_q=seq_lens_q.max(),
+                        max_seqlen_kv=self.seq_lens[reqs_start:].max(),
+                        batch_size=len(self.seq_lens[reqs_start:]),
+                        cmp_ratio=1,
+                        ori_mask_mode=4,  # 4:sliding window
+                        ori_win_left=self.model_config.hf_config.sliding_window - 1,
+                        ori_win_right=0,
+                        layout_q="TND",
+                        layout_kv="PA_ND",
+                        has_ori_kv=True,
+                        has_cmp_kv=False,
+                    )
+                sas_metadata = prefill_metadata_cache[layer_name]
+            elif self.compressor_ratio == 4:
+                if prefill_metadata_cache.get(layer_name) is None:
+                    prefill_metadata_cache[layer_name] = metadata_op(
+                        **metadata_kwargs,
+                        num_heads_q=n_local_heads,
+                        num_heads_kv=1,
+                        head_dim=self.model_config.get_head_size(),
+                        cu_seqlens_q=prefill_query_start_loc,
+                        cu_seqlens_ori_kv=prefill_query_start_loc,
+                        cu_seqlens_cmp_kv=cu_c4_cmp_seqlen_list,
+                        seqused_q=self.seqused_q,
+                        seqused_kv=self.seq_lens[reqs_start:],
+                        max_seqlen_q=seq_lens_q.max(),
+                        max_seqlen_kv=self.seq_lens[reqs_start:].max(),
+                        batch_size=len(self.seq_lens[reqs_start:]),
+                        cmp_topk=index_topk,
+                        # topk=index_topk,
+                        cmp_ratio=4,
+                        ori_mask_mode=4,
+                        cmp_mask_mode=3,
+                        ori_win_left=self.model_config.hf_config.sliding_window - 1,
+                        ori_win_right=0,
+                        layout_q="TND",
+                        layout_kv="PA_ND",
+                        has_ori_kv=True,
+                        has_cmp_kv=True,
+                    )
+                sas_metadata = prefill_metadata_cache[layer_name]
+            else:
+                if prefill_metadata_cache.get(layer_name) is None:
+                    prefill_metadata_cache[layer_name] = metadata_op(
+                        **metadata_kwargs,
+                        num_heads_q=n_local_heads,
+                        num_heads_kv=1,
+                        head_dim=self.model_config.get_head_size(),
+                        cu_seqlens_q=prefill_query_start_loc,
+                        cu_seqlens_ori_kv=prefill_query_start_loc,
+                        cu_seqlens_cmp_kv=cu_c128_cmp_seqlen_list,
+                        seqused_q=self.seqused_q,
+                        seqused_kv=self.seq_lens[reqs_start:],
+                        max_seqlen_q=seq_lens_q.max(),
+                        max_seqlen_kv=self.seq_lens[reqs_start:].max(),
+                        batch_size=len(self.seq_lens[reqs_start:]),
+                        cmp_ratio=128,  #
+                        ori_mask_mode=4,  # 4:sliding window
+                        cmp_mask_mode=3,  # 3:causal
+                        ori_win_left=self.model_config.hf_config.sliding_window - 1,
+                        ori_win_right=0,
+                        layout_q="TND",
+                        layout_kv="PA_ND",
+                        has_ori_kv=True,
+                        has_cmp_kv=True,
+                    )
+                sas_metadata = prefill_metadata_cache[layer_name]
+            return sas_metadata
+
+        def get_qli_metadata() -> torch.Tensor:
+            if prefill_metadata_cache.get("qli") is None:
+                prefill_metadata_cache["qli"] = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer_metadata(
+                    actual_seq_lengths_query=prefill_query_start_loc[1:].clone(),
+                    actual_seq_lengths_key=self.seq_lens[reqs_start:].clone(),
+                    num_heads_q=self.model_config.hf_config.index_n_heads,  # 64
+                    num_heads_k=1,
+                    head_dim=self.model_config.hf_config.index_head_dim,  # 128
+                    query_quant_mode=0,
+                    key_quant_mode=0,
+                    batch_size=len(self.seq_lens[reqs_start:]),
+                    max_seqlen_q=max_query_len if self._device_metadata_enabled else seq_lens_q.max().item(),
+                    max_seqlen_k=(
+                        max_seq_lens if self._device_metadata_enabled else self.seq_lens[reqs_start:].max().item()
+                    ),
+                    layout_query="TND",
+                    layout_key="PA_BSND",
+                    sparse_count=self.model_config.hf_config.index_topk,  # 512
+                    sparse_mode=3,
+                    pre_tokens=(1 << 63) - 1,
+                    next_tokens=(1 << 63) - 1,
+                    cmp_ratio=4,
+                    device=str(self.seqused_q.device),
+                )
+            qli_metadata = prefill_metadata_cache.get("qli")
+
+            return qli_metadata
+
+        if self._device_metadata_enabled:
+
+            def build_sas_metadata() -> None:
+                self.prefill_sas_metadata[:1024] = get_sas_metadata()
+
+            def build_qli_metadata() -> None:
+                self.prefill_qli_metadata[:1024] = get_qli_metadata()
+
+            if self.compressor_ratio == 4:
+                self._device_metadata_tasks += (
+                    DeviceMetadataTask(DeviceMetadataStage.INDEXER, build_qli_metadata, id(self.prefill_qli_metadata)),
+                )
+            self._device_metadata_tasks += (
+                DeviceMetadataTask(DeviceMetadataStage.ATTENTION, build_sas_metadata, id(self.prefill_sas_metadata)),
+            )
+            sas_metadata = self.prefill_sas_metadata
+            qli_metadata = self.prefill_qli_metadata if self.compressor_ratio == 4 else None
+        else:
+            sas_metadata = get_sas_metadata()
+            qli_metadata = get_qli_metadata()
+
+        prefill_metadata = AscendDSAPrefillMetadata(
             attn_mask=None,
             query_lens=self.query_lens[reqs_start:].to(torch.int32),
             seq_lens=self.seq_lens[reqs_start:],
@@ -923,6 +1106,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             block_table=self.block_table[reqs_start:, ...],
             slot_mapping=prefill_slot_mapping,
             block_size=self.block_size,
+            cache_group_key=self.cache_group_key,
             num_compressed_tokens=num_compressed_tokens,
             max_query_len=max_query_len,
             max_seq_lens=max_seq_lens,
@@ -938,12 +1122,32 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             cu_c4_cmp_seqlen_list=cu_c4_cmp_seqlen_list,
             cu_c128_cmp_seqlen_list=cu_c128_cmp_seqlen_list,
         )
+        if self._device_metadata_enabled and self.prefill_compressor_metadata_buffers is not None:
+            buffers = self.prefill_compressor_metadata_buffers
+            outputs = (
+                buffers[0][:num_compressed_tokens],
+                buffers[1][:num_compressed_tokens],
+                buffers[2][:num_compressed_tokens],
+            )
+            group_id = id(buffers[0])
+            prefill_metadata.compressor_metadata = outputs
+            prefill_metadata.compressor_metadata_group_id = group_id
+            self._device_metadata_tasks = (
+                DeviceMetadataTask(
+                    DeviceMetadataStage.COMPRESSOR,
+                    lambda: build_compressor_metadata_out(prefill_metadata, self.compressor_ratio, outputs),
+                    group_id,
+                ),
+                *self._device_metadata_tasks,
+            )
+        return prefill_metadata
 
     def build_decode_metadata(
         self,
         common_prefix_len: int,
         common_attn_metadata: AscendCommonAttentionMetadata,
         num_reqs_actual: int | None,
+        full_graph_mode: bool = False,
     ) -> AscendDSADecodeMetadata:
         assert self.decode_ratio_to_sas_metadata is not None
         if self.decode_ratio_to_sas_metadata.get("query_start_loc", None) is None:
@@ -1009,10 +1213,15 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         if self.compressor_ratio > 1:
             # Keep only graph inputs here. The compressor metadata op itself is
             # launched in forward at the real compressor consumer.
-            num_compressed_tokens = self._num_compressor_metadata_rows(
-                BUILD_METADATA_STEP_DECODE,
-                common_attn_metadata,
-            )
+            if full_graph_mode and self._device_metadata_enabled:
+                num_tokens = common_attn_metadata.num_input_tokens
+                num_compressed_tokens = min(num_tokens, num_tokens // self.compressor_ratio + self.num_decodes)
+                num_decodes_actual = self.num_decodes
+            else:
+                num_compressed_tokens = self._num_compressor_metadata_rows(
+                    BUILD_METADATA_STEP_DECODE,
+                    common_attn_metadata,
+                )
             full_compress_cos, full_compress_sin = get_full_cos_and_sin_dsa(layer_name)
             slot_mapping = None
         else:
@@ -1028,7 +1237,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         n_local_heads = self.model_config.hf_config.num_attention_heads // tp_size
         index_topk = self.model_config.hf_config.index_topk
 
-        assert self.decode_sas_metadata is not None
+        decode_sas_metadata = self.decode_sas_metadata
+        assert decode_sas_metadata is not None
 
         cu_seqlens_ori_kv = DeviceOperator.get_dsa_decode_cu_seqlens_ori_kv(
             self.decode_ratio_to_sas_metadata,
@@ -1041,114 +1251,132 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         metadata_op = DeviceOperator.get_dsa_sparse_attn_metadata_op()
         metadata_kwargs = DeviceOperator.get_dsa_sparse_attn_metadata_kwargs(self.seqused_q.device)
         cu_seqlens_cmp_kv = DeviceOperator.get_dsa_decode_cu_seqlens_cmp_kv(self.cu_seqlens_cmp_kv)
-        if self.compressor_ratio <= 1:
-            if self.decode_ratio_to_sas_metadata.get(layer_name) is None:
-                self.decode_ratio_to_sas_metadata[layer_name] = metadata_op(
-                    **metadata_kwargs,
-                    num_heads_q=n_local_heads,
-                    num_heads_kv=1,
-                    head_dim=self.model_config.get_head_size(),
-                    cu_seqlens_q=query_start_loc,  # cached
-                    cu_seqlens_ori_kv=cu_seqlens_ori_kv,
-                    cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
-                    seqused_q=self.seqused_q,
-                    seqused_kv=self.seq_lens[: self.num_decodes],  # cached
-                    max_seqlen_q=max_seqlen_q,
-                    max_seqlen_kv=max_seqlen_kv,
-                    batch_size=len(self.seq_lens[: self.num_decodes]),  # cached
-                    cmp_ratio=1,
-                    ori_mask_mode=4,
-                    cmp_mask_mode=3,
-                    ori_win_left=self.model_config.hf_config.sliding_window - 1,
-                    ori_win_right=0,
-                    layout_q="TND",
-                    layout_kv="PA_ND",
-                    has_ori_kv=True,
-                    has_cmp_kv=False,
-                )
-            self.decode_sas_metadata[:1024] = self.decode_ratio_to_sas_metadata[layer_name]
-        elif self.compressor_ratio == 4:
-            if self.decode_ratio_to_sas_metadata.get(layer_name) is None:
-                self.decode_ratio_to_sas_metadata[layer_name] = metadata_op(
-                    **metadata_kwargs,
-                    num_heads_q=n_local_heads,
-                    num_heads_kv=1,
-                    head_dim=self.model_config.get_head_size(),
-                    cu_seqlens_q=query_start_loc,  # cached
-                    cu_seqlens_ori_kv=cu_seqlens_ori_kv,
-                    cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
-                    seqused_q=self.seqused_q,
-                    seqused_kv=self.seq_lens[: self.num_decodes],  # cached
-                    max_seqlen_q=max_seqlen_q,
-                    max_seqlen_kv=max_seqlen_kv,
-                    batch_size=len(self.seq_lens[: self.num_decodes]),  # cached
-                    cmp_topk=index_topk,
-                    # topk=index_topk,
-                    cmp_ratio=4,
-                    ori_mask_mode=4,
-                    cmp_mask_mode=3,
-                    ori_win_left=self.model_config.hf_config.sliding_window - 1,
-                    ori_win_right=0,
-                    layout_q="TND",
-                    layout_kv="PA_ND",
-                    has_ori_kv=True,
-                    has_cmp_kv=True,
-                )
-            self.decode_sas_metadata[:1024] = self.decode_ratio_to_sas_metadata[layer_name]
-        else:
-            if self.decode_ratio_to_sas_metadata.get(layer_name) is None:
-                self.decode_ratio_to_sas_metadata[layer_name] = metadata_op(
-                    **metadata_kwargs,
-                    num_heads_q=n_local_heads,
-                    num_heads_kv=1,
-                    head_dim=self.model_config.get_head_size(),
-                    cu_seqlens_q=query_start_loc,
-                    cu_seqlens_ori_kv=cu_seqlens_ori_kv,
-                    cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
-                    seqused_q=self.seqused_q,
-                    seqused_kv=self.seq_lens[: self.num_decodes],
-                    max_seqlen_q=max_seqlen_q,
-                    max_seqlen_kv=max_seqlen_kv,
+        decode_metadata_cache = self.decode_ratio_to_sas_metadata
+
+        def build_sas_metadata() -> None:
+            if self.compressor_ratio <= 1:
+                if decode_metadata_cache.get(layer_name) is None:
+                    decode_metadata_cache[layer_name] = metadata_op(
+                        **metadata_kwargs,
+                        num_heads_q=n_local_heads,
+                        num_heads_kv=1,
+                        head_dim=self.model_config.get_head_size(),
+                        cu_seqlens_q=query_start_loc,  # cached
+                        cu_seqlens_ori_kv=cu_seqlens_ori_kv,
+                        cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
+                        seqused_q=self.seqused_q,
+                        seqused_kv=self.seq_lens[: self.num_decodes],  # cached
+                        max_seqlen_q=max_seqlen_q,
+                        max_seqlen_kv=max_seqlen_kv,
+                        batch_size=len(self.seq_lens[: self.num_decodes]),  # cached
+                        cmp_ratio=1,
+                        ori_mask_mode=4,
+                        cmp_mask_mode=3,
+                        ori_win_left=self.model_config.hf_config.sliding_window - 1,
+                        ori_win_right=0,
+                        layout_q="TND",
+                        layout_kv="PA_ND",
+                        has_ori_kv=True,
+                        has_cmp_kv=False,
+                    )
+                self.decode_sas_metadata[:1024] = decode_metadata_cache[layer_name]
+            elif self.compressor_ratio == 4:
+                if decode_metadata_cache.get(layer_name) is None:
+                    decode_metadata_cache[layer_name] = metadata_op(
+                        **metadata_kwargs,
+                        num_heads_q=n_local_heads,
+                        num_heads_kv=1,
+                        head_dim=self.model_config.get_head_size(),
+                        cu_seqlens_q=query_start_loc,  # cached
+                        cu_seqlens_ori_kv=cu_seqlens_ori_kv,
+                        cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
+                        seqused_q=self.seqused_q,
+                        seqused_kv=self.seq_lens[: self.num_decodes],  # cached
+                        max_seqlen_q=max_seqlen_q,
+                        max_seqlen_kv=max_seqlen_kv,
+                        batch_size=len(self.seq_lens[: self.num_decodes]),  # cached
+                        cmp_topk=index_topk,
+                        # topk=index_topk,
+                        cmp_ratio=4,
+                        ori_mask_mode=4,
+                        cmp_mask_mode=3,
+                        ori_win_left=self.model_config.hf_config.sliding_window - 1,
+                        ori_win_right=0,
+                        layout_q="TND",
+                        layout_kv="PA_ND",
+                        has_ori_kv=True,
+                        has_cmp_kv=True,
+                    )
+                self.decode_sas_metadata[:1024] = decode_metadata_cache[layer_name]
+            else:
+                if decode_metadata_cache.get(layer_name) is None:
+                    decode_metadata_cache[layer_name] = metadata_op(
+                        **metadata_kwargs,
+                        num_heads_q=n_local_heads,
+                        num_heads_kv=1,
+                        head_dim=self.model_config.get_head_size(),
+                        cu_seqlens_q=query_start_loc,
+                        cu_seqlens_ori_kv=cu_seqlens_ori_kv,
+                        cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
+                        seqused_q=self.seqused_q,
+                        seqused_kv=self.seq_lens[: self.num_decodes],
+                        max_seqlen_q=max_seqlen_q,
+                        max_seqlen_kv=max_seqlen_kv,
+                        batch_size=len(self.seq_lens[: self.num_decodes]),
+                        cmp_ratio=128,
+                        ori_mask_mode=4,
+                        cmp_mask_mode=3,
+                        ori_win_left=self.model_config.hf_config.sliding_window - 1,
+                        ori_win_right=0,
+                        layout_q="TND",
+                        layout_kv="PA_ND",
+                        has_ori_kv=True,
+                        has_cmp_kv=True,
+                    )
+                self.decode_sas_metadata[:1024] = decode_metadata_cache[layer_name]
+
+        def build_qli_metadata() -> None:
+            assert self.decode_qli_metadata is not None
+            if decode_metadata_cache.get("qli") is None:
+                decode_metadata_cache["qli"] = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer_metadata(
+                    actual_seq_lengths_query=query_start_loc[1:].clone(),
+                    actual_seq_lengths_key=self.seq_lens[: self.num_decodes].clone(),
+                    num_heads_q=self.model_config.hf_config.index_n_heads,  # 64
+                    num_heads_k=1,
+                    head_dim=self.model_config.hf_config.index_head_dim,  # 128
+                    query_quant_mode=0,
+                    key_quant_mode=0,
                     batch_size=len(self.seq_lens[: self.num_decodes]),
-                    cmp_ratio=128,
-                    ori_mask_mode=4,
-                    cmp_mask_mode=3,
-                    ori_win_left=self.model_config.hf_config.sliding_window - 1,
-                    ori_win_right=0,
-                    layout_q="TND",
-                    layout_kv="PA_ND",
-                    has_ori_kv=True,
-                    has_cmp_kv=True,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_kv,
+                    layout_query="TND",
+                    layout_key="PA_BSND",
+                    sparse_count=self.model_config.hf_config.index_topk,  # 512
+                    sparse_mode=3,
+                    pre_tokens=(1 << 63) - 1,
+                    next_tokens=(1 << 63) - 1,
+                    cmp_ratio=4,
+                    device=str(self.seqused_q.device),
                 )
-            self.decode_sas_metadata[:1024] = self.decode_ratio_to_sas_metadata[layer_name]
-        assert self.decode_qli_metadata is not None
-        if self.decode_ratio_to_sas_metadata.get("qli") is None:
-            self.decode_ratio_to_sas_metadata["qli"] = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer_metadata(
-                actual_seq_lengths_query=query_start_loc[1:].clone(),
-                actual_seq_lengths_key=self.seq_lens[: self.num_decodes].clone(),
-                num_heads_q=self.model_config.hf_config.index_n_heads,  # 64
-                num_heads_k=1,
-                head_dim=self.model_config.hf_config.index_head_dim,  # 128
-                query_quant_mode=0,
-                key_quant_mode=0,
-                batch_size=len(self.seq_lens[: self.num_decodes]),
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_kv,
-                layout_query="TND",
-                layout_key="PA_BSND",
-                sparse_count=self.model_config.hf_config.index_topk,  # 512
-                sparse_mode=3,
-                pre_tokens=(1 << 63) - 1,
-                next_tokens=(1 << 63) - 1,
-                cmp_ratio=4,
-                device=str(self.seqused_q.device),
+            self.decode_qli_metadata[:1024] = decode_metadata_cache.get("qli")
+
+        if self._device_metadata_enabled:
+            if self.compressor_ratio == 4:
+                self._device_metadata_tasks += (
+                    DeviceMetadataTask(DeviceMetadataStage.INDEXER, build_qli_metadata, id(self.decode_qli_metadata)),
+                )
+            self._device_metadata_tasks += (
+                DeviceMetadataTask(DeviceMetadataStage.ATTENTION, build_sas_metadata, id(self.decode_sas_metadata)),
             )
-        self.decode_qli_metadata[:1024] = self.decode_ratio_to_sas_metadata.get("qli")
+        else:
+            build_sas_metadata()
+            build_qli_metadata()
         decode_metadata = AscendDSADecodeMetadata(
             input_positions=input_positions,
             block_table=self.block_table[:block_table_size, ...],
             slot_mapping=slot_mapping,
             block_size=self.block_size,
+            cache_group_key=self.cache_group_key,
             num_compressed_tokens=num_compressed_tokens,
             seq_lens=self.seq_lens[: self.num_decodes],  # cached
             seq_lens_list=seq_lens_list,
@@ -1167,8 +1395,28 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             start_pos=self.start_pos_decode[: self.num_decodes],  # cached
             num_reqs_actual=num_decodes_actual,
             sas_metadata=self.decode_sas_metadata,
-            qli_metadata=self.decode_qli_metadata,
+            qli_metadata=(
+                self.decode_qli_metadata if self.compressor_ratio == 4 or not self._device_metadata_enabled else None
+            ),
         )
+        if self._device_metadata_enabled and self.decode_compressor_metadata_buffers is not None:
+            buffers = self.decode_compressor_metadata_buffers
+            outputs = (
+                buffers[0][:num_compressed_tokens],
+                buffers[1][:num_compressed_tokens],
+                buffers[2][:num_compressed_tokens],
+            )
+            group_id = id(buffers[0])
+            decode_metadata.compressor_metadata = outputs
+            decode_metadata.compressor_metadata_group_id = group_id
+            self._device_metadata_tasks = (
+                DeviceMetadataTask(
+                    DeviceMetadataStage.COMPRESSOR,
+                    lambda: build_compressor_metadata_out(decode_metadata, self.compressor_ratio, outputs),
+                    group_id,
+                ),
+                *self._device_metadata_tasks,
+            )
         return decode_metadata
 
     def build_for_drafting(
@@ -1303,6 +1551,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             block_table=block_table[reqs_start:, ...],
             slot_mapping=prefill_slot_mapping,
             block_size=self.block_size,
+            cache_group_key=self.cache_group_key,
             max_query_len=None,  # type: ignore[arg-type]
             max_seq_lens=None,  # type: ignore[arg-type]
             query_start_loc=prefill_query_start_loc,
@@ -1401,6 +1650,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             block_table=block_table[:num_decodes, ...],
             slot_mapping=slot_mapping,
             block_size=self.block_size,
+            cache_group_key=self.cache_group_key,
             seq_lens=seq_lens[:num_decodes],
             seq_lens_list=None,  # type: ignore[arg-type]
             max_seq_lens=None,  # type: ignore[arg-type]
@@ -1597,31 +1847,49 @@ class AscendDSAImpl(DSAAttentionImpl):
         self,
         metadata: AscendDSAPrefillMetadata | AscendDSADecodeMetadata,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        assert metadata.full_compress_cos is not None
-        assert metadata.full_compress_sin is not None
-        assert metadata.num_compressed_tokens is not None
-        assert metadata.start_pos is not None
-        assert metadata.num_reqs_actual is not None
-        full_compress_cos = metadata.full_compress_cos.view(
-            metadata.full_compress_cos.shape[0],
-            metadata.full_compress_cos.shape[-1],
+        if metadata.compressor_metadata is not None:
+            assert metadata.compressor_metadata_group_id is not None
+            wait_for_device_metadata(
+                DeviceMetadataStage.COMPRESSOR,
+                metadata.compressor_metadata_group_id,
+            )
+            return metadata.compressor_metadata
+        return get_or_compute_compressor_metadata(metadata, self.compress_ratio)
+
+    def _forward_compressor(
+        self,
+        hidden_states: torch.Tensor,
+        state_cache: torch.Tensor,
+        compressor_metadata: AscendDSAPrefillMetadata | AscendDSADecodeMetadata,
+        compressor_state_metadata: AscendDSAPrefillMetadata | AscendDSADecodeMetadata,
+        actual_seq_lengths_query: torch.Tensor,
+        start_pos: torch.Tensor,
+    ) -> CompressorForwardOutput:
+        coff = 2 if self.compressor_overlap else 1
+        compress_cos, compress_sin, compress_slot_mapping = self._compute_compressor_metadata(
+            compressor_metadata,
         )
-        full_compress_sin = metadata.full_compress_sin.view(
-            metadata.full_compress_sin.shape[0],
-            metadata.full_compress_sin.shape[-1],
+        compressed_kv = torch.ops._C_ascend.compressor(
+            hidden_states,
+            self.compressor_wkv.weight,
+            self.compressor_wgate.weight,
+            state_cache.squeeze(-2),
+            self.compressor_ape,
+            self.compressor_norm.weight,
+            compress_sin.view(-1, compress_sin.shape[-1]),
+            compress_cos.view(-1, compress_cos.shape[-1]),
+            state_block_table=compressor_state_metadata.block_table,
+            cu_seqlens=actual_seq_lengths_query,
+            seqused=None,
+            start_pos=start_pos,
+            rope_head_dim=self.rope_head_dim,
+            cmp_ratio=self.compress_ratio,
+            coff=coff,
+            norm_eps=self.compressor_norm_eps,
+            rotary_mode=2,
+            cache_mode=1,
         )
-        return torch.ops._C_ascend.compressor_metadata(
-            full_compress_cos,
-            full_compress_sin,
-            metadata.query_start_loc,
-            metadata.start_pos,
-            metadata.block_table,
-            metadata.block_size,
-            DeviceOperator.get_dsa_compressor_slot_mapping_format(),
-            self.compress_ratio,
-            metadata.num_compressed_tokens,
-            metadata.num_reqs_actual,
-        )
+        return compressed_kv, compress_slot_mapping
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         # Attention impls are not walked by vllm's process_weights_after_loading
@@ -1833,14 +2101,23 @@ class AscendDSAImpl(DSAAttentionImpl):
 
         return output_padded
 
-    def _mla_prolog_multistream(self, hidden_states, cos, sin, swa_kv_cache, slot_mapping, is_prefill=False):
+    def _mla_prolog_multistream(
+        self,
+        hidden_states,
+        cos,
+        sin,
+        swa_kv_cache,
+        slot_mapping,
+        is_prefill=False,
+        tail_overlap_fn: Callable[[], CompressorForwardOutput] | None = None,
+    ):
         """3-block multi-stream: 3-stage CV parallel + serial tail
 
         Block partition (V: Vector, C: Cube, AIV: AI Vector):
           Part1: q_quant[V] -> q_a_down[C]  ||  kv_quant[V]
           Part2: q_norm[V] + q_b_quant[V]  ||  kv_matmul[C]
           Part3: q_b_matmul[C]             ||  kv_norm[V] + rope[V] + scatter[AIV]
-          Tail:  q_rms[V] + rope[V] (wait for auxiliary stream to complete)
+          Tail:  q_rms[V] + rope[V]  ||  optional compressor metadata + compressor
 
         Each stream's data is self-contained; no cross-stream sync is needed between blocks.
         Only the tail wait_stream ensures scatter is complete.
@@ -1916,8 +2193,18 @@ class AscendDSAImpl(DSAAttentionImpl):
         else:
             q = self.cv_wq_b.matmul(q_b_quant, q_b_scale).unflatten(-1, (self.n_local_heads, self.head_dim))
 
-        # Serial tail: wait for auxiliary stream then execute q_rms[V] + rope[V]
+        # Join the Q and SWA-KV branches, then reuse the auxiliary stream for
+        # independent tail work while q_rms[V] + rope[V] run on the main stream.
         main_stream.wait_stream(aux_stream)
+
+        tail_overlap_output: CompressorOverlapOutput | None = None
+        if tail_overlap_fn is not None:
+            e_tail_start = main_stream.record_event()
+            with npu_stream_switch(aux_stream, enabled=True):
+                torch.npu.current_stream().wait_event(e_tail_start)
+                overlap_result = tail_overlap_fn()
+                e_tail_overlap_done = torch.npu.current_stream().record_event()
+            tail_overlap_output = overlap_result, e_tail_overlap_done
 
         q = DeviceOperator.apply_dsa_q_rms(q, self.eps, self.q_norm_without_weight)
         torch.ops._C_ascend.inplace_partial_rotary_mul(
@@ -1928,7 +2215,7 @@ class AscendDSAImpl(DSAAttentionImpl):
             partial_slice=[self.nope_head_dim, self.head_dim],
         )
 
-        return q, qr, qr_pertoken_scale
+        return q, qr, qr_pertoken_scale, tail_overlap_output
 
     def _forward_prefill(
         self,
@@ -1968,12 +2255,39 @@ class AscendDSAImpl(DSAAttentionImpl):
         )
         ori_win_right = 0 if swa_prefill_metadata.ori_win_right is None else swa_prefill_metadata.ori_win_right
 
+        compressor_prefill_metadata = None
+        compressor_state_prefill_metadata = None
+        compressor_tail_fn = None
+        if self.compress_ratio > 1:
+            compressor_prefill_metadata = _require_prefill_metadata(compressor_attn_metadata)
+            compressor_state_prefill_metadata = _require_prefill_metadata(compressor_kv_state_metadata)
+            if self.multistream_dsv4_dsa_overlap:
+
+                def compressor_tail_fn() -> CompressorForwardOutput:
+                    assert compressor_prefill_metadata is not None
+                    assert compressor_state_prefill_metadata is not None
+                    return self._forward_compressor(
+                        hidden_states,
+                        state_cache,
+                        compressor_prefill_metadata,
+                        compressor_state_prefill_metadata,
+                        actual_seq_lengths_query,
+                        common_prefill_metadata.start_pos,
+                    )
+
         if self.multistream_dsv4_dsa_overlap:
             # mla prolog: q + kv dual-stream parallel
-            q, qr, _ = self._mla_prolog_multistream(
-                hidden_states, cos, sin, swa_kv_cache, swa_prefill_metadata.slot_mapping, is_prefill=True
+            q, qr, _, compressor_overlap_output = self._mla_prolog_multistream(
+                hidden_states,
+                cos,
+                sin,
+                swa_kv_cache,
+                swa_prefill_metadata.slot_mapping,
+                is_prefill=True,
+                tail_overlap_fn=compressor_tail_fn,
             )
         else:
+            compressor_overlap_output = None
             # mlaprolog
             share_hs_quant = _is_w8a8_dynamic(self.wq_a) and _is_w8a8_dynamic(self.wkv)
             if share_hs_quant:
@@ -2050,6 +2364,7 @@ class AscendDSAImpl(DSAAttentionImpl):
             if swa_prefill_metadata.dspark_swa_indices is not None:
                 extra_attn_kwargs["ori_sparse_indices"] = swa_prefill_metadata.dspark_swa_indices
             notify_kv_cache_written(layer_name)
+            wait_for_device_metadata(DeviceMetadataStage.ATTENTION, id(common_prefill_metadata.sas_metadata))
             record_attention_compute_start()
             return attn_op(
                 q,
@@ -2070,8 +2385,8 @@ class AscendDSAImpl(DSAAttentionImpl):
             )[0]
 
         if self.compress_ratio > 1:
-            compressor_prefill_metadata = _require_prefill_metadata(compressor_attn_metadata)
-            compressor_state_prefill_metadata = _require_prefill_metadata(compressor_kv_state_metadata)
+            assert compressor_prefill_metadata is not None
+            assert compressor_state_prefill_metadata is not None
             compress_topk_idxs = None
             # Only call indexer_select_qli when compress_ratio == 4 (requires 5 elements in attn_metadata)
             if self.compress_ratio == 4:
@@ -2108,36 +2423,22 @@ class AscendDSAImpl(DSAAttentionImpl):
                             qr_pertoken_scale=qr_pertoken_scale,
                         )
 
-            coff = 2 if self.compressor_overlap else 1
-            compress_cos, compress_sin, compress_slot_mapping = self._compute_compressor_metadata(
-                compressor_prefill_metadata,
-            )
-
-            # Inline compressor + scatter (c128, c4 non-dual)
-            compressed_kv = torch.ops._C_ascend.compressor(
-                hidden_states,
-                self.compressor_wkv.weight,
-                self.compressor_wgate.weight,
-                state_cache.squeeze(-2),
-                self.compressor_ape,
-                self.compressor_norm.weight,
-                compress_sin.view(-1, compress_sin.shape[-1]),
-                compress_cos.view(-1, compress_cos.shape[-1]),
-                state_block_table=compressor_state_prefill_metadata.block_table,
-                cu_seqlens=actual_seq_lengths_query,
-                seqused=None,
-                start_pos=common_prefill_metadata.start_pos,
-                rope_head_dim=self.rope_head_dim,
-                cmp_ratio=self.compress_ratio,
-                coff=coff,
-                norm_eps=self.compressor_norm_eps,
-                rotary_mode=2,
-                cache_mode=1,
-            )
+            if compressor_overlap_output is not None:
+                (compressed_kv, compress_slot_mapping), compressor_done = compressor_overlap_output
+                torch.npu.current_stream().wait_event(compressor_done)
+            else:
+                compressed_kv, compress_slot_mapping = self._forward_compressor(
+                    hidden_states,
+                    state_cache,
+                    compressor_prefill_metadata,
+                    compressor_state_prefill_metadata,
+                    actual_seq_lengths_query,
+                    common_prefill_metadata.start_pos,
+                )
 
             # For multistream_dsv4_dsa_overlap with compress_ratio=4:
             # aux_stream: indexer_weights_proj (parallel with main q_quant + kv_scatter)
-            # main stream: compressed_kv -> q_quant -> kv_scatter -> wait aux_stream -> lightning_indexer
+            # main stream: wait/use compressed_kv -> q_quant -> kv_scatter -> wait aux_stream -> lightning_indexer
             if self.multistream_dsv4_dsa_overlap and self.compress_ratio == 4 and not self.skip_topk:
                 main_stream = torch.npu.current_stream()
                 aux_stream = dsv4_dsa_overlap_stream()
@@ -2163,6 +2464,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 kvlens = indexer_scale_prefill_metadata.seq_lens
                 block_table = indexer_scale_prefill_metadata.block_table
                 qli_metadata = indexer_scale_prefill_metadata.qli_metadata
+                wait_for_device_metadata(DeviceMetadataStage.INDEXER, id(qli_metadata))
                 compress_topk_idxs, _ = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer(
                     query=q_quant,
                     key=indexer_k_cache,
@@ -2189,6 +2491,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 self._update_indexcache_topk_indices(compress_topk_idxs, offset=prefill_offset)
 
             notify_kv_cache_written(layer_name)
+            wait_for_device_metadata(DeviceMetadataStage.ATTENTION, id(common_prefill_metadata.sas_metadata))
             record_attention_compute_start()
 
             if self.compress_ratio == 4:
@@ -2281,12 +2584,39 @@ class AscendDSAImpl(DSAAttentionImpl):
         )
         ori_win_right = 0 if swa_decode_metadata.ori_win_right is None else swa_decode_metadata.ori_win_right
 
+        compressor_decode_metadata = None
+        compressor_state_decode_metadata = None
+        compressor_tail_fn = None
+        if self.compress_ratio > 1:
+            compressor_decode_metadata = _require_decode_metadata(compressor_attn_metadata)
+            compressor_state_decode_metadata = _require_decode_metadata(compressor_kv_state_metadata)
+            if self.multistream_dsv4_dsa_overlap:
+
+                def compressor_tail_fn() -> CompressorForwardOutput:
+                    assert compressor_decode_metadata is not None
+                    assert compressor_state_decode_metadata is not None
+                    return self._forward_compressor(
+                        hidden_states,
+                        state_cache,
+                        compressor_decode_metadata,
+                        compressor_state_decode_metadata,
+                        actual_seq_lengths_query,
+                        common_decode_metadata.start_pos,
+                    )
+
         if self.multistream_dsv4_dsa_overlap:
             # mla prolog: q + kv dual-stream parallel
-            q, qr, qr_pertoken_scale = self._mla_prolog_multistream(
-                hidden_states, cos, sin, swa_kv_cache, swa_decode_metadata.slot_mapping, is_prefill=False
+            q, qr, qr_pertoken_scale, compressor_overlap_output = self._mla_prolog_multistream(
+                hidden_states,
+                cos,
+                sin,
+                swa_kv_cache,
+                swa_decode_metadata.slot_mapping,
+                is_prefill=False,
+                tail_overlap_fn=compressor_tail_fn,
             )
         else:
+            compressor_overlap_output = None
             # Share one dynamic-quant of hidden_states between wq_a (main stream)
             # and wkv (attention stream) when both sides are W8A8 dynamic.
             share_hs_quant = _is_w8a8_dynamic(self.wq_a) and _is_w8a8_dynamic(self.wkv)
@@ -2371,8 +2701,8 @@ class AscendDSAImpl(DSAAttentionImpl):
             DeviceOperator.dsa_kv_compress_scatter(swa_kv_cache, kv, swa_decode_metadata.slot_mapping)
 
         if self.compress_ratio > 1:
-            compressor_decode_metadata = _require_decode_metadata(compressor_attn_metadata)
-            compressor_state_decode_metadata = _require_decode_metadata(compressor_kv_state_metadata)
+            assert compressor_decode_metadata is not None
+            assert compressor_state_decode_metadata is not None
             compress_topk_idxs = None
             if self.compress_ratio == 4:
                 # IndexCache: decode segment occupies buffer[:num_decode_tokens]
@@ -2406,36 +2736,22 @@ class AscendDSAImpl(DSAAttentionImpl):
                             qr_pertoken_scale=qr_pertoken_scale,
                         )
 
-            coff = 2 if self.compressor_overlap else 1
-            compress_cos, compress_sin, compress_slot_mapping = self._compute_compressor_metadata(
-                compressor_decode_metadata,
-            )
-
-            # Inline compressor + scatter (c128, c4 non-dual)
-            compressed_kv = torch.ops._C_ascend.compressor(
-                hidden_states,
-                self.compressor_wkv.weight,
-                self.compressor_wgate.weight,
-                state_cache.squeeze(-2),
-                self.compressor_ape,
-                self.compressor_norm.weight,
-                compress_sin.view(-1, compress_sin.shape[-1]),
-                compress_cos.view(-1, compress_cos.shape[-1]),
-                state_block_table=compressor_state_decode_metadata.block_table,
-                cu_seqlens=actual_seq_lengths_query,
-                seqused=None,
-                start_pos=common_decode_metadata.start_pos,
-                rope_head_dim=self.rope_head_dim,
-                cmp_ratio=self.compress_ratio,
-                coff=coff,
-                norm_eps=self.compressor_norm_eps,
-                rotary_mode=2,
-                cache_mode=1,
-            )
+            if compressor_overlap_output is not None:
+                (compressed_kv, compress_slot_mapping), compressor_done = compressor_overlap_output
+                torch.npu.current_stream().wait_event(compressor_done)
+            else:
+                compressed_kv, compress_slot_mapping = self._forward_compressor(
+                    hidden_states,
+                    state_cache,
+                    compressor_decode_metadata,
+                    compressor_state_decode_metadata,
+                    actual_seq_lengths_query,
+                    common_decode_metadata.start_pos,
+                )
 
             # For multistream_dsv4_dsa_overlap with compress_ratio=4:
             # aux_stream: indexer_weights_proj (parallel with main q_quant + kv_scatter)
-            # main stream: compressed_kv -> q_quant -> kv_scatter -> wait aux_stream -> lightning_indexer
+            # main stream: wait/use compressed_kv -> q_quant -> kv_scatter -> wait aux_stream -> lightning_indexer
             if self.multistream_dsv4_dsa_overlap and self.compress_ratio == 4 and not self.skip_topk:
                 main_stream = torch.npu.current_stream()
                 aux_stream = dsv4_dsa_overlap_stream()
@@ -2461,6 +2777,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 kvlens = indexer_scale_decode_metadata.seq_lens
                 block_table = indexer_scale_decode_metadata.block_table
                 qli_metadata = indexer_scale_decode_metadata.qli_metadata
+                wait_for_device_metadata(DeviceMetadataStage.INDEXER, id(qli_metadata))
                 compress_topk_idxs, _ = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer(
                     query=q_quant,
                     key=indexer_k_cache,
@@ -2487,6 +2804,12 @@ class AscendDSAImpl(DSAAttentionImpl):
                 self._update_indexcache_topk_indices(compress_topk_idxs, offset=0)
 
         notify_kv_cache_written(layer_name)
+        if self.compress_ratio <= 1:
+            sas_metadata = swa_decode_metadata.sas_metadata
+        else:
+            assert compressor_decode_metadata is not None
+            sas_metadata = compressor_decode_metadata.sas_metadata
+        wait_for_device_metadata(DeviceMetadataStage.ATTENTION, id(sas_metadata))
         record_attention_compute_start()
         attn_op = DeviceOperator.get_dsa_sparse_attn_op()
         extra_attn_kwargs: dict = DeviceOperator.get_dsa_sparse_attn_base_kwargs()
@@ -2512,6 +2835,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 **extra_attn_kwargs,
             )[0]
         elif self.compress_ratio == 4:
+            assert compressor_decode_metadata is not None
             attn_output = attn_op(
                 q,
                 ori_kv=swa_kv_cache,
@@ -2534,6 +2858,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 **extra_attn_kwargs,
             )[0]
         else:
+            assert compressor_decode_metadata is not None
             attn_output = attn_op(
                 q,
                 ori_kv=swa_kv_cache,
@@ -2729,6 +3054,7 @@ class AscendDSAImpl(DSAAttentionImpl):
             block_table = indexer_kv_scale_metadata.decode.block_table
             qli_metadata = indexer_kv_scale_metadata.decode.qli_metadata
 
+        wait_for_device_metadata(DeviceMetadataStage.INDEXER, id(qli_metadata))
         topk_idxs, _ = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer(
             query=q,
             key=indexer_k_cache,

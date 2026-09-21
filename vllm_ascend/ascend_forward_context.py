@@ -108,6 +108,7 @@ def set_ascend_forward_context(
     skip_compiled: bool = False,
     max_tokens_across_pcp: int = 0,
     draft_attn_metadatas=None,
+    device_metadata_executor=None,
     has_sinks=False,
     input_ids=None,
     eplb_heat_collection_status: bool = False,
@@ -128,6 +129,7 @@ def set_ascend_forward_context(
     with set_forward_context(**forward_context_kwargs):
         forward_context = get_forward_context()
         forward_context.draft_attn_metadatas = draft_attn_metadatas
+        forward_context.device_metadata_executor = device_metadata_executor
 
         forward_context.input_ids = input_ids
 

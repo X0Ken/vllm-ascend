@@ -151,6 +151,11 @@ class AscendConfig:
         self.dspark_main_proj_tp = additional_config.get("dspark_main_proj_tp", False)
         if not isinstance(self.dspark_main_proj_tp, bool):
             raise ValueError("additional_config.dspark_main_proj_tp must be a bool")
+        # Opt-in target-model DSA metadata overlap; CP and draft builders keep
+        # their synchronous paths. Disable to compare or restore scheduling.
+        self.async_dsv4_metadata = additional_config.get("async_dsv4_metadata", False)
+        if not isinstance(self.async_dsv4_metadata, bool):
+            raise ValueError("additional_config.async_dsv4_metadata must be a bool")
         self.enable_prefill_mc2 = bool(additional_config.get("enable_prefill_mc2", False))
 
         self.enable_fused_mc2 = self._get_config_value(

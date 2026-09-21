@@ -67,6 +67,7 @@ class TestAscendConfig(TestBase):
         ascend_config = init_ascend_config(test_vllm_config)
         self.assertFalse(ascend_config.multistream_overlap_shared_expert)
         self.assertFalse(ascend_config.dspark_main_proj_tp)
+        self.assertFalse(ascend_config.async_dsv4_metadata)
         self.assertFalse(ascend_config.enable_kv_nz)
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
@@ -88,6 +89,7 @@ class TestAscendConfig(TestBase):
             },
             "multistream_overlap_shared_expert": True,
             "dspark_main_proj_tp": True,
+            "async_dsv4_metadata": True,
             "eplb_config": {"num_redundant_experts": 2},
             "refresh": True,
             "enable_kv_nz": False,
@@ -96,6 +98,7 @@ class TestAscendConfig(TestBase):
         self.assertEqual(ascend_config.eplb_config.num_redundant_experts, 2)
         self.assertTrue(ascend_config.multistream_overlap_shared_expert)
         self.assertTrue(ascend_config.dspark_main_proj_tp)
+        self.assertTrue(ascend_config.async_dsv4_metadata)
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
         self.assertFalse(ascend_compilation_config.fuse_norm_quant)

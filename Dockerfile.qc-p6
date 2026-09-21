@@ -1,0 +1,27 @@
+# Incremental ARM64 image; build.sh verifies the local p5 image ID first.
+ARG BASE_IMAGE=qc-ascend-dsv4:p5-20260916
+FROM ${BASE_IMAGE}
+ARG ASCEND_REVISION
+LABEL org.opencontainers.image.source="https://github.com/X0Ken/vllm-ascend" \
+      org.opencontainers.image.revision="${ASCEND_REVISION}" \
+      org.opencontainers.image.version="p6-20260921" \
+      org.opencontainers.image.base.name="qc-ascend-dsv4:p5-20260916" \
+      qc.base.image-id="sha256:9c9e0df4acd1a74a1a246c1cc0deba9d4b00d2c2976d706c85ba23659c63ec8f" \
+      qc.vllm-ascend.revision="${ASCEND_REVISION}" \
+      qc.validation.scope="See external p6 validation manifest"
+COPY source.bundle /tmp/qc-p6/source.bundle
+RUN set -eu; \
+    cd /vllm-workspace/vllm-ascend; \
+    test "$(git rev-parse HEAD)" = "98a40f41d3005e470f0917e192d16b75422252cc"; \
+    sha256sum vllm_ascend/*.so > /tmp/qc-p6/native.sha256; \
+    python3 -m pip freeze --all | sort > /tmp/qc-p6/packages.before; \
+    git fetch /tmp/qc-p6/source.bundle qc-ascend-dsv4; \
+    git checkout --force --detach "${ASCEND_REVISION}"; \
+    COMPILE_CUSTOM_KERNELS=0 python3 -m pip install --no-index --no-deps --no-build-isolation -e .; \
+    sha256sum -c /tmp/qc-p6/native.sha256; \
+    test "$(git rev-parse HEAD)" = "${ASCEND_REVISION}"; \
+    mkdir -p /opt/qc-p6; \
+    cp /tmp/qc-p6/native.sha256 /opt/qc-p6/native.sha256; \
+    cp /tmp/qc-p6/packages.before /opt/qc-p6/packages-p5.txt; \
+    python3 -m pip freeze --all | sort > /opt/qc-p6/packages-p6.txt; \
+    rm -rf /tmp/qc-p6
