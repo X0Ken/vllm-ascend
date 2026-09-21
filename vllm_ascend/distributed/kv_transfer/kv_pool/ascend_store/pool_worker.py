@@ -73,8 +73,10 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     get_group_cache_family,
     get_partial_block_index,
     infer_cache_transfer_granularity,
+    infer_cacheable_group_ids,
     infer_group_block_sizes,
     infer_group_cache_families,
+    infer_hash_block_size,
     infer_tp_mismatch_info,
     uses_hybrid_kv_cache,
 )
@@ -169,14 +171,10 @@ class KVPoolWorker:
         self.original_block_size = infer_group_block_sizes(vllm_config.cache_config.block_size, kv_cache_groups)
         cp_scale = self.pcp_size * self.dcp_size
         self.grouped_block_size = [block_size * cp_scale for block_size in self.original_block_size]
-        requested_hash_block_size = vllm_config.cache_config.prefix_match_unit
-        if not isinstance(requested_hash_block_size, int):
-            requested_hash_block_size = None
         self.hash_block_size = (
-            requested_hash_block_size if requested_hash_block_size is not None else min(self.original_block_size)
-        ) * cp_scale
-        for group_block_size in self.grouped_block_size:
-            assert group_block_size % self.hash_block_size == 0, "block_size must be divisible by hash_block_size"
+            infer_hash_block_size(self.original_block_size, kv_cache_groups, vllm_config.cache_config.prefix_match_unit)
+            * cp_scale
+        )
         self.block_size = self.grouped_block_size[0]
         self.lcm_block_size = math.lcm(*self.grouped_block_size)
         self.num_kv_cache_groups = len(self.grouped_block_size)
@@ -312,6 +310,10 @@ class KVPoolWorker:
         )
         self.cache_coordinator = self._build_cache_coordinator(vllm_config)
         self.token_database.cache_coordinator = self.cache_coordinator
+        groups = self.kv_cache_config.kv_cache_groups if self.kv_cache_config is not None else None
+        self.token_database.non_cacheable_group_ids = set(range(self.num_kv_cache_groups)) - infer_cacheable_group_ids(
+            groups
+        )
 
     def _init_backend(self, parallel_config, extra_config) -> None:
         backend = backend_map.get(self.backend.lower())
@@ -2260,6 +2262,8 @@ class KVPoolWorker:
         lookup_masks = self.cache_coordinator.lookup_mask(aligned_len)
 
         for group_id in kv_cache_group_ids:
+            if group_id not in self.cache_coordinator.cacheable_group_ids:
+                continue
             keys: list[str] = []
             chunk_hashes: list[BlockHash | str] = []
             variant_counts: list[int] = []

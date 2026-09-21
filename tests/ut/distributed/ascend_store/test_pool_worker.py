@@ -225,6 +225,7 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         worker.num_kv_cache_groups = 1
         worker.cache_coordinator = MagicMock()
         worker.cache_coordinator.lcm_block_size = 128
+        worker.cache_coordinator.cacheable_group_ids = {0}
         worker.cache_coordinator.lookup_mask.return_value = ([True],)
         worker.cache_coordinator.store_mask.return_value = ([False],)
         worker.cache_coordinator.find_longest_cache_hit.return_value = ((), 128)

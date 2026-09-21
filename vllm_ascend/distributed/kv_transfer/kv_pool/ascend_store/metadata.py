@@ -13,6 +13,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import BlockHash, BlockHashList
 from vllm.v1.kv_cache_interface import FullAttentionSpec, UniformTypeKVCacheSpecs
 
+from vllm_ascend.core.circular_buffer import prefix_cacheable
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import AttentionComputeStartGate
 
 
@@ -251,6 +252,26 @@ def uses_hybrid_kv_cache(scheduler_config: Any, kv_cache_groups: Sequence[Any] |
     )
 
 
+def infer_cacheable_group_ids(kv_cache_groups: Sequence[Any] | None) -> set[int]:
+    """Keep private scratch groups out of external prefix lookup and transfer."""
+    if not kv_cache_groups:
+        return {0}
+    return {i for i, group in enumerate(kv_cache_groups) if prefix_cacheable(group.kv_cache_spec)}
+
+
+def infer_hash_block_size(
+    block_sizes: list[int], kv_cache_groups: Sequence[Any] | None, prefix_match_unit: int | None
+) -> int:
+    # Match the engine's prefix hashing: circular scratch has a storage block
+    # size, but does not contribute to prefix-cache hash granularity.
+    cacheable_ids = infer_cacheable_group_ids(kv_cache_groups)
+    cacheable_sizes = [block_sizes[i] for i in sorted(cacheable_ids)]
+    hash_block_size = prefix_match_unit if isinstance(prefix_match_unit, int) else min(cacheable_sizes or block_sizes)
+    for block_size in cacheable_sizes:
+        assert block_size % hash_block_size == 0, "block_size must be divisible by hash_block_size"
+    return hash_block_size
+
+
 def infer_group_block_sizes(
     cache_block_size: int,
     kv_cache_groups: Sequence[Any] | None,
@@ -312,6 +333,7 @@ class ChunkedTokenDatabase:
         self.hash_block_size = self.block_size[0] if hash_block_size is None else hash_block_size
         self._key_prefix_cache: dict[tuple[int, str, str], str] = {}
         self.cache_coordinator: Any | None = None
+        self.non_cacheable_group_ids: set[int] = set()
 
     def _get_key_prefix(
         self,
@@ -501,7 +523,7 @@ class ChunkedTokenDatabase:
         shard_rank: int | None = None,
         shard_size: int | None = None,
     ) -> Iterable[tuple[int, int, BlockHash | str, int | None]]:
-        if not block_hashes:
+        if not block_hashes or kv_cache_group_id in self.non_cacheable_group_ids:
             return
         logical_block_size = self.get_block_size(kv_cache_group_id)
         grouped_hashes = get_block_hashes(block_hashes, logical_block_size, self.hash_block_size)

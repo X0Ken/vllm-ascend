@@ -282,7 +282,8 @@ class _FakeSingleTypeKVCacheManager:
     ):
         computed: tuple[list[object], ...] = tuple([] for _ in kv_cache_group_ids)
         max_blocks = max_length // kv_cache_spec.block_size
-        for block_hash in list(block_hashes)[:max_blocks]:
+        hash_stride = kv_cache_spec.block_size // block_pool.hash_block_size
+        for block_hash in list(block_hashes)[hash_stride - 1 :: hash_stride][:max_blocks]:
             cached = block_pool.get_cached_block(block_hash, kv_cache_group_ids)
             if not cached:
                 break
@@ -291,7 +292,7 @@ class _FakeSingleTypeKVCacheManager:
         if drop_eagle_block and computed and computed[0]:
             for blocks in computed:
                 blocks.pop()
-        return computed
+        return computed, len(computed[0]) * kv_cache_spec.block_size if computed else 0
 
 
 class _FakeSlidingWindowManager(_FakeSingleTypeKVCacheManager):

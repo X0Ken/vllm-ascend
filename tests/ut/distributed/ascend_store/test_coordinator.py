@@ -94,7 +94,45 @@ class _FakeCompressedManager:
         return computed, len(computed[0]) * logical_block_size
 
 
+@dataclass(frozen=True)
+class _PrivateScratchSpec:
+    block_size: int = 32
+    prefix_cacheable: bool = False
+
+
 class TestAscendStoreCoordinator(unittest.TestCase):
+    def test_private_scratch_neither_limits_hits_nor_gets_transferred(self):
+        coord = AscendStoreCoordinator(
+            [
+                KVCacheGroupSpec(["full"], _full_spec(128)),
+                KVCacheGroupSpec(["scratch"], _PrivateScratchSpec()),
+                KVCacheGroupSpec(["swa"], _sliding_spec(128, 128)),
+            ],
+            scheduler_block_size=128,
+            hash_block_size=128,
+            group_block_sizes=[128, 32, 128],
+            group_cache_families=["default", "default", "swa"],
+        )
+        hashes = _hashes(4)
+        exists = {(g, h) for g in [0, 2] for h in hashes}
+        masks, hit = coord.find_longest_cache_hit(hashes, 512, ExternalCachedBlockPool(128, exists))
+        self.assertEqual(hit, 512)
+        self.assertEqual(masks[1], [])
+        self.assertEqual(coord.load_mask(hashes, 512)[1], [])
+        self.assertEqual(coord.store_mask(512)[1], [False] * 16)
+        self.assertEqual(coord.lookup_mask(512)[1], [False] * 16)
+        self.assertEqual(coord.cacheable_group_ids, {0, 2})
+
+    def test_only_private_scratch_cannot_report_a_cache_hit(self):
+        coord = AscendStoreCoordinator(
+            [KVCacheGroupSpec(["scratch"], _PrivateScratchSpec())],
+            scheduler_block_size=128,
+            hash_block_size=128,
+            group_block_sizes=[32],
+            group_cache_families=["default"],
+        )
+        self.assertEqual(coord.find_longest_cache_hit(_hashes(4), 512, ExternalCachedBlockPool(128)), (([],), 0))
+
     def test_compressed_group_hits_on_effective_granularity(self):
         block_hashes = _hashes(128)
         grouped_hash = get_block_hashes(block_hashes, group_block_size=128 * 128, hash_block_size=128)[0]

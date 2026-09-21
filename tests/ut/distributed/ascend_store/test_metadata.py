@@ -33,12 +33,40 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     get_group_block_size,
     get_group_cache_family,
     infer_cache_transfer_granularity,
+    infer_cacheable_group_ids,
     infer_group_block_sizes,
+    infer_hash_block_size,
     uses_hybrid_kv_cache,
 )
 
 
 class TestCacheLayoutHelpers(unittest.TestCase):
+    def test_private_scratch_does_not_define_prefix_hash_granularity(self):
+        groups = [
+            SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=128)),
+            SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=32, prefix_cacheable=False)),
+            SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=128)),
+        ]
+        self.assertEqual(infer_cacheable_group_ids(groups), {0, 2})
+        self.assertEqual(infer_hash_block_size([128, 32, 128], groups, None), 128)
+        self.assertEqual(infer_hash_block_size([128, 32, 128], groups, 64), 64)
+        self.assertEqual(infer_hash_block_size([128], None, None), 128)
+        with self.assertRaises(AssertionError):
+            infer_hash_block_size([128, 32, 128], groups, 96)
+
+    def test_private_scratch_is_never_transferred(self):
+        db = ChunkedTokenDatabase(
+            [KeyMetadata("v41", 0, 0, 0, 0, i) for i in range(3)],
+            [128, 32, 128],
+            None,
+            hash_block_size=128,
+        )
+        db.non_cacheable_group_ids = {1}
+        hashes = [b"a" * 32, b"b" * 32]
+        self.assertEqual(list(db._iter_token_chunks(256, hashes, kv_cache_group_id=1)), [])
+        self.assertEqual(len(list(db._iter_token_chunks(256, hashes, kv_cache_group_id=0))), 2)
+        self.assertEqual(len(list(db._iter_token_chunks(256, hashes, kv_cache_group_id=2))), 2)
+
     def test_uses_hybrid_kv_cache(self):
         groups = [
             SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16)),
