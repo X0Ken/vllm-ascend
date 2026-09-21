@@ -389,6 +389,8 @@ class AscendConfig:
     enable_engram: bool = True
     # Keep Engram tables on CPU and transfer only requested BF16 rows.
     enable_engram_ple_offload: bool = False
+    # Fuse the inverse RoPE sign into the native operator for V4.1 only.
+    enable_dsv41_rope_negate_sin: bool = False
     # Overlap the offloaded CPU lookup with eager prefill/mixed execution.
     # Captured decode graphs keep the synchronous refresh.
     enable_engram_prefetch: bool = False

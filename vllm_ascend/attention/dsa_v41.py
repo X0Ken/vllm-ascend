@@ -26,6 +26,7 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
 )
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.dsa_v1 import build_dspark_swa_indices, dsv4_dsa_overlap_stream
 from vllm_ascend.core.deepseek_v41 import (
     DeepseekV41CompressorStateSpec,
@@ -253,8 +254,11 @@ class DeepseekV41EagerAttentionImpl:
     model construction is independent from cache-aware attention execution.
     """
 
+    negate_sin = False
+
     def __init__(self, prefix, role, topology, long_kv_source_prefix, index_k_source_prefix):
         self.prefix = prefix
+        self.negate_sin = get_ascend_config().enable_dsv41_rope_negate_sin
         self.layer_name = f"{prefix}.attn"
         self.role = role
         self.topology = topology
@@ -643,9 +647,10 @@ class DeepseekV41EagerAttentionImpl:
             torch.ops._C_ascend.inplace_partial_rotary_mul(
                 attention_output.unsqueeze(1),
                 cos,
-                -sin,
+                sin if self.negate_sin else -sin,
                 rotary_mode="interleave",
                 partial_slice=[attn.nope_head_dim, attn.head_dim],
+                negate_sin=self.negate_sin,
             )
         else:
             heads = attn.n_heads if getattr(attn, "enable_dsa_cp", False) else attn.n_local_heads
