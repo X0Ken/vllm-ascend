@@ -96,10 +96,7 @@ class EngramQueryGroup:
         node_groups = [[ep.ranks[i] for i, host in enumerate(hosts) if host == name] for name in dict.fromkeys(hosts)]
         node_sizes = {len(ranks) for ranks in node_groups}
         if len(node_sizes) != 1:
-            raise ValueError(
-                "Engram requires equal rank counts on every node: "
-                f"{node_groups}"
-            )
+            raise ValueError(f"Engram requires equal rank counts on every node: {node_groups}")
         selected = None
         for ranks in node_groups:
             # Every world rank creates groups in the same order.
@@ -115,8 +112,18 @@ class EngramQueryGroup:
 class NodeShardedEngram(nn.Module):
     """Contiguous row shards; only BF16 rows cross the node-local fabric."""
 
-    def __init__(self, rows, width, query_group, device=None, storage_format="bf16", cpu_offload=False):
+    def __init__(
+        self, rows, width, query_group, device=None, storage_format="bf16", cpu_offload=False, offload_backend="cpu"
+    ):
         super().__init__()
+        if offload_backend not in ("cpu", "uva"):
+            raise ValueError("Engram offload_backend must be cpu or uva")
+        if offload_backend == "uva" and (not cpu_offload or storage_format != "int8"):
+            raise ValueError("Engram UVA requires CPU-offloaded INT8 storage")
+        if offload_backend == "uva" and (width < 32 or width & (width - 1)):
+            raise ValueError("Engram UVA requires a power-of-two width >= 32")
+        self.offload_backend = offload_backend
+        self._host_uva = None
         if storage_format not in ("bf16", "int8", "fp8", "mxfp8"):
             raise ValueError("Engram storage_format must be bf16, int8, fp8, or mxfp8")
         if storage_format in ("int8", "fp8", "mxfp8") and width % 32:
@@ -143,22 +150,31 @@ class NodeShardedEngram(nn.Module):
         self.end = min(self.start + self.shard_rows, rows)
         if self.start >= rows:
             raise ValueError("Engram table must have at least one row per rank")
+        if offload_backend == "uva":
+            from .engram_uva import HostUvaBuffer
+
+            device = torch.device("npu", torch.npu.current_device()) if device is None else torch.device(device)
+            codes = HostUvaBuffer((self.end - self.start, width), torch.int8, device)
+            try:
+                scales = HostUvaBuffer((self.end - self.start, width // 32), torch.float32, device)
+            except BaseException:
+                codes.close()
+                raise
+            self._host_uva = (codes, scales)
         self._empty_flat = torch.empty(0, dtype=torch.int64, device="cpu")
         # Reuse fixed-size HCCL metadata buffers across requests.
         self._metadata_device_buffers = {}
         self._empty_metadata = torch.zeros(query_group.size + 1, dtype=torch.int64, device="cpu")
         self.weight = nn.Parameter(
-            torch.empty(
+            self._host_uva[0].tensor
+            if self._host_uva is not None
+            else torch.empty(
                 self.end - self.start,
                 width,
                 dtype=(
                     torch.int8
                     if storage_format == "int8"
-                    else (
-                        torch.float8_e4m3fn
-                        if storage_format in ("fp8", "mxfp8")
-                        else torch.bfloat16
-                    )
+                    else (torch.float8_e4m3fn if storage_format in ("fp8", "mxfp8") else torch.bfloat16)
                 ),
                 device=storage_device,
                 pin_memory=False,
@@ -168,7 +184,9 @@ class NodeShardedEngram(nn.Module):
         if storage_format == "int8":
             self.register_buffer(
                 "weight_scale",
-                torch.empty(self.end - self.start, width // 32, dtype=torch.float32, device=storage_device),
+                self._host_uva[1].tensor
+                if self._host_uva is not None
+                else torch.empty(self.end - self.start, width // 32, dtype=torch.float32, device=storage_device),
             )
         elif storage_format in ("fp8", "mxfp8"):
             self.register_buffer(
@@ -195,6 +213,11 @@ class NodeShardedEngram(nn.Module):
             self.weight.data[start:end].copy_(rows)
 
     def lookup_local(self, ids):
+        if self._host_uva is not None:
+            from .engram_uva import gather_dequantize_host_uva
+
+            device = self._host_uva[0].ptrs.device
+            return gather_dequantize_host_uva(*self._host_uva, ids.reshape(-1).to(device)).view(*ids.shape, self.width)
         # Idle DP replicas still enter routing collectives, but must not launch
         # gather/dequant kernels for an empty owner request.
         if ids.numel() == 0:
@@ -274,7 +297,7 @@ class NodeShardedEngram(nn.Module):
 
     def _record_offload_use(self, source_ptr, device):
         """Keep a pinned staging slot alive until the submitted device work ends."""
-        if not self.offload_pinned or device.type != "npu":
+        if self._host_uva is not None or not self.offload_pinned or device.type != "npu":
             return
         event = torch.npu.Event()
         event.record(torch.npu.current_stream(device))
@@ -331,8 +354,8 @@ class NodeShardedEngram(nn.Module):
                         raise ValueError(f"{scale_key}: expected FP32 [{self.rows}, {self.width // 32}]")
                     for start in range(self.start, self.end, chunk_rows):
                         stop = min(start + chunk_rows, self.end)
-                        self.weight.data[start-self.start:stop-self.start].copy_(tensor[start:stop])
-                        self.weight_scale[start-self.start:stop-self.start].copy_(scale[start:stop])
+                        self.weight.data[start - self.start : stop - self.start].copy_(tensor[start:stop])
+                        self.weight_scale[start - self.start : stop - self.start].copy_(scale[start:stop])
                 return
             if self.storage_format in ("fp8", "mxfp8"):
                 if source_dtype not in ("F8_E4M3", "F8_E4M3FN") or scale_key not in index:
@@ -340,13 +363,14 @@ class NodeShardedEngram(nn.Module):
                 with safe_open(root / index[scale_key], framework="pt", device="cpu") as sf:
                     scale = sf.get_slice(scale_key)
                     if scale.get_shape() != [self.rows, self.width // 32] or scale.get_dtype() not in (
-                        "F8_E8M0", "F8_E8M0FNU"
+                        "F8_E8M0",
+                        "F8_E8M0FNU",
                     ):
                         raise ValueError(f"{scale_key}: expected FP8 UE8M0 [{self.rows}, {self.width // 32}]")
                     for start in range(self.start, self.end, chunk_rows):
                         stop = min(start + chunk_rows, self.end)
-                        self.weight.data[start-self.start:stop-self.start].copy_(tensor[start:stop])
-                        self.weight_scale[start-self.start:stop-self.start].copy_(scale[start:stop])
+                        self.weight.data[start - self.start : stop - self.start].copy_(tensor[start:stop])
+                        self.weight_scale[start - self.start : stop - self.start].copy_(scale[start:stop])
                 return
             if source_dtype != "BF16":
                 raise ValueError(f"{key}: expected BF16 source for {self.storage_format}")
@@ -418,7 +442,10 @@ class NodeShardedEngram(nn.Module):
                 dist.all_to_all_single(returned, packed.flatten(), wire_send, wire_recv, group=q.group)
                 returned = unpack_engram_int8_rows(returned.reshape(total_requests, wire_width), self.width)
             else:
-                local_values = self.lookup_local(local_ids.cpu() if self.weight.device.type == "cpu" else local_ids)
+                lookup_ids = (
+                    local_ids.cpu() if self.weight.device.type == "cpu" and self._host_uva is None else local_ids
+                )
+                local_values = self.lookup_local(lookup_ids)
                 source_ptr = local_values.data_ptr()
                 values = local_values.to(
                     device=device, dtype=torch.bfloat16, non_blocking=self.offload_pinned
@@ -448,8 +475,7 @@ class NodeShardedEngram(nn.Module):
         if buffers is None:
             buffers = (
                 torch.empty(metadata.numel(), dtype=metadata.dtype, device=device),
-                torch.empty(self.query_group.size * metadata.numel(),
-                            dtype=metadata.dtype, device=device),
+                torch.empty(self.query_group.size * metadata.numel(), dtype=metadata.dtype, device=device),
             )
             self._metadata_device_buffers[key] = buffers
         metadata_device, gathered_device = buffers

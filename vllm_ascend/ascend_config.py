@@ -389,6 +389,9 @@ class AscendConfig:
     enable_engram: bool = True
     # Keep Engram tables on CPU and transfer only requested BF16 rows.
     enable_engram_ple_offload: bool = False
+    # CPU preserves the pinned staging implementation; UVA keeps INT8 tables
+    # in registered host memory and lets the NPU gather/dequantize rows.
+    engram_offload_backend: Literal["cpu", "uva"] = "cpu"
     # Fuse the inverse RoPE sign into the native operator for V4.1 only.
     enable_dsv41_rope_negate_sin: bool = False
     # Overlap the offloaded CPU lookup with eager prefill/mixed execution.
@@ -515,6 +518,11 @@ class AscendConfig:
                 self.engram_storage = "fp8"
         elif self.engram_model_path is not None:
             raise ValueError("engram_model_path requires enable_engram_ple_offload=True")
+        if self.engram_offload_backend == "uva":
+            if not self.enable_engram_ple_offload or self.engram_storage != "int8":
+                raise ValueError("UVA requires enable_engram_ple_offload=True and engram_storage=int8")
+            if self.enable_engram_prefetch:
+                raise ValueError("UVA requires enable_engram_prefetch=False; CPU lookup workers cannot run NPU gathers")
         if (
             self.enable_force_eplb
             and self.eplb_config.dynamic_eplb

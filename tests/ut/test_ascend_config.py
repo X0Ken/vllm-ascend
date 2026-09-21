@@ -994,13 +994,15 @@ class TestTopLevelSwitchTypeValidation(TestBase):
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
     def test_engram_offload_storage_and_validation(self, mock_fix):
         for storage, expected in (
-            (None, "fp8"), ("bf16", "bf16"), ("fp8", "fp8"), ("int8", "int8"), ("mxfp8", "mxfp8")
+            (None, "fp8"),
+            ("bf16", "bf16"),
+            ("fp8", "fp8"),
+            ("int8", "int8"),
+            ("mxfp8", "mxfp8"),
         ):
             clear_ascend_config()
             vc = VllmConfig()
-            vc.additional_config = {
-                "enable_engram_ple_offload": "true", "engram_model_path": "/tmp/engram"
-            }
+            vc.additional_config = {"enable_engram_ple_offload": "true", "engram_model_path": "/tmp/engram"}
             if storage is not None:
                 vc.additional_config["engram_storage"] = storage
             config = init_ascend_config(vc)
@@ -1017,6 +1019,36 @@ class TestTopLevelSwitchTypeValidation(TestBase):
             vc.additional_config = settings
             with self.assertRaises(ValueError):
                 init_ascend_config(vc)
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_engram_uva_selection_and_validation(self, mock_fix):
+        defaults = init_ascend_config(VllmConfig())
+        self.assertEqual(defaults.engram_offload_backend, "cpu")
+        self.assertFalse(defaults.enable_dsv41_rope_negate_sin)
+        valid = {
+            "enable_engram_ple_offload": True,
+            "engram_storage": "int8",
+            "engram_offload_backend": "uva",
+            "enable_dsv41_rope_negate_sin": True,
+        }
+        for override, succeeds in (
+            ({}, True),
+            ({"enable_engram_prefetch": True}, False),
+            ({"enable_engram_ple_offload": False}, False),
+            ({"engram_storage": "bf16"}, False),
+            ({"engram_offload_backend": "invalid"}, False),
+        ):
+            clear_ascend_config()
+            vc = VllmConfig()
+            vc.additional_config = valid | override
+            if succeeds:
+                config = init_ascend_config(vc)
+                self.assertEqual(config.engram_offload_backend, "uva")
+                self.assertTrue(config.enable_dsv41_rope_negate_sin)
+            else:
+                with self.assertRaises(ValueError):
+                    init_ascend_config(vc)
 
     @_clean_up
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
