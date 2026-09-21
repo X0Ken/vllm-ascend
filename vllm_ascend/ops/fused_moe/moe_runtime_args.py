@@ -211,6 +211,7 @@ def build_token_dispatch_input(
     *,
     fused_experts_input: MoEFusedExpertsInput,
     topk_ids: torch.Tensor | None = None,
+    cumulative_expert_tokens: bool = False,
 ) -> MoETokenDispatchInput:
     return MoETokenDispatchInput(
         hidden_states=fused_experts_input.hidden_states,
@@ -218,6 +219,7 @@ def build_token_dispatch_input(
         topk_ids=fused_experts_input.topk_ids if topk_ids is None else topk_ids,
         routing=fused_experts_input.routing,
         quant=fused_experts_input.quant,
+        cumulative_expert_tokens=cumulative_expert_tokens,
     )
 
 

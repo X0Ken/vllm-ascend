@@ -47,6 +47,7 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import (
     TokenDispatcherWithMC2,
 )
 from vllm_ascend.quantization.quant_type import QuantType
+from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 _MoECommMethods: dict[MoECommType | None, MoECommMethod] = {}
 
@@ -70,6 +71,22 @@ def set_gmmswigluquant_method():
 
     ascend_config = get_ascend_config()
     return ascend_config.ascend_fusion_config.fusion_ops_gmmswigluquant
+
+
+def _use_allgather_cumulative_expert_tokens(fused_experts_input: MoEFusedExpertsInput, use_fusion_ops: bool) -> bool:
+    """Avoid a counts-to-prefix-sums kernel for the A2 W8A8 fused MLP."""
+    activation = getattr(fused_experts_input.activation, "value", fused_experts_input.activation)
+    return (
+        _EXTRA_CTX.moe_comm_type == MoECommType.ALLGATHER
+        and get_ascend_device_type() == AscendDeviceType.A2
+        and fused_experts_input.quant.quant_type == QuantType.W8A8
+        and use_fusion_ops
+        and not fused_experts_input.dynamic_eplb
+        and activation == "silu"
+        and fused_experts_input.weights.w1_offset is None
+        and fused_experts_input.weights.w1_scale_bias is None
+        and fused_experts_input.lora_context is None
+    )
 
 
 @dataclass
@@ -155,6 +172,7 @@ class MoECommMethod(ABC):
         token_dispatch_input = build_token_dispatch_input(
             fused_experts_input=fused_experts_input,
             topk_ids=routed_topk_ids,
+            cumulative_expert_tokens=_use_allgather_cumulative_expert_tokens(fused_experts_input, self.use_fusion_ops),
         )
         token_dispatch_output = self.token_dispatcher.token_dispatch(token_dispatch_input=token_dispatch_input)
 

@@ -24,7 +24,7 @@ from vllm.distributed import (
 from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -33,12 +33,14 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.models.deepseek_v4 import (
     DeepseekV2DecoderLayer,
     DeepseekV2MixtureOfExperts,
     DeepseekV4MoE,
 )
 from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa
+from vllm_ascend.utils import enable_sp, enable_sp_by_pass
 
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.(gate_proj|up_proj|down_proj)\.scale$")
 
@@ -64,6 +66,30 @@ def _get_dspark_num_mtp_layers(config: PretrainedConfig) -> int:
     if num_layers is None:
         num_layers = getattr(config, "dspark_num_mtp_layers", 3)
     return int(num_layers or 3)
+
+
+def _build_dspark_main_proj(config: PretrainedConfig, prefix: str) -> nn.Module:
+    use_tp = get_ascend_config().dspark_main_proj_tp
+    if use_tp and (enable_sp() or enable_sp_by_pass()):
+        # Ascend's substring-based column dispatcher classifies "main_proj"
+        # as "in_proj". That path can gather already replicated input tokens
+        # under a FlashComm context, so retain the original projection here.
+        logger.warning_once("DSpark main projection TP is disabled with sequence parallelism/FlashComm.")
+        use_tp = False
+    if use_tp:
+        tp_size = get_tensor_model_parallel_world_size()
+        use_tp = tp_size > 1 and config.hidden_size % tp_size == 0
+    linear_cls = ColumnParallelLinear if use_tp else ReplicatedLinear
+    options = {"gather_output": True} if use_tp else {}
+    return linear_cls(
+        config.hidden_size * len(config.dspark_target_layer_ids),
+        config.hidden_size,
+        bias=False,
+        return_bias=False,
+        quant_config=None,
+        prefix=prefix,
+        **options,
+    )
 
 
 class DSparkMarkovHead(nn.Module):
@@ -120,13 +146,8 @@ class DeepseekV4DSparkModel(nn.Module):
         )
 
         first_layer = self.layers[str(self.mtp_start_layer_idx)]
-        self.main_proj = ReplicatedLinear(
-            config.hidden_size * len(self.target_layer_ids),
-            config.hidden_size,
-            bias=False,
-            return_bias=False,
-            quant_config=None,
-            prefix=maybe_prefix(prefix, f"layers.{self.mtp_start_layer_idx}.main_proj"),
+        self.main_proj = _build_dspark_main_proj(
+            config, maybe_prefix(prefix, f"layers.{self.mtp_start_layer_idx}.main_proj")
         )
         self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         first_layer.main_proj = self.main_proj

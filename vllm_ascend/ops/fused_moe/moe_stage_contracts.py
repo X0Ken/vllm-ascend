@@ -86,6 +86,8 @@ class MoETokenDispatchInput:
     topk_ids: torch.Tensor
     routing: MoERoutingParams
     quant: MoEQuantParams
+    # Opt in only when the following ALLGATHER MLP consumes prefix sums.
+    cumulative_expert_tokens: bool = False
 
 
 # dispatch carry-over state consumed by combine

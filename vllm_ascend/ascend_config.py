@@ -147,6 +147,10 @@ class AscendConfig:
         self.enable_cpu_binding = additional_config.get("enable_cpu_binding", True)
         self.enable_sleep_mode_extra_cleanup = additional_config.get("enable_sleep_mode_extra_cleanup", False)
         self.multistream_dsv4_dsa_overlap = additional_config.get("multistream_dsv4_dsa_overlap", True)
+        # Opt-in DSpark main projection TP; SP/FlashComm keeps replicated input handling.
+        self.dspark_main_proj_tp = additional_config.get("dspark_main_proj_tp", False)
+        if not isinstance(self.dspark_main_proj_tp, bool):
+            raise ValueError("additional_config.dspark_main_proj_tp must be a bool")
         self.enable_prefill_mc2 = bool(additional_config.get("enable_prefill_mc2", False))
 
         self.enable_fused_mc2 = self._get_config_value(
