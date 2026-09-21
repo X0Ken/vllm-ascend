@@ -193,7 +193,32 @@ class PagedNgramHistory:
         self.lookback = layout.max_ngram_size
         self.pages = {}
 
-    def update(self, input_ids, positions, request_ids, block_table, block_size):
+    def _restore_prompt_prefix(self, positions, request_ids, block_table, block_size, prompt_token_ids):
+        """Rebuild the n-gram tail when external KV is loaded into new pages.
+
+        The connector transfers attention KV, not this process-local CPU token
+        mirror. Refresh even existing pages: a recycled page may hold another
+        request's history. Generated/speculative tokens remain owned by update.
+        """
+        seen = set()
+        for position, request in zip(positions.tolist(), request_ids.tolist()):
+            if request in seen:
+                continue
+            seen.add(request)
+            prompt = prompt_token_ids.get(request)
+            if prompt is None:
+                continue
+            start = max(0, position - self.lookback + 1)
+            end = min(position, len(prompt))
+            for previous in range(start, end):
+                page = int(block_table[request, previous // block_size])
+                if page not in self.pages:
+                    self.pages[page] = torch.full((block_size,), -1, dtype=torch.int64, device="cpu")
+                token = prompt[previous]
+                value = -1 if token in (self.image_token_id, self.image_pad_token_id) else self.token_map[token]
+                self.pages[page][previous % block_size] = value
+
+    def update(self, input_ids, positions, request_ids, block_table, block_size, prompt_token_ids=None):
         """All arguments are CPU tensors; page numbers come from full SWA KV."""
         if input_ids.numel() == 0:
             # Idle DP and empty prefill still follow the collective contract,
@@ -203,6 +228,8 @@ class PagedNgramHistory:
                 torch.empty((0, self.primes.shape[0], columns), dtype=torch.int64, device="cpu"),
                 torch.empty(0, dtype=torch.bool, device="cpu"),
             )
+        if prompt_token_ids is not None:
+            self._restore_prompt_prefix(positions, request_ids, block_table, block_size, prompt_token_ids)
         compressed = self.token_map[input_ids]
         mask = valid_engram_token_mask(
             input_ids,

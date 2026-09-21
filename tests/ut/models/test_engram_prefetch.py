@@ -267,7 +267,7 @@ def test_prefetch_preparation_hashes_once_without_wait(monkeypatch):
 
     monkeypatch.setattr(torch.Tensor, "copy_", record_mask_copy)
 
-    def update(*args):
+    def update(*args, **kwargs):
         events.append("hash")
         return hashes, mask
 

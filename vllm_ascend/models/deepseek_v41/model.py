@@ -578,6 +578,7 @@ class DeepseekV41Model(DeepseekV4Model):
                 requests,
                 block_table,
                 block_size,
+                prompt_token_ids=getattr(get_forward_context(), "engram_prompt_token_ids", None),
             )
         return hashes, mask
 

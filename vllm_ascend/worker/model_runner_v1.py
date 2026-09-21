@@ -2987,6 +2987,13 @@ class NPUModelRunner(GPUModelRunner):
         # dispatch is shared with other runner versions in engram_runner.py.
         from vllm_ascend.models.deepseek_v41.engram_runner import prepare_engram_for_forward
 
+        if get_ascend_config().enable_engram:
+            # Prompt lists already live on CPU. Supply references only; Engram
+            # restores at most max_ngram_size - 1 tokens per active request.
+            forward_context.engram_prompt_token_ids = {
+                index: self.requests[req_id].prompt_token_ids
+                for index, req_id in enumerate(self.input_batch.req_ids)
+            }
         trace = get_ascend_config().enable_engram_trace
         begin = time.perf_counter() if trace else 0.0
         prep = prepare_engram_for_forward(
