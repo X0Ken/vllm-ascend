@@ -26,7 +26,7 @@ class Runtime:
         self.allocations = {}
         self.calls = []
 
-    def aclrtMallocHost(self, output, size, flag):
+    def aclrtMallocHost(self, output, size):
         self.calls.append("allocate")
         if self.failure == "allocate":
             return 1

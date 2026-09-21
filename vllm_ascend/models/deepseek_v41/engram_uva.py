@@ -23,7 +23,7 @@ def _host_library() -> ctypes.CDLL:
     """The CANN runtime entry points that publish host memory to the device."""
 
     lib = ctypes.CDLL("libascendcl.so")
-    lib.aclrtMallocHost.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_uint32]
+    lib.aclrtMallocHost.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
     lib.aclrtMallocHost.restype = ctypes.c_int
     lib.aclrtFreeHost.argtypes = [ctypes.c_void_p]
     lib.aclrtFreeHost.restype = ctypes.c_int
@@ -50,7 +50,7 @@ class HostUvaBuffer:
         if size <= 0:
             raise ValueError("UVA buffers must be nonempty")
         self.pointer = ctypes.c_void_p()
-        rc = self.lib.aclrtMallocHost(ctypes.byref(self.pointer), size, 0)
+        rc = self.lib.aclrtMallocHost(ctypes.byref(self.pointer), size)
         if rc:
             raise RuntimeError(f"aclrtMallocHost failed: rc={rc} size={size}")
         self.buffer = (ctypes.c_char * size).from_address(self.pointer.value)
