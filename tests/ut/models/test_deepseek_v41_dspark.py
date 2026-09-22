@@ -14,13 +14,13 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm_ascend.core.deepseek_v41 import DeepseekV41DraftSWASpec
 from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec, register_ascend_kv_cache_specs
 from vllm_ascend.models.deepseek_v4.model import AscendDeepseekV4SWACache
+from vllm_ascend.models.deepseek_v41 import dspark as deepseek_v41_dspark_module
 from vllm_ascend.models.deepseek_v41.dspark import (
     DeepseekV41DSparkAttention,
     DeepseekV41DSparkDecoderLayer,
     DeepseekV41DSparkModel,
     DeepseekV41DSparkSWACache,
 )
-from vllm_ascend.models.deepseek_v41 import dspark as deepseek_v41_dspark_module
 from vllm_ascend.models.deepseek_v41.model import DeepseekV41Model
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
@@ -80,6 +80,7 @@ def test_target_exports_residual_entering_selected_layers(monkeypatch):
 
     model = SimpleNamespace(
         hc_mult=4,
+        _engram_compiled_prefetch=False,
         needs_moe_input_ids=False,
         prepare_engram=lambda input_ids, positions: ({}, torch.empty(0, dtype=torch.bool)),
         aux_hidden_state_layers=(1, 3),
@@ -88,7 +89,15 @@ def test_target_exports_residual_entering_selected_layers(monkeypatch):
         norm=lambda hidden: hidden,
     )
     hidden = torch.arange(12, dtype=torch.float32).reshape(3, 4)
-    output, aux = DeepseekV41Model.forward(model, torch.arange(3), torch.arange(3), None, inputs_embeds=hidden)
+    output, aux = DeepseekV41Model.forward(
+        model,
+        torch.arange(3),
+        torch.arange(3),
+        None,
+        inputs_embeds=hidden,
+        engram_lookups={},
+        engram_mask=torch.empty(0, dtype=torch.bool),
+    )
     torch.testing.assert_close(aux[0], hidden)
     torch.testing.assert_close(aux[1], hidden + 3)
     torch.testing.assert_close(output, hidden + 6)
@@ -113,6 +122,10 @@ def test_v41_draft_routes_to_v41_and_disables_post_projection_q_norm(cp):
     config = SimpleNamespace(compilation_config=SimpleNamespace(static_forward_context={}))
     with (
         patch.object(DeepseekV4Attention, "__init__", initialize_base),
+        patch(
+            "vllm_ascend.attention.dsa_v41.get_ascend_config",
+            return_value=SimpleNamespace(enable_dsv41_rope_negate_sin=False),
+        ),
         patch("vllm_ascend.attention.context_parallel.dsa_v41_cp.enable_dsa_cp", return_value=cp),
         patch("vllm_ascend.attention.context_parallel.dsa_v41_cp.enable_pcp", return_value=False),
     ):
@@ -124,13 +137,16 @@ def test_v41_draft_routes_to_v41_and_disables_post_projection_q_norm(cp):
     assert ordinary_backend.apply_q_norm is True
 
 
-def test_v41_draft_sequence_parallel_shards_inputs_and_restores_output(monkeypatch):
+def test_v41_draft_sequence_parallel_preserves_router_ids_and_restores_output(monkeypatch):
+    routed_ids = []
+
     class Layer:
         @staticmethod
         def hc_collapse(hidden, pre_mix):
             return hidden.mean(dim=1)
 
         def __call__(self, positions, hidden, pre_mix, llama_4_scaling, input_ids):
+            routed_ids.append(input_ids)
             return hidden, pre_mix
 
     hidden = torch.arange(16, dtype=torch.float32).reshape(4, 4)
@@ -138,9 +154,8 @@ def test_v41_draft_sequence_parallel_shards_inputs_and_restores_output(monkeypat
     padding = torch.tensor([False, True, False, False])
     forward_context = SimpleNamespace(is_padding=padding)
     sharded_hidden = hidden[:2].unsqueeze(1).repeat(1, 4, 1)
-    sharded_ids = input_ids[:2]
     gathered = torch.arange(20, dtype=torch.float32).reshape(5, 4)
-    sp_shard = MagicMock(side_effect=[sharded_hidden, sharded_ids])
+    sp_shard = MagicMock(return_value=sharded_hidden)
     sp_all_gather = MagicMock(return_value=gathered)
     padding_mask = MagicMock(return_value=torch.tensor([False, True]))
     monkeypatch.setattr(deepseek_v41_dspark_module, "sp_shard", sp_shard)
@@ -163,7 +178,8 @@ def test_v41_draft_sequence_parallel_shards_inputs_and_restores_output(monkeypat
     padding_mask.assert_called_once()
     assert forward_context.is_padding.tolist() == [False, True]
     assert sp_shard.call_args_list[0].args[0].shape == (4, 4, 4)
-    assert sp_shard.call_args_list[1].args[0] is input_ids
+    sp_shard.assert_called_once()
+    assert routed_ids[0] is input_ids
     sp_all_gather.assert_called_once()
     torch.testing.assert_close(output, gathered[:4])
 
@@ -172,9 +188,7 @@ def test_v41_draft_context_store_uses_physical_pairs_and_preserves_padding():
     from vllm_ascend.models.deepseek_v41.dspark import DeepseekV41DSparkModel
 
     cache = torch.empty(3, 128, 1, 8)
-    attn = SimpleNamespace(dsa_attn=SimpleNamespace(
-        swa_cache_layer=SimpleNamespace(block_size=128, kv_cache=[cache])
-    ))
+    attn = SimpleNamespace(dsa_attn=SimpleNamespace(swa_cache_layer=SimpleNamespace(block_size=128, kv_cache=[cache])))
     values = torch.randn(3, 1, 8)
     with patch("vllm_ascend.models.deepseek_v41.dspark.scatter_cache_sk") as store:
         DeepseekV41DSparkModel._store_standard_swa_kv(None, values, torch.tensor([129, -1, 258]), attn)

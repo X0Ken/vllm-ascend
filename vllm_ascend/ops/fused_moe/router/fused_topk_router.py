@@ -165,7 +165,14 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
                 tid2eid_ones = self.tid2eid.to(torch.int32) if self.tid2eid is not None else None
                 if _EXTRA_CTX.moe_comm_type == MoECommType.ALLGATHER:
                     prepare_finalize = _EXTRA_CTX.moe_comm_method.prepare_finalize
-                    input_ids = prepare_finalize.all_gather_input_id_with_dp_group(input_ids)
+                    if prepare_finalize.moe_config.is_sequence_parallel:
+                        # Match the hidden-state EP gather, including unequal DP
+                        # lengths and TP padding. A DP-only ID gather omits the
+                        # TP shards and cannot align with these router rows.
+                        local_ids = sequence_parallel_chunk(input_ids.reshape(-1, 1))
+                        input_ids = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(local_ids).reshape(-1)
+                    else:
+                        input_ids = prepare_finalize.all_gather_input_id_with_dp_group(input_ids)
                 else:
                     input_ids = _EXTRA_CTX.moe_comm_method.pad_and_split_input_ids(input_ids)
                 if _EXTRA_CTX.moe_comm_type != MoECommType.ALLGATHER and input_ids.numel() != router_logits.shape[0]:

@@ -752,7 +752,8 @@ class DeepseekV41Model(DeepseekV4Model):
                     hidden_states,
                 )
             hidden_states = sp_shard(hidden_states)
-            input_ids = sp_shard(input_ids)
+            # Hash routing owns ID sharding and its communication-specific gather.
+            # Keep the TP-replicated IDs, as in the V4 MoE caller contract.
             token_mask = sp_shard(token_mask)
             lookups = {layer_idx: sp_shard(lookup) for layer_idx, lookup in lookups.items()}
         hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)

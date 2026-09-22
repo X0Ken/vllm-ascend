@@ -238,6 +238,19 @@ Regression coverage is in `tests/ut/spec_decode/test_dspark_proposer.py`,
 The NPU test changes inputs, sequence lengths, block tables and padding between
 replays and compares every live output exactly against eager execution.
 
+## Sequence parallel hash routing
+
+V4.1 target and DSpark blocks retain TP-replicated token IDs while sharding
+hidden states. The MoE router applies the matching TP chunk and EP gather,
+including padding and unequal DP lengths, before the hash expert lookup.
+This keeps token IDs aligned with the hidden-state rows selected for routing.
+The non-SP DP gather is unchanged.
+
+On the p5 serving path, `enable_flashcomm1=true` in `--additional-config`
+selects sequence parallel execution. Validation covers TP8/DP2/EP16 with
+PP/DCP/PCP equal to one and requests sent only to DP0. Enabling query graphs
+is a separate option and requires validation of the combined configuration.
+
 ## Supported milestone and remaining accuracy work
 
 The runtime contract is model runner V1, eager or `FULL_DECODE_ONLY` mode,

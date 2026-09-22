@@ -634,7 +634,10 @@ def test_hash_router_preserves_fp32_weights_and_explicit_input_ids(monkeypatch, 
     router_logits = torch.randn(2, 4)
     topk_weights = torch.randn(2, 2)
     topk_ids = torch.zeros(2, 2, dtype=torch.int32)
-    prepare_finalize = SimpleNamespace(all_gather_input_id_with_dp_group=MagicMock(side_effect=lambda value: value))
+    prepare_finalize = SimpleNamespace(
+        moe_config=SimpleNamespace(is_sequence_parallel=False),
+        all_gather_input_id_with_dp_group=MagicMock(side_effect=lambda value: value),
+    )
     monkeypatch.setattr(
         fused_topk_router_module,
         "_EXTRA_CTX",
@@ -690,7 +693,10 @@ def test_vision_router_fuses_bias_and_image_sentinel(monkeypatch):
     bias_vl = torch.randn(4, dtype=torch.bfloat16)
     topk_weights = torch.randn(2, 2)
     topk_ids = torch.zeros(2, 2, dtype=torch.int32)
-    prepare_finalize = SimpleNamespace(all_gather_input_id_with_dp_group=MagicMock(side_effect=lambda value: value))
+    prepare_finalize = SimpleNamespace(
+        moe_config=SimpleNamespace(is_sequence_parallel=False),
+        all_gather_input_id_with_dp_group=MagicMock(side_effect=lambda value: value),
+    )
     monkeypatch.setattr(
         fused_topk_router_module,
         "_EXTRA_CTX",
@@ -1540,3 +1546,53 @@ def test_forward_impl_keeps_full_width_input_for_shared_experts(monkeypatch):
     )
     assert result[0] is shared_out
     assert result[1] is routed_out
+
+
+@pytest.mark.parametrize("tp_size,tp_rank", [(2, 0), (2, 1), (8, 0), (8, 7)])
+@pytest.mark.parametrize("lengths", [(5, 3), (512, 512)])
+def test_hash_router_sp_ids_follow_hidden_ep_gather(monkeypatch, tp_size, tp_rank, lengths):
+    """ID routing must reproduce EP token ordering and remove each DP's padding."""
+    local = torch.arange(lengths[0], dtype=torch.int64) + 10
+    expected = torch.cat((local, torch.arange(lengths[1], dtype=torch.int64) + 1000))
+    padded = F.pad(local, (0, (-local.numel()) % tp_size))
+    shard = padded.chunk(tp_size)[tp_rank].reshape(-1, 1)
+    prepare = SimpleNamespace(
+        moe_config=SimpleNamespace(is_sequence_parallel=True),
+        all_gather_input_id_with_dp_group=MagicMock(),
+    )
+    monkeypatch.setattr(
+        fused_topk_router_module,
+        "_EXTRA_CTX",
+        SimpleNamespace(
+            moe_comm_type=MoECommType.ALLGATHER,
+            moe_comm_method=SimpleNamespace(prepare_finalize=prepare),
+        ),
+    )
+    chunk = MagicMock(return_value=shard)
+    monkeypatch.setattr(fused_topk_router_module, "sequence_parallel_chunk", chunk)
+
+    def ep_gather(value):
+        torch.testing.assert_close(value, shard)
+        return expected.reshape(-1, 1)
+
+    gather = MagicMock(side_effect=ep_gather)
+    monkeypatch.setattr(torch.ops.vllm, "maybe_all_gather_and_maybe_unpad", gather, raising=False)
+    weights = torch.ones(expected.numel(), 2)
+    ids = torch.zeros(expected.numel(), 2, dtype=torch.int32)
+    hash_op = MagicMock(return_value=(weights, ids, None))
+    monkeypatch.setattr(torch.ops._C_ascend, "moe_gating_top_k_hash", hash_op, raising=False)
+    router = AscendFusedTopKRouter(
+        top_k=2,
+        global_num_experts=4,
+        num_expert_group=1,
+        topk_group=1,
+        scoring_func="sqrtsoftplus",
+        tid2eid=torch.zeros(2048, 2, dtype=torch.int32),
+    )
+    logits = torch.ones(expected.numel(), 4)
+    router._compute_routing(logits, logits, torch.int32, input_ids=local)
+    torch.testing.assert_close(chunk.call_args.args[0].reshape(-1), local)
+    chunk.assert_called_once()
+    gather.assert_called_once()
+    prepare.all_gather_input_id_with_dp_group.assert_not_called()
+    torch.testing.assert_close(hash_op.call_args.kwargs["input_ids"], expected)
