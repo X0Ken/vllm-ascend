@@ -226,8 +226,8 @@ lengths; the proposer returns tokens only for live requests. Idle DP workers
 participate without receiving client traffic.
 
 This option defaults to false and supports the V4.1 target, DSpark with greedy
-draft sampling and `sample_from_anchor=true`, without context parallelism or
-LoRA. `max_num_batched_tokens` must be at least
+draft sampling and `sample_from_anchor=true`, without context parallelism,
+LoRA, or dynamic speculative budgets. `max_num_batched_tokens` must be at least
 `max_num_seqs * num_speculative_tokens`. The validation path uses BF16 cache,
 `FULL_DECODE_ONLY`, TP8/DP2/EP16 and a fixed client-facing DP rank. Other
 execution paths do not inherit its performance results.

@@ -741,6 +741,8 @@ class AscendConfig:
             raise ValueError("enable_dsv41_draft_graph requires DSpark speculative decoding")
         if speculative.draft_sample_method != "greedy":
             raise ValueError("enable_dsv41_draft_graph requires greedy draft sampling")
+        if self.dynamic_spec_config.method is not None:
+            raise ValueError("enable_dsv41_draft_graph does not support dynamic speculative budgets")
         draft_hf = speculative.draft_model_config.hf_config
         draft_hf = getattr(draft_hf, "text_config", draft_hf)
         if not getattr(draft_hf, "sample_from_anchor", True):

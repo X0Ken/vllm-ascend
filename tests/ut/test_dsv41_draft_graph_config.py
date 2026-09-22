@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_ascend.ascend_config import AscendConfig
+from vllm_ascend.ascend_config import AscendConfig, DynamicSpecConfig
 
 
 def config():
@@ -56,3 +56,18 @@ def test_reject_unsupported_draft_graph_config(path, value, message):
         AscendConfig(
             enable_dsv41_draft_graph=True, sparse_kv_offload_config=SimpleNamespace(enabled=False)
         )._validate_dsv41_draft_graph(vc)
+
+
+@pytest.mark.parametrize("method", ["dspark", "dflash"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_dynamic_budget_requires_eager_draft(method, enabled):
+    ascend = AscendConfig(
+        enable_dsv41_draft_graph=enabled,
+        dynamic_spec_config=DynamicSpecConfig(method=method),
+        sparse_kv_offload_config=SimpleNamespace(enabled=False),
+    )
+    if enabled:
+        with pytest.raises(ValueError, match="dynamic speculative budgets"):
+            ascend._validate_dsv41_draft_graph(config())
+    else:
+        ascend._validate_dsv41_draft_graph(config())
