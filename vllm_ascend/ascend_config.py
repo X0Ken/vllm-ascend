@@ -394,6 +394,8 @@ class AscendConfig:
     engram_offload_backend: Literal["cpu", "uva"] = "cpu"
     # Fuse the inverse RoPE sign into the native operator for V4.1 only.
     enable_dsv41_rope_negate_sin: bool = False
+    # Experimental query-only DSpark graph; context KV remains eager.
+    enable_dsv41_draft_graph: bool = False
     # Overlap the offloaded CPU lookup with eager prefill/mixed execution.
     # Captured decode graphs keep the synchronous refresh.
     enable_engram_prefetch: bool = False
@@ -502,6 +504,7 @@ class AscendConfig:
     # the max_num_batched_tokens that sequence-parallel writeback corrected).
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
+        self._validate_dsv41_draft_graph(vc)
         if self.engram_cpu_lookup_threads < 0:
             raise ValueError("engram_cpu_lookup_threads must be >= 0")
         if self.enable_engram_prefetch and not self.enable_engram_ple_offload:
@@ -725,6 +728,31 @@ class AscendConfig:
         # sparse KV offload vs sparse SFA C8 main cache mutex
         self._validate_sparse_c8_kv_offload_compatibility()
         return self
+
+    def _validate_dsv41_draft_graph(self, vllm_config: VllmConfig) -> None:
+        if not self.enable_dsv41_draft_graph:
+            return
+        model = vllm_config.model_config
+        model_type = getattr(getattr(model, "hf_text_config", None), "model_type", "")
+        if model_type not in ("deepseek_v41_text", "deepseek_v4.1_text"):
+            raise ValueError("enable_dsv41_draft_graph requires a DeepSeek V4.1 target model")
+        speculative = vllm_config.speculative_config
+        if speculative is None or speculative.method != "dspark":
+            raise ValueError("enable_dsv41_draft_graph requires DSpark speculative decoding")
+        if speculative.draft_sample_method != "greedy":
+            raise ValueError("enable_dsv41_draft_graph requires greedy draft sampling")
+        draft_hf = speculative.draft_model_config.hf_config
+        draft_hf = getattr(draft_hf, "text_config", draft_hf)
+        if not getattr(draft_hf, "sample_from_anchor", True):
+            raise ValueError("enable_dsv41_draft_graph requires sample_from_anchor=True")
+        parallel = vllm_config.parallel_config
+        if parallel.prefill_context_parallel_size != 1 or parallel.decode_context_parallel_size != 1:
+            raise ValueError("enable_dsv41_draft_graph does not support context parallelism")
+        if vllm_config.lora_config is not None:
+            raise ValueError("enable_dsv41_draft_graph does not support LoRA")
+        scheduler = vllm_config.scheduler_config
+        if scheduler.max_num_seqs * speculative.num_speculative_tokens > scheduler.max_num_batched_tokens:
+            raise ValueError("enable_dsv41_draft_graph requires enough batched tokens for all draft queries")
 
     def _validate_mc2_comm_alg(self, vllm_config: VllmConfig) -> None:
         from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile

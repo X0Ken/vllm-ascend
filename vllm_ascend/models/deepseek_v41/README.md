@@ -75,7 +75,8 @@ both DSA_CP settings. Noncausal draft queries pass explicit physical SWA
 indices to SparseFlashMla with mask mode 0. CP slices these global indices
 and preserves the full visible KV length for each local request. Context KV
 writes use the same stride-aware cache scatter as the target model. The V1
-proposer remains eager; this routing does not enable draft graph capture.
+proposer remains eager by default. Query graph capture is an explicit opt-in,
+as described below.
 
 The optional Aurora DSpark model adds one group, G12, containing exactly three
 `DeepseekV41DraftSWASpec` resources: `mtp.0.self_attn.swa_cache`,
@@ -209,6 +210,33 @@ architecture but do not own another copy of the long KV or Index K. Candidate
 blocks originate at layer 20. Consumers retain the source prefix and retrieve
 the source cache from `static_forward_context`; shared modules are never
 re-registered under consumer layers.
+
+## Optional DSpark query graphs
+
+Set `enable_dsv41_draft_graph=true` in `--additional-config` together with
+`"enforce_eager": false` in `--speculative-config` to enable V1 DSpark query
+capture. The target must also permit graphs. With `sample_from_anchor=true`,
+each request contributes K queries, where K is `num_speculative_tokens`.
+Target-context KV projection and cache writes remain outside capture.
+
+The metadata builder retains query starts, physical block tables, sparse
+indices and TopK lengths at stable addresses. Live calls update these buffers
+before replay. Graph buckets pad the CPU prefill mask together with CPU/device
+lengths; the proposer returns tokens only for live requests. Idle DP workers
+participate without receiving client traffic.
+
+This option defaults to false and supports the V4.1 target, DSpark with greedy
+draft sampling and `sample_from_anchor=true`, without context parallelism or
+LoRA. `max_num_batched_tokens` must be at least
+`max_num_seqs * num_speculative_tokens`. The validation path uses BF16 cache,
+`FULL_DECODE_ONLY`, TP8/DP2/EP16 and a fixed client-facing DP rank. Other
+execution paths do not inherit its performance results.
+
+Regression coverage is in `tests/ut/spec_decode/test_dspark_proposer.py`,
+`tests/ut/test_dsv41_draft_graph_config.py` and the NPU test
+`tests/e2e/nightly/single_node/ops/singlecard_ops/test_deepseek_v41_draft_graph.py`.
+The NPU test changes inputs, sequence lengths, block tables and padding between
+replays and compares every live output exactly against eager execution.
 
 ## Supported milestone and remaining accuracy work
 

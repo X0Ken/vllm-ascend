@@ -922,28 +922,42 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         has_lora = len(self.runner.input_batch.lora_id_to_lora_request) > 0
         uniform_decode = target_model_batch_desc.uniform
 
-        if self.use_cuda_graph:
-            _, batch_descriptor = self.runner.cudagraph_dispatcher.dispatch(
-                num_tokens=num_tokens, uniform_decode=uniform_decode, has_lora=has_lora
+        if self.method == "dspark" and self.use_cuda_graph:
+            draft_tokens = (
+                target_model_batch_desc.num_reqs * self.num_query_per_req
+                if uniform_decode and target_model_batch_desc.num_reqs
+                else num_tokens
             )
-            num_input_tokens = batch_descriptor.num_tokens
-        else:
-            num_input_tokens = num_tokens
-
-        (
-            num_input_tokens,
-            num_tokens_across_dp,
-            _,
-        ) = self.runner._sync_metadata_across_dp(num_input_tokens, is_draft_model=True)
-
-        if self.use_cuda_graph:
-            aclgraph_runtime_mode, batch_descriptor = self.runner.cudagraph_dispatcher.dispatch(
-                num_tokens=num_input_tokens, uniform_decode=uniform_decode, has_lora=has_lora
+            num_input_tokens, num_tokens_across_dp, _ = self.runner._sync_metadata_across_dp(
+                draft_tokens, is_draft_model=True
             )
-            num_input_tokens = batch_descriptor.num_tokens
+            aclgraph_runtime_mode = CUDAGraphMode.FULL if uniform_decode else CUDAGraphMode.NONE
+            batch_descriptor = BatchDescriptor(
+                num_tokens=num_input_tokens, num_reqs=num_input_tokens // self.num_query_per_req, uniform=True
+            )
         else:
-            aclgraph_runtime_mode = CUDAGraphMode.NONE
-            batch_descriptor = None
+            if self.use_cuda_graph:
+                _, batch_descriptor = self.runner.cudagraph_dispatcher.dispatch(
+                    num_tokens=num_tokens, uniform_decode=uniform_decode, has_lora=has_lora
+                )
+                num_input_tokens = batch_descriptor.num_tokens
+            else:
+                num_input_tokens = num_tokens
+
+            (
+                num_input_tokens,
+                num_tokens_across_dp,
+                _,
+            ) = self.runner._sync_metadata_across_dp(num_input_tokens, is_draft_model=True)
+
+            if self.use_cuda_graph:
+                aclgraph_runtime_mode, batch_descriptor = self.runner.cudagraph_dispatcher.dispatch(
+                    num_tokens=num_input_tokens, uniform_decode=uniform_decode, has_lora=has_lora
+                )
+                num_input_tokens = batch_descriptor.num_tokens
+            else:
+                aclgraph_runtime_mode = CUDAGraphMode.NONE
+                batch_descriptor = None
 
         if aclgraph_runtime_mode == CUDAGraphMode.FULL:
             # TODO: Due to the inconsistency between the proposer `dispatcher` and model runner, this padding
@@ -954,14 +968,26 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             num_reqs = common_attn_metadata.query_start_loc.shape[0]
             self.query_start_loc.gpu[:num_reqs].copy_(common_attn_metadata.query_start_loc)
             self.query_start_loc.cpu[:num_reqs].copy_(common_attn_metadata.query_start_loc_cpu)
-            num_reqs_padded = self.runner._pad_query_start_loc_for_fia(
-                self.query_start_loc,
-                num_input_tokens,
-                batch_descriptor.num_reqs if batch_descriptor.num_reqs is not None else common_attn_metadata.num_reqs,
-                common_attn_metadata.num_reqs,
-                aclgraph_runtime_mode,
-                batch_descriptor.num_reqs,
-            )
+            if self.method == "dspark":
+                num_reqs_padded = batch_descriptor.num_reqs
+                actual_reqs = common_attn_metadata.num_reqs
+                last = self.query_start_loc.cpu[actual_reqs]
+                self.query_start_loc.cpu[actual_reqs + 1 : num_reqs_padded + 1].copy_(
+                    last
+                    + torch.arange(1, num_reqs_padded - actual_reqs + 1, dtype=torch.int32) * self.num_query_per_req
+                )
+                self.query_start_loc.copy_to_gpu()
+            else:
+                num_reqs_padded = self.runner._pad_query_start_loc_for_fia(
+                    self.query_start_loc,
+                    num_input_tokens,
+                    batch_descriptor.num_reqs
+                    if batch_descriptor.num_reqs is not None
+                    else common_attn_metadata.num_reqs,
+                    common_attn_metadata.num_reqs,
+                    aclgraph_runtime_mode,
+                    batch_descriptor.num_reqs,
+                )
             common_attn_metadata.num_reqs = num_reqs_padded
             common_attn_metadata.query_start_loc = self.query_start_loc.gpu[: num_reqs_padded + 1]
             common_attn_metadata.query_start_loc_cpu = self.query_start_loc.cpu[: num_reqs_padded + 1]
@@ -983,6 +1009,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 if common_attn_metadata._seq_lens_cpu is not None:
                     common_attn_metadata._seq_lens_cpu = self._adjust_tensor(
                         common_attn_metadata._seq_lens_cpu, num_reqs_padded
+                    )
+                if getattr(common_attn_metadata, "is_prefilling", None) is not None:
+                    # A graph bucket can contain more rows than the live batch.
+                    # Align the host mask with the padded query starts too;
+                    # otherwise V4.1's request counters index a longer tensor
+                    # with the live-only mask (for example five rows vs six).
+                    common_attn_metadata.is_prefilling = self._adjust_tensor(
+                        common_attn_metadata.is_prefilling, num_reqs_padded
                     )
             else:
                 common_attn_metadata.seq_lens = self._adjust_tensor(self.runner.seq_lens, num_reqs_padded)
@@ -1053,6 +1087,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         common_attn_metadata.query_start_loc = self.query_start_loc_group[0][: num_reqs_padded + 1]
 
         common_attn_metadata.num_input_tokens = num_input_tokens
+        if self.method == "dspark" and aclgraph_runtime_mode == CUDAGraphMode.FULL:
+            # The captured SWA operator consumes the complete padded query
+            # block. Its repeat_interleave size must match the padded qsl;
+            # output tokens are trimmed to the live request count afterwards.
+            common_attn_metadata.num_actual_tokens = num_input_tokens
 
         self._pad_draft_buffers(num_tokens, num_input_tokens)
         multi_steps_attn_metadata, attn_metadata_i = self.build_draft_attn_metadata(
@@ -1165,6 +1204,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 "is_prefill": is_prefill_batch,
                 "sampling_metadata": sampling_metadata,
             }
+            if self.method == "dspark" and self.use_cuda_graph:
+                self.build_model_inputs_first_pass(num_input_tokens, self._context_slot_mapping_buffers)
             runnable = cast(Callable[..., Any], self._runnable)
             run_draft: Callable[[], Any] = partial(runnable, **model_inputs)
 
@@ -1176,6 +1217,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
         if active_device_metadata_executor is not None:
             active_device_metadata_executor.release()
+        if self.method == "dspark" and self.use_cuda_graph:
+            draft_token_ids = draft_token_ids[:batch_size]
         return draft_token_ids
 
     def _sample_draft_from_logits(
@@ -1259,7 +1302,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         model_kwargs = {"input_ids": model_input_ids, "positions": model_positions, "inputs_embeds": inputs_embeds}
 
         if self.method in ("dflash", "dspark"):
-            self.build_model_inputs_first_pass(num_input_tokens, self._context_slot_mapping_buffers)
+            if not (self.method == "dspark" and self.use_cuda_graph):
+                self.build_model_inputs_first_pass(num_input_tokens, self._context_slot_mapping_buffers)
         else:
             if self.pass_hidden_states_to_model:
                 model_hidden_states = self.hidden_states[:num_input_tokens]

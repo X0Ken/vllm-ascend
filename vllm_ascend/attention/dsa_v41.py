@@ -741,8 +741,30 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
     def build_for_drafting(self, common_attn_metadata, draft_index, **kwargs):
         if not isinstance(self.kv_cache_spec, DeepseekV41DraftSWASpec):
             raise TypeError("V4.1 drafting requires a draft SWA cache")
-        # DSpark issues one eager block per step. Group-local tables and slots
+        # DSpark issues one query block per step. Group-local tables and slots
         # remain independent; the builder owns the operator metadata buffers.
+        if get_ascend_config().enable_dsv41_draft_graph:
+            table = common_attn_metadata.block_table_tensor
+            if not hasattr(self, "_draft_block_table"):
+                self._draft_block_table = torch.empty(
+                    (self.vllm_config.scheduler_config.max_num_seqs, table.shape[1]),
+                    dtype=table.dtype,
+                    device=table.device,
+                )
+            self._draft_block_table[: table.shape[0]].copy_(table)
+            common_attn_metadata.block_table_tensor = self._draft_block_table[: table.shape[0]]
+            # Capture and live drafting originate from different qsl staging
+            # buffers. Keep the pointer consumed by SMLA fixed across both.
+            if not hasattr(self, "_draft_query_start_loc"):
+                self._draft_query_start_loc = torch.empty(
+                    self.vllm_config.scheduler_config.max_num_seqs + 1,
+                    dtype=common_attn_metadata.query_start_loc.dtype,
+                    device=table.device,
+                )
+            rows = common_attn_metadata.query_start_loc.shape[0]
+            self._draft_query_start_loc[:rows].copy_(common_attn_metadata.query_start_loc)
+            common_attn_metadata.query_start_loc = self._draft_query_start_loc[:rows]
+            return self.build(0, common_attn_metadata, full_graph_mode=True)
         return self.build(0, common_attn_metadata)
 
     def enable_device_metadata(self) -> None:
@@ -937,6 +959,22 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             if ori_sparse_indices is not None and noncausal
             else None
         )
+        if noncausal and get_ascend_config().enable_dsv41_draft_graph:
+            if not hasattr(self, "_draft_sparse_indices"):
+                self._draft_sparse_indices = torch.empty(
+                    (self.vllm_config.scheduler_config.max_num_batched_tokens, *ori_sparse_indices.shape[1:]),
+                    dtype=torch.int32,
+                    device=ori_sparse_indices.device,
+                )
+                self._draft_topk_length = torch.empty(
+                    (self.vllm_config.scheduler_config.max_num_batched_tokens, *ori_topk_length.shape[1:]),
+                    dtype=torch.int32,
+                    device=ori_sparse_indices.device,
+                )
+            self._draft_sparse_indices[:num_input_tokens].copy_(ori_sparse_indices)
+            self._draft_topk_length[:num_input_tokens].copy_(ori_topk_length)
+            ori_sparse_indices = self._draft_sparse_indices[:num_input_tokens]
+            ori_topk_length = self._draft_topk_length[:num_input_tokens]
         ori_mask_mode = 0 if noncausal else 4
         ori_win_left = max(0, window_size - 1)
         ori_win_right = 0
