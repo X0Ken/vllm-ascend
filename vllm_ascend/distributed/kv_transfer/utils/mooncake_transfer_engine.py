@@ -1,3 +1,5 @@
+import fcntl
+import os
 import threading
 
 
@@ -21,11 +23,20 @@ class GlobalTE:
                             "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "  # noqa: E501
                             "to run vLLM with MooncakeConnector."
                         ) from e
-                    self.transfer_engine = TransferEngine()
+                    transfer_engine = TransferEngine()
                     device_name = device_name if device_name is not None else ""
-                    ret_value = self.transfer_engine.initialize(hostname, "P2PHANDSHAKE", "ascend", device_name)
+                    # ADXL probes an available port before binding its daemon.
+                    # Adjacent device ranges overlap at their boundary, so
+                    # concurrent workers can both select the same free port.
+                    # Shared IPC deployments also share this startup-only lock.
+                    lock_path = f"/dev/shm/vllm-ascend-mooncake-{os.getuid()}.lock"
+                    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+                    with os.fdopen(fd, "a") as lock:
+                        fcntl.flock(lock, fcntl.LOCK_EX)
+                        ret_value = transfer_engine.initialize(hostname, "P2PHANDSHAKE", "ascend", device_name)
                     if ret_value != 0:
                         raise RuntimeError(f"TransferEngine initialization failed with ret_value: {ret_value}")
+                    self.transfer_engine = transfer_engine
         return self.transfer_engine
 
     def register_buffer(self, ptrs: list[int], sizes: list[int]):
