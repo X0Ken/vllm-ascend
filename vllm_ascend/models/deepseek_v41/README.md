@@ -259,6 +259,19 @@ and input-buffer UVA allocations precedence over the large host memory pool.
 Scheduler clients still initialize eagerly and contribute no pool memory.
 The default is `false`; this option does not alter the Engram UVA backend.
 
+When checkpoint file pages crowd the pool allocation, the optional
+`"release_model_file_cache": true` setting advises the OS to release clean
+local `*.safetensors` pages before initializing a contributing worker's pool.
+It requires `defer_setup`, defaults to `false`, leaves the files unchanged,
+and does not clear unrelated system caches. The OS may retain mapped pages;
+the logged file size is the advised size, not measured reclaimed memory.
+This work runs during startup and may lengthen initialization.
+
+For large pools, Mooncake's `MC_MAX_MR_SIZE=17179869184` environment setting
+limits each registered region to 16 GiB while preserving the total configured
+`global_segment_size` per worker. Smaller regions alone do not guarantee
+successful RoCE registration; validate the complete configuration below.
+
 Pool registration alone is insufficient to validate a capacity. Check UVA
 allocations, actual writes and reads from every contributing worker, and real
 external-cache recall after clearing the HBM prefix cache. A repeated request

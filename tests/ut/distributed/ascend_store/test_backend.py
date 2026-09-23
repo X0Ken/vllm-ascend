@@ -496,6 +496,7 @@ class TestMooncakeBackendMethods(unittest.TestCase):
             device_name="",
             master_server_address="127.0.0.1:50088",
             enable_ssd_offload=False,
+            release_model_file_cache=False,
             tenant_id="default",
         )
         with (
