@@ -169,6 +169,9 @@ class KVPoolWorker:
         use_eagle_fn = getattr(speculative_config, "use_eagle", None)
         self.use_eagle = use_eagle_fn() is True if callable(use_eagle_fn) else False
         self.original_block_size = infer_group_block_sizes(vllm_config.cache_config.block_size, kv_cache_groups)
+        self.cacheable_group_ids = infer_cacheable_group_ids(kv_cache_groups)
+        if self.use_layerwise and len(self.cacheable_group_ids) != len(self.original_block_size):
+            raise ValueError("AscendStore private KV state requires non-layerwise transfer")
         cp_scale = self.pcp_size * self.dcp_size
         self.grouped_block_size = [block_size * cp_scale for block_size in self.original_block_size]
         self.hash_block_size = (
@@ -176,12 +179,12 @@ class KVPoolWorker:
             * cp_scale
         )
         self.block_size = self.grouped_block_size[0]
-        self.lcm_block_size = math.lcm(*self.grouped_block_size)
+        self.lcm_block_size = math.lcm(*(self.grouped_block_size[i] for i in self.cacheable_group_ids))
         self.num_kv_cache_groups = len(self.grouped_block_size)
         self.kv_cache_group_families = infer_group_cache_families(kv_cache_groups, self.compress_ratios, self.hf_config)
         self.group_uses_align_state = self._infer_group_uses_align_state()
         self.cache_transfer_granularity = infer_cache_transfer_granularity(
-            self.grouped_block_size, self.lcm_block_size, range(self.num_kv_cache_groups)
+            self.grouped_block_size, self.lcm_block_size, self.cacheable_group_ids
         )
         self.h2d_stagger_us = int(extra_config.get("h2d_stagger_us", 0))
         self.layerwise_max_transfer_blocks = int(extra_config.get("layerwise_max_transfer_blocks", 0))

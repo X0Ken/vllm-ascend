@@ -46,6 +46,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     get_group_block_size,
     get_group_cache_family,
     infer_cache_transfer_granularity,
+    infer_cacheable_group_ids,
     infer_group_block_sizes,
     infer_group_cache_families,
     infer_hash_block_size,
@@ -117,6 +118,9 @@ class KVPoolScheduler:
         use_eagle_fn = getattr(speculative_config, "use_eagle", None)
         self.use_eagle = use_eagle_fn() is True if callable(use_eagle_fn) else False
         self.original_block_size = infer_group_block_sizes(vllm_config.cache_config.block_size, kv_cache_groups)
+        self.cacheable_group_ids = infer_cacheable_group_ids(kv_cache_groups)
+        if self.use_layerwise and len(self.cacheable_group_ids) != len(self.original_block_size):
+            raise ValueError("AscendStore private KV state requires non-layerwise transfer")
         cp_scale = self.pcp_size * self.dcp_size
         self.grouped_block_size = [block_size * cp_scale for block_size in self.original_block_size]
         self.hash_block_size = (
@@ -124,9 +128,9 @@ class KVPoolScheduler:
             * cp_scale
         )
         self._block_size = self.grouped_block_size[0]
-        self.lcm_block_size = math.lcm(*self.grouped_block_size)
+        self.lcm_block_size = math.lcm(*(self.grouped_block_size[i] for i in self.cacheable_group_ids))
         self.cache_transfer_granularity = infer_cache_transfer_granularity(
-            self.grouped_block_size, self.lcm_block_size, self.kv_cache_group_ids
+            self.grouped_block_size, self.lcm_block_size, self.cacheable_group_ids
         )
         # request_id -> full_token_ids
         self._request_trackers: dict[str, RequestTracker] = {}
@@ -520,6 +524,10 @@ class KVPoolScheduler:
                 )
         if num_external_hit_tokens == request.num_tokens:
             num_external_hit_tokens -= 1
+        if len(self.cacheable_group_ids) != len(self.original_block_size):
+            # Private compressor state is rebuilt locally. Recompute the last
+            # whole token page rather than resume inside a compressed block.
+            num_external_hit_tokens = self._floor_to_cache_transfer_granularity(num_external_hit_tokens)
 
         if num_external_hit_tokens < num_computed_tokens:
             need_to_allocate = 0
@@ -750,11 +758,12 @@ class KVPoolScheduler:
         num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
         if req_tuple:
             request = req_tuple[0]
-            num_current_tokens = request_tracker.token_len
+            # The scheduler rolls this back when speculative tokens are rejected.
+            num_current_tokens = request.num_computed_tokens
             new_token_ids = request.all_token_ids[num_current_tokens : num_current_tokens + num_new_tokens]
             if request_tracker.token_ids is not None and new_token_ids:
                 request_tracker.token_ids.extend(new_token_ids)
-            request_tracker.token_len += num_new_tokens
+            request_tracker.token_len = num_current_tokens + num_new_tokens
         else:
             raise ValueError(f"Request {req_id} is not in _unfinished_requests, but it is scheduled to be cached")
         if new_block_ids is not None:
@@ -852,7 +861,12 @@ class KVPoolScheduler:
         if not force_skip_save:
             for i, req_id in enumerate(cached_reqs.req_ids):
                 new_block_ids = cached_reqs.new_block_ids[i]
-                if not new_block_ids and not self.tp_mismatch and not self.layerwise_offload:
+                if (
+                    not new_block_ids
+                    and not self.tp_mismatch
+                    and not self.layerwise_offload
+                    and not self.save_decode_cache
+                ):
                     continue
                 if req_id in self._preempted_req_ids:
                     if not new_block_ids:

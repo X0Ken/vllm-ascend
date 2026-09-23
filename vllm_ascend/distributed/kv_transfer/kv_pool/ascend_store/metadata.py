@@ -256,7 +256,9 @@ def infer_cacheable_group_ids(kv_cache_groups: Sequence[Any] | None) -> set[int]
     """Keep private scratch groups out of external prefix lookup and transfer."""
     if not kv_cache_groups:
         return {0}
-    return {i for i, group in enumerate(kv_cache_groups) if prefix_cacheable(group.kv_cache_spec)}
+    group_ids = {i for i, group in enumerate(kv_cache_groups) if prefix_cacheable(group.kv_cache_spec)}
+    assert group_ids, "AscendStore requires at least one prefix-cacheable KV cache group"
+    return group_ids
 
 
 def infer_hash_block_size(
@@ -523,6 +525,7 @@ class ChunkedTokenDatabase:
         shard_rank: int | None = None,
         shard_size: int | None = None,
     ) -> Iterable[tuple[int, int, BlockHash | str, int | None]]:
+        # Private circular state has no external prefix key.
         if not block_hashes or kv_cache_group_id in self.non_cacheable_group_ids:
             return
         logical_block_size = self.get_block_size(kv_cache_group_id)
@@ -1045,7 +1048,9 @@ class ReqMeta:
             and target_token_len % cache_transfer_granularity == 0
             and full_block_count > available_full_block_count
         )
-        if boundary_without_hash:
+        # Scheduled draft tokens can cross a page before that page has a
+        # committed request hash. Do not mark an unsent page as saved.
+        if boundary_without_hash or (not save_partial_block and full_block_count > available_full_block_count):
             num_tokens_to_save = available_full_block_count * cache_transfer_granularity
         if tracker.last_block_gva is not None and (
             target_token_len % cache_transfer_granularity != 0 or boundary_without_hash
