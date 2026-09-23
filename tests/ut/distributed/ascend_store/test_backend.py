@@ -420,6 +420,7 @@ class TestMooncakeBackendMethods(unittest.TestCase):
             backend.config = MagicMock()
             backend.local_seg = "127.0.0.1:1234"
             backend._lazy_init = False
+            backend._defer_setup = False
             backend._store_initialized = True
             backend._use_fabric_mem = False
             backend._use_store_independent_te = False
@@ -1002,6 +1003,56 @@ class TestMemcacheQosValidation(unittest.TestCase):
     def test_init_rejects_invalid_qos(self):
         with patch.dict(os.environ, {self._ENV: "7"}), self.assertRaisesRegex(ValueError, r"\[0, 4\]"):
             MemcacheBackend(MagicMock())
+
+
+class TestMooncakeDeferredSetup(unittest.TestCase):
+    _MODULE = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend"
+
+    def test_deferred_workers_and_eager_schedulers(self):
+        for defer in (False, True):
+            for contributes in (False, True):
+                with self.subTest(defer=defer, contributes=contributes), patch.dict(os.environ, {}, clear=True):
+                    config = _make_mooncake_store_config(defer_setup=defer)
+                    store = MagicMock()
+                    with (
+                        patch.object(MooncakeStoreConfig, "load_from_env", return_value=config),
+                        patch.object(MooncakeBackend, "_setup_store", return_value=store) as setup,
+                        patch(f"{self._MODULE}.global_te"),
+                        patch(f"{self._MODULE}.get_ip", return_value="127.0.0.1"),
+                    ):
+                        backend = MooncakeBackend(MagicMock(), contribute_memory=contributes)
+                        self.assertEqual(setup.call_count, 0 if defer and contributes else 1)
+                        if defer and contributes:
+                            self.assertEqual(backend.exists(["not-ready"]), [0])
+                        backend.register_buffer([1], [8])
+                        backend.register_buffer([2], [8])
+                        backend.ensure_initialized()
+                        self.assertEqual(setup.call_count, 1)
+                        self.assertIs(backend.store, store)
+                        self.assertTrue(backend._store_initialized)
+
+    def test_failed_deferred_setup_can_retry(self):
+        with patch.dict(os.environ, {}, clear=True):
+            config = _make_mooncake_store_config(defer_setup=True)
+            store = MagicMock()
+            with (
+                patch.object(MooncakeStoreConfig, "load_from_env", return_value=config),
+                patch.object(MooncakeBackend, "_setup_store", side_effect=[RuntimeError("allocation"), store]),
+                patch(f"{self._MODULE}.global_te"),
+                patch(f"{self._MODULE}.get_ip", return_value="127.0.0.1"),
+            ):
+                backend = MooncakeBackend(MagicMock())
+                with self.assertRaisesRegex(RuntimeError, "allocation"):
+                    backend.register_buffer([1], [8])
+                self.assertFalse(backend._store_initialized)
+                self.assertIsNone(backend.store)
+                backend.register_buffer([1], [8])
+                self.assertIs(backend.store, store)
+
+    def test_config_rejects_non_boolean_defer(self):
+        for value in ("false", 0, 1, None):
+            with self.subTest(value=value), self.assertRaisesRegex(TypeError, "defer_setup must be a boolean"):
+                _make_mooncake_store_config(defer_setup=value)
 
 
 if __name__ == "__main__":

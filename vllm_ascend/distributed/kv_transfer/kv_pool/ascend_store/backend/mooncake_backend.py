@@ -116,7 +116,11 @@ class MooncakeBackend(Backend):
         # operates independently of the global transfer engine; setup goes through store
         # and buffers are registered via store.register_buffer() instead of global_te.
         self._use_store_independent_te = bool(os.getenv("ASCEND_GLOBAL_RESOURCE_CONFIG")) and not self._use_fabric_mem
-        self._lazy_init = lazy_init and self._use_fabric_mem
+        # Reserve model/UVA metadata before the large ordinary-page pool.
+        # Scheduler clients contribute no memory and must remain eager so they
+        # can discover remote segments before this worker has run a request.
+        self._defer_setup = self.config.defer_setup and contribute_memory
+        self._lazy_init = (lazy_init and self._use_fabric_mem) or self._defer_setup
         self._contribute_memory = contribute_memory
         self._store_initialized = False
         self._store_init_lock = threading.Lock()
@@ -223,6 +227,8 @@ class MooncakeBackend(Backend):
         torch.npu.set_device(device)
 
     def register_buffer(self, ptrs: list[int], lengths: list[int]):
+        if self._defer_setup:
+            self.ensure_initialized()
         if self._use_store_independent_te:
             assert self.store is not None
             for ptr, length in zip(ptrs, lengths):
@@ -269,7 +275,7 @@ class MooncakeBackend(Backend):
                     error_codes,
                 )
                 logger.debug("Failed to put key details. keys=%s, result=%s", keys, res)
-                if self._lazy_init:
+                if self._lazy_init and not self._defer_setup:
                     logger.warning("First DSV4(compress) request failure is expected. This is normal behavior.")
         except Exception as e:
             logger.error(
@@ -280,7 +286,7 @@ class MooncakeBackend(Backend):
                 e,
             )
             logger.debug("Failed to put key details. keys=%s", keys)
-            if self._lazy_init:
+            if self._lazy_init and not self._defer_setup:
                 logger.warning("First DSV4(compress) request failure is expected. This is normal behavior.")
 
     def get(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
@@ -342,8 +348,11 @@ class MooncakeStoreConfig:
     enable_ssd_offload: bool = False
     ssd_offload_path: str = ""
     tenant_id: str = DEFAULT_TENANT_ID
+    defer_setup: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.defer_setup, bool):
+            raise TypeError("defer_setup must be a boolean")
         if not self.enable_ssd_offload:
             return
         if not self.ssd_offload_path:
@@ -377,6 +386,7 @@ class MooncakeStoreConfig:
             enable_ssd_offload=bool(config.get("enable_ssd_offload", False)),
             ssd_offload_path=config.get("ssd_offload_path", ""),
             tenant_id=_normalize_tenant_id(config.get("tenant_id", DEFAULT_TENANT_ID)),
+            defer_setup=config.get("defer_setup", False),
         )
 
     @staticmethod

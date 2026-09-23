@@ -251,6 +251,21 @@ selects sequence parallel execution. Validation covers TP8/DP2/EP16 with
 PP/DCP/PCP equal to one and requests sent only to DP0. Enabling query graphs
 is a separate option and requires validation of the combined configuration.
 
+## Deferred Mooncake pool allocation
+
+Set `"defer_setup": true` in the Mooncake JSON configuration to initialize
+contributing workers when their KV buffers are registered. This gives model
+and input-buffer UVA allocations precedence over the large host memory pool.
+Scheduler clients still initialize eagerly and contribute no pool memory.
+The default is `false`; this option does not alter the Engram UVA backend.
+
+Pool registration alone is insufficient to validate a capacity. Check UVA
+allocations, actual writes and reads from every contributing worker, and real
+external-cache recall after clearing the HBM prefix cache. A repeated request
+may continue to hit external KV, so record both HBM and external-hit counters
+instead of assuming that the repeat resides in HBM. Reserve host memory
+headroom and validate the selected capacity again after restarting.
+
 ## Supported milestone and remaining accuracy work
 
 The runtime contract is model runner V1, eager or `FULL_DECODE_ONLY` mode,
