@@ -396,6 +396,8 @@ class AscendConfig:
     enable_dsv41_rope_negate_sin: bool = False
     # Experimental query-only DSpark graph; context KV remains eager.
     enable_dsv41_draft_graph: bool = False
+    # Use an 8-token SP graph for a single V4.1 K5 request.
+    enable_dsv41_compact_sp_graph: bool = False
     # Overlap the offloaded CPU lookup with eager prefill/mixed execution.
     # Captured decode graphs keep the synchronous refresh.
     enable_engram_prefetch: bool = False

@@ -82,6 +82,28 @@ The following table lists additional configuration options available in vLLM Asc
 
 The details of each configuration option are as follows:
 
+**enable_dsv41_compact_sp_graph**
+
+Default: `False`. To enable, merge `"enable_dsv41_compact_sp_graph": true` into
+the existing `--additional-config` JSON object.
+
+This option adds an 8-token sequence-parallel decode graph for a single
+DeepSeek V4.1 DSpark K5 request, replacing the usual 24-token padded graph.
+All six real verification tokens are retained; only the trailing dummy query
+is shortened. Multi-request batches retain the existing LCM-aligned graph
+sizes, and mixed batches retain eager execution.
+
+Requires TP8, PP1, sequence parallelism, target `FULL_DECODE_ONLY` graph mode,
+and five speculative tokens. DSA context parallelism and LoRA must be disabled.
+The validated p6 setup also uses Draft FULL graphs and Engram UVA; this option
+does not change those settings.
+
+On Ascend 910B3, paired 10-minute OpenCode history replays against p6
+(`43d1096dc`), using non-headless mode and one fixed endpoint, improved C1 mean
+TPOT by 7.87% (11.1749 to 10.2951 ms). C8 mean TPOT increased by 0.52% and mean
+end-to-end latency increased by 1.00%. These are workload-specific measurements;
+the option remains disabled by default so deployments can choose this tradeoff.
+
 **xlite_graph_config**
 
 | Name | Type | Default | Description |

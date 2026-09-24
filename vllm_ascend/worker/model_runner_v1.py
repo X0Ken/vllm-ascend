@@ -949,6 +949,24 @@ class NPUModelRunner(GPUModelRunner):
         else:
             num_reqs_padded = batch_desc_num_reqs if batch_desc_num_reqs is not None else num_reqs
 
+        if (
+            get_ascend_config().enable_dsv41_compact_sp_graph
+            and cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and batch_desc_num_reqs is not None
+            and num_tokens_padded % self.uniform_decode_query_len != 0
+        ):
+            assert num_reqs <= num_reqs_padded
+            last_loc = query_start_loc.np[num_reqs]
+            assert last_loc <= num_tokens_padded
+            query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1] = np.minimum(
+                last_loc + self.arange_np[1 : num_reqs_padded + 1 - num_reqs]
+                * self.uniform_decode_query_len,
+                num_tokens_padded,
+            )
+            assert query_start_loc.np[num_reqs_padded] == num_tokens_padded
+            query_start_loc.copy_to_gpu()
+            return num_reqs_padded
+
         # avoid corner case of cudagraph config mode FULL to enter the first padding logic
         # e.g. 1 request with 1 token when num_spec > 1 (num_spec = 3 and cudagraph_batch_size = 4 for example)
         # will cause tokens are padded but requests are not
@@ -1472,18 +1490,6 @@ class NPUModelRunner(GPUModelRunner):
             self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
         )
         self.seq_lens[num_reqs:].fill_(0)
-
-        # In async spec decode mode, optimistic_seq_lens_cpu assumes all
-        # tokens from the previous speculative step were accepted. Correct it
-        # on CPU using the valid-sampled-token counts that are already copied
-        # asynchronously for scheduler bookkeeping. This avoids an extra
-        # NPU->CPU seq_lens copy and the synchronize() in attention metadata.
-        # Mirrors update_num_computed_tokens_for_batch_change on the GPU side.
-        async_spec_decode_active = (
-            self.use_async_spec_decode
-            and valid_sampled_token_count_gpu is not None
-            and prev_req_id_to_index
-        )
 
         self.input_batch.block_table.compute_slot_mapping(
             num_reqs,
@@ -5609,8 +5615,26 @@ class NPUModelRunner(GPUModelRunner):
         with update_pass_config(self):
             tensor_parallel_size = self.parallel_config.tensor_parallel_size
             resolver_tensor_parallel_size = tensor_parallel_size
+            compact_sp = get_ascend_config().enable_dsv41_compact_sp_graph
+            if compact_sp:
+                from vllm_ascend.compilation.compact_sp_graph import (
+                    DSV41_COMPACT_SP_TP_SIZE,
+                    DSV41_K5_QUERY_LEN,
+                    CompactSPGraphDispatcher,
+                )
+
+                model_type = getattr(self.model_config.hf_text_config, "model_type", "")
+                assert model_type in ("deepseek_v41_text", "deepseek_v4.1_text")
+                assert enable_sp(self.vllm_config) and not enable_dsa_cp()
+                assert self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+                assert self.uniform_decode_query_len == DSV41_K5_QUERY_LEN
+                assert tensor_parallel_size == DSV41_COMPACT_SP_TP_SIZE
+                assert self.parallel_config.pipeline_parallel_size == 1
+                assert self.vllm_config.lora_config is None
+                self.cudagraph_dispatcher = CompactSPGraphDispatcher(self.vllm_config)
             if (
-                self.compilation_config.cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+                not compact_sp
+                and self.compilation_config.cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
                 and (enable_dsa_cp() or enable_sp(self.vllm_config) or self.compilation_config.pass_config.enable_sp)
             ):
                 # CP and SP pad tokens to TP. Align capture keys to both TP
@@ -5622,12 +5646,20 @@ class NPUModelRunner(GPUModelRunner):
             cudagraph_mode = self.compilation_config.resolve_cudagraph_mode_and_sizes(
                 min_cg_support=min_cg_support,
                 min_cg_attn_backend=min_cg_attn_backend,
-                uniform_decode_query_len=self.uniform_decode_query_len,
+                uniform_decode_query_len=1 if compact_sp else self.uniform_decode_query_len,
                 use_v2_model_runner=False,
                 tensor_parallel_size=resolver_tensor_parallel_size,
                 kv_cache_config=self.kv_cache_config,
                 max_num_reqs=self.max_num_reqs,
             )
+            if compact_sp:
+                # Add only the single-request graph. Multi-request batches keep
+                # the existing LCM-aligned graph sizes and descriptors.
+                alignment = math.lcm(self.uniform_decode_query_len, tensor_parallel_size)
+                self.compilation_config.cudagraph_capture_sizes = [
+                    size for size in self.compilation_config.cudagraph_capture_sizes
+                    if size == tensor_parallel_size or size % alignment == 0
+                ]
             self.cudagraph_dispatcher.initialize_cudagraph_keys(
                 cudagraph_mode, self.uniform_decode_query_len
             )
