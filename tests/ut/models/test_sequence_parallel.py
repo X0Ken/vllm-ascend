@@ -42,3 +42,22 @@ def test_reduce_scatter_padding(monkeypatch, custom_collective, num_tokens, tp_s
         fallback.assert_not_called()
     else:
         fallback.assert_called_once_with(inputs[0], 0)
+
+
+def test_reduce_scatter_keeps_padding_op_during_compilation(monkeypatch):
+    x = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+    captured = []
+
+    def reduce_scatter(value):
+        captured.append(value)
+        return value[:2]
+
+    monkeypatch.setattr(sp.torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setattr(sp, "get_tensor_model_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(sp, "get_tp_group", lambda: SimpleNamespace(device_communicator=None))
+    monkeypatch.setattr(sp, "tensor_model_parallel_reduce_scatter", lambda value, dim: reduce_scatter(value))
+
+    torch.testing.assert_close(sp.sp_reduce_scatter(x), x[:2])
+    assert len(captured) == 1
+    torch.testing.assert_close(captured[0], x)
+    assert captured[0] is not x
