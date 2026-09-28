@@ -19,6 +19,8 @@ import torch
 import torch.distributed as dist
 from vllm.distributed.device_communicators.base_device_communicator import DeviceCommunicatorBase
 
+from vllm_ascend import envs
+
 
 class _NpuAll2AllManager:
     """No-op all2all_manager for NPU. Used by vLLM main's fault-tolerance
@@ -56,3 +58,12 @@ class NPUCommunicator(DeviceCommunicatorBase):
         self.device = torch.npu.current_device()
         self.ca_comm = None
         self.all2all_manager = _NpuAll2AllManager()
+        self._tp_fp32_all_reduce = unique_name.split(":", 1)[0] == "tp" and envs.VLLM_ASCEND_TP_BF16_ALLREDUCE_FP32
+
+    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        if self._tp_fp32_all_reduce and input_.dtype == torch.bfloat16:
+            accumulator = input_.to(dtype=torch.float32)
+            dist.all_reduce(accumulator, group=self.device_group)
+            input_.copy_(accumulator)
+            return input_
+        return super().all_reduce(input_)

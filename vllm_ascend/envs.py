@@ -71,6 +71,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Promote BF16 tensor-parallel all-reduce to FP32 accumulation, then cast
+    # back once. Opt-in for the fixed DeepSeek V4.1 910B3 accuracy profile.
+    # Valid values: 0 (default) or 1. Not sensitive.
+    "VLLM_ASCEND_TP_BF16_ALLREDUCE_FP32": lambda: bool(int(os.getenv("VLLM_ASCEND_TP_BF16_ALLREDUCE_FP32", "0"))),
 }
 
 # end-env-vars-definition
