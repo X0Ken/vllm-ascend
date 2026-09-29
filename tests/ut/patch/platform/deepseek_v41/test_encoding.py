@@ -111,6 +111,53 @@ def test_v41_rejects_image_placeholder_in_text() -> None:
         )
 
 
+@pytest.mark.parametrize("content_field", ["content", "content_blocks"])
+@pytest.mark.parametrize("role", ["developer", "user"])
+def test_v41_encodes_responses_input_text(content_field: str, role: str) -> None:
+    message = {
+        "role": role,
+        content_field: [{"type": "input_text", "text": "first"}, {"type": "input_text", "text": "second"}],
+    }
+    if content_field == "content_blocks":
+        message["content"] = ""
+
+    prompt = encode_messages([message], thinking_mode="chat")
+
+    assert "first\n\nsecond" in prompt
+    assert "[Unsupported input_text]" not in prompt
+
+
+def test_v41_encodes_input_text_in_tool_result() -> None:
+    prompt = encode_messages(
+        [
+            {
+                "role": "user",
+                "content_blocks": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_1",
+                        "content": [
+                            {"type": "input_text", "text": "tool output"},
+                        ],
+                    },
+                ],
+            }
+        ],
+        thinking_mode="chat",
+    )
+
+    assert "tool output" in prompt
+    assert "[Unsupported input_text]" not in prompt
+
+
+def test_v41_rejects_image_placeholder_in_input_text() -> None:
+    with pytest.raises(ValueError, match="Text block contains image placeholder"):
+        encode_messages(
+            [{"role": "user", "content": [{"type": "input_text", "text": IMAGE_PLACEHOLDER}]}],
+            thinking_mode="chat",
+        )
+
+
 # ============================================================
 # Reasoning Effort
 # ============================================================

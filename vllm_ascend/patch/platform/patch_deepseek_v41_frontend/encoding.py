@@ -301,14 +301,14 @@ def _process_image_blocks(
             block["content"], nested_images = _process_image_blocks(block["content"], image_placeholder)
             new_blocks.append(block)
             images.extend(nested_images)
-        elif block.get("type") == "text":
+        elif block.get("type") in ("text", "input_text"):
             text = block.get("text") or ""
             if IMAGE_PLACEHOLDER in text:
                 raise ValueError(
                     f"Text block contains image placeholder '{IMAGE_PLACEHOLDER}': "
                     f"'{text[:100]}'. Images should be separate content blocks."
                 )
-            new_blocks.append(block)
+            new_blocks.append({**block, "type": "text"})
         else:
             new_blocks.append(block)
     return new_blocks, images
@@ -343,7 +343,7 @@ def process_image_messages(
         if msg.get("content_blocks"):
             msg["content_blocks"], message_images = _process_image_blocks(msg["content_blocks"])
             images.extend(message_images)
-            if not isinstance(msg.get("content"), str):
+            if not isinstance(msg.get("content"), str) or not msg["content"]:
                 texts = [
                     block.get("text", "")
                     for block in msg["content_blocks"]
