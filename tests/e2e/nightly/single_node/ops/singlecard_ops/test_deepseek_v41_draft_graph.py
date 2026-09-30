@@ -16,8 +16,9 @@ from vllm_ascend.utils import enable_custom_op
 
 @pytest.mark.parametrize("batch", [1, 3, 8, 32])
 @pytest.mark.parametrize("query_len", [1, 5])
+@pytest.mark.parametrize("input_padding", [0, 5])
 @torch.inference_mode()
-def test_draft_swa_graph_replays_changed_metadata(monkeypatch, batch, query_len):
+def test_draft_swa_graph_replays_changed_metadata(monkeypatch, batch, query_len, input_padding):
     assert enable_custom_op()
     device = torch.device("npu:0")
     torch.npu.set_device(device)
@@ -79,7 +80,7 @@ def test_draft_swa_graph_replays_changed_metadata(monkeypatch, batch, query_len)
 
     def consume(entry):
         q = query.clone()
-        cos, sin = entry.cos[layer], entry.sin[layer]
+        cos, sin = entry.cos[layer][: query.shape[0]], entry.sin[layer][: query.shape[0]]
         torch.ops._C_ascend.inplace_partial_rotary_mul(
             q.unsqueeze(1), cos, sin, rotary_mode="interleave", partial_slice=[448, 512]
         )
@@ -129,6 +130,10 @@ def test_draft_swa_graph_replays_changed_metadata(monkeypatch, batch, query_len)
             dtype=torch.int64,
             device=device,
         )
+        # DP synchronization pads model inputs even during eager prefill/mixed
+        # execution. Attention still consumes only the local query rows.
+        positions_cpu = torch.cat((positions_cpu, torch.zeros(input_padding, dtype=torch.int64)))
+        slots = torch.cat((slots, torch.full((input_padding,), -1, dtype=torch.int64, device=device)))
         qsl_cpu = torch.arange(batch + 1, dtype=torch.int32) * query_len
         common = dict(
             query_start_loc=qsl_cpu.to(device),
@@ -139,7 +144,7 @@ def test_draft_swa_graph_replays_changed_metadata(monkeypatch, batch, query_len)
             slot_mapping=slots,
             block_table_tensor=table_cpu.to(device),
             num_reqs=batch,
-            num_input_tokens=batch * query_len,
+            num_input_tokens=batch * query_len + input_padding,
             num_actual_tokens=batch * query_len,
             max_query_len=query_len,
             max_seq_len=max(lengths),

@@ -976,10 +976,15 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
                     dtype=torch.int32,
                     device=ori_sparse_indices.device,
                 )
-            self._draft_sparse_indices[:num_input_tokens].copy_(ori_sparse_indices)
-            self._draft_topk_length[:num_input_tokens].copy_(ori_topk_length)
-            ori_sparse_indices = self._draft_sparse_indices[:num_input_tokens]
-            ori_topk_length = self._draft_topk_length[:num_input_tokens]
+            # Match the queries consumed by attention, not the DP-synchronized
+            # model input. Eager prefill/mixed batches can have fewer queries
+            # than num_input_tokens. FULL replay already includes graph padding
+            # in num_actual_tokens in the proposer. Keep the persistent base
+            # address in both cases without exposing stale rows from a prior batch.
+            self._draft_sparse_indices[:num_actual_tokens].copy_(ori_sparse_indices)
+            self._draft_topk_length[:num_actual_tokens].copy_(ori_topk_length)
+            ori_sparse_indices = self._draft_sparse_indices[:num_actual_tokens]
+            ori_topk_length = self._draft_topk_length[:num_actual_tokens]
         ori_mask_mode = 0 if noncausal else 4
         ori_win_left = max(0, window_size - 1)
         ori_win_right = 0
