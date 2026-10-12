@@ -1,0 +1,14 @@
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -0,0 +1 @@
++from vllm.v1.engine import v41_prefill_policy as _v41_prefill_policy
+@@ -652 +653,6 @@
+-        if self.scheduler.has_requests():
++        if self.scheduler.has_requests() and not _v41_prefill_policy.pending_prefill(
++            batch_queue, self.async_scheduling
++        ):
++            _v41_prefill_ids = _v41_prefill_policy.prefill_ids(
++                self.scheduler.requests, self.async_scheduling
++            )
+@@ -653,0 +660 @@
++            _v41_prefill_policy.tag_output(scheduler_output, _v41_prefill_ids)

@@ -2656,6 +2656,39 @@ class NPUModelRunner(GPUModelRunner):
             spec_decode_metadata,
         )
 
+        # Queue first-token D2H before DSpark submits draft kernels. The
+        # async wrapper stays private until sample_tokens returns; final
+        # metadata is attached after the unchanged draft/KV bookkeeping.
+        _v41_early_async_output = None
+        if (
+            self.use_async_scheduling
+            and self.speculative_config is not None
+            and pp.world_size == 1
+            and isinstance(self.drafter, AscendDSparkProposer)
+            and spec_decode_metadata is None
+            and not self.routed_experts_initialized
+        ):
+            _v41_early_async_output = AsyncGPUModelRunnerOutput(
+                model_runner_output=ModelRunnerOutput(
+                    req_ids=req_ids_output_copy,
+                    req_id_to_index=req_id_to_index_output_copy,
+                    sampled_token_ids=valid_sampled_token_ids,
+                    spec_token_ids=output_spec_token_ids,
+                    logprobs=logprobs_lists,
+                    prompt_logprobs_dict=prompt_logprobs_dict,
+                    kv_connector_output=kv_connector_output,
+                    pooler_output=[],
+                    ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
+                    cudagraph_stats=cudagraph_stats,
+                    routed_experts=None,
+                ),
+                sampled_token_ids=sampler_output.sampled_token_ids,
+                logprobs_tensors=sampler_output.logprobs_tensors,
+                invalid_req_indices=invalid_req_indices,
+                async_output_copy_stream=self.async_output_copy_stream,
+                vocab_size=self.input_batch.vocab_size,
+            )
+
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
                 if not early_pp_padded_drafter:
@@ -2761,15 +2794,22 @@ class NPUModelRunner(GPUModelRunner):
                     :total
                 ].clone(),
             )
-        async_output = AsyncGPUModelRunnerOutput(
-            model_runner_output=model_runner_output,
-            sampled_token_ids=sampler_output.sampled_token_ids,
-            logprobs_tensors=sampler_output.logprobs_tensors,
-            invalid_req_indices=invalid_req_indices,
-            async_output_copy_stream=self.async_output_copy_stream,
-            vocab_size=self.input_batch.vocab_size,
-            routed_experts=routed_experts_snapshot,
-        )
+        if _v41_early_async_output is not None:
+            # RPC consumers cannot access the wrapper before this function
+            # returns; replace the provisional metadata with the original
+            # post-draft object before publication.
+            _v41_early_async_output._model_runner_output = model_runner_output
+            async_output = _v41_early_async_output
+        else:
+            async_output = AsyncGPUModelRunnerOutput(
+                model_runner_output=model_runner_output,
+                sampled_token_ids=sampler_output.sampled_token_ids,
+                logprobs_tensors=sampler_output.logprobs_tensors,
+                invalid_req_indices=invalid_req_indices,
+                async_output_copy_stream=self.async_output_copy_stream,
+                vocab_size=self.input_batch.vocab_size,
+                routed_experts=routed_experts_snapshot,
+            )
         self.input_batch.set_async_sampled_token_ids(
             async_output.sampled_token_ids_cpu,
             async_output.async_copy_ready_event,

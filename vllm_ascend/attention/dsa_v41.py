@@ -49,6 +49,8 @@ from vllm_ascend.worker.device_metadata import (
 V41_METADATA_BUFFER_SIZE = 1024
 
 
+from vllm_ascend.ops.triton.v41_kv_norm_rope_cache import kv_norm_rope_cache, supports
+
 @eager_break_during_capture
 def dsa_v41_forward(
     hidden_states: torch.Tensor,
@@ -405,19 +407,24 @@ class DeepseekV41EagerAttentionImpl:
         main_stream.wait_event(kv_matmul_done)
         with npu_stream_switch(aux_stream, enabled=True):
             aux_stream.wait_event(part3_start)
-            kv = attn.kv_norm(kv).view(-1, 1, attn.head_dim)
-            torch.ops._C_ascend.inplace_partial_rotary_mul(
-                kv.unsqueeze(1),
-                cos,
-                sin,
-                rotary_mode="interleave",
-                partial_slice=[attn.nope_head_dim, attn.head_dim],
-            )
-            scatter_cache_sk(
-                attn.dsa_attn.swa_cache_layer.kv_cache[0],
-                swa_metadata.slot_mapping,
-                kv.squeeze(1),
-            )
+            cache = attn.dsa_attn.swa_cache_layer.kv_cache[0]
+            slots = swa_metadata.slot_mapping
+            if supports(kv, attn.kv_norm, cos, sin, slots, cache):
+                kv_norm_rope_cache(attn.kv_norm(kv), attn.kv_norm, cos, sin, slots, cache, normalize=False)
+            else:
+                kv = attn.kv_norm(kv).view(-1, 1, attn.head_dim)
+                torch.ops._C_ascend.inplace_partial_rotary_mul(
+                    kv.unsqueeze(1),
+                    cos,
+                    sin,
+                    rotary_mode="interleave",
+                    partial_slice=[attn.nope_head_dim, attn.head_dim],
+                )
+                scatter_cache_sk(
+                    attn.dsa_attn.swa_cache_layer.kv_cache[0],
+                    swa_metadata.slot_mapping,
+                    kv.squeeze(1),
+                )
         q = wq_b.matmul(q_b_quant, q_b_scale, bias=attn.wq_b.bias).unflatten(-1, (attn.n_local_heads, attn.head_dim))
         main_stream.wait_stream(aux_stream)
         torch.ops._C_ascend.inplace_partial_rotary_mul(

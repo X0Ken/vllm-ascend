@@ -1,3 +1,4 @@
+import vllm_ascend.ops.v41_joint_runtime
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek V4.1 text model and source-shared hybrid-cache graph."""
@@ -10,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+torch.ops.load_library("/opt/v41hcpostprenorm/native.so")
 import vllm.envs as envs
 from safetensors import safe_open
 from transformers import AutoTokenizer
@@ -447,17 +449,12 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
         x = self.self_attn(positions, x, llama_4_scaling)
         if use_sequence_parallel:
             x = sp_reduce_scatter(x)
-        hidden_states = self.hc_post(x, residual, attn_post, attn_comb)
-
-        residual = hidden_states
-        x, ffn_post, ffn_comb, ffn_pre = self.hc_pre(
-            hidden_states,
-            self.hc_ffn_fn,
-            self.hc_ffn_scale,
-            self.hc_ffn_base,
-            attn_pre,
-        )
-        x, x_fp32 = self.rms_norm_cast(x)
+        x, ffn_post, ffn_comb, ffn_pre, residual, x_fp32 = torch.ops.v41_joint_runtime.dispatch(
+                residual, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base,
+                attn_pre, x, attn_post, attn_comb, self.post_attention_layernorm.weight,
+                self.hc_sinkhorn_iters, self.norm_eps, self.hc_eps,
+                self.post_attention_layernorm.variance_epsilon,
+            )
         x = self.mlp(
             x,
             input_ids=input_ids,
