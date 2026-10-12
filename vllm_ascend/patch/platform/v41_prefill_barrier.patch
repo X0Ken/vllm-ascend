@@ -12,3 +12,7 @@
 +            )
 @@ -653,0 +660 @@
 +            _v41_prefill_policy.tag_output(scheduler_output, _v41_prefill_ids)
+@@ -667,0 +675,3 @@
++                    _v41_prefill_policy.backfill_structured_drafts(
++                        self, scheduler_output
++                    )
