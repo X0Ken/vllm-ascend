@@ -3006,7 +3006,7 @@ class NPUModelRunner(GPUModelRunner):
             and pp.world_size == 1
             and isinstance(self.drafter, AscendDSparkProposer)
             and spec_decode_metadata is None
-                    ):
+        ):
             _v41_early_async_output = AsyncGPUModelRunnerOutput(
                 model_runner_output=ModelRunnerOutput(
                     req_ids=req_ids_output_copy,
@@ -3083,14 +3083,14 @@ class NPUModelRunner(GPUModelRunner):
             async_output._model_runner_output = model_runner_output
         else:
             async_output = AsyncGPUModelRunnerOutput(
-            model_runner_output=model_runner_output,
-            sampled_token_ids=sampler_output.sampled_token_ids,
-            logprobs_tensors=sampler_output.logprobs_tensors,
-            invalid_req_indices=invalid_req_indices,
-            async_output_copy_stream=self.async_output_copy_stream,
-            vocab_size=self.input_batch.vocab_size,
-            num_nans=num_nans_device,
-        )
+                model_runner_output=model_runner_output,
+                sampled_token_ids=sampler_output.sampled_token_ids,
+                logprobs_tensors=sampler_output.logprobs_tensors,
+                invalid_req_indices=invalid_req_indices,
+                async_output_copy_stream=self.async_output_copy_stream,
+                vocab_size=self.input_batch.vocab_size,
+                num_nans=num_nans_device,
+            )
         self.input_batch.set_async_sampled_token_ids(
             async_output.sampled_token_ids_cpu,
             async_output.async_copy_ready_event,
