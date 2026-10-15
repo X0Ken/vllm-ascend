@@ -11,7 +11,8 @@ from http import HTTPStatus
 
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from vllm.entrypoints.serve.utils import server_utils
+from vllm.entrypoints.serve.engine.protocol import ErrorInfo, ErrorResponse
+from vllm.entrypoints.serve.exception_handling.handlers import validation as handler_module
 from vllm.exceptions import VLLMValidationError
 
 MAX_ERRORS = 8
@@ -33,7 +34,7 @@ def _location(error):
         for part in loc[:MAX_LOCATION_PARTS]
         if isinstance(part, (str, int))
     ]
-    return server_utils.clean_loc_for_param(parts)[:MAX_FIELD_CHARS]
+    return handler_module.clean_loc_for_param(parts)[:MAX_FIELD_CHARS]
 
 
 async def validation_exception_handler(req, exc: RequestValidationError):
@@ -64,18 +65,23 @@ async def validation_exception_handler(req, exc: RequestValidationError):
         lines.append(f"  {count - MAX_ERRORS} additional errors omitted")
     if req.app.state.args.log_error_stack:
         # Logging the exception would render its input dictionaries again.
-        server_utils.logger.warning("Request validation failed: %s errors; param=%s", count, param)
-    response = server_utils.create_error_response(
-        message="\n".join(lines),
-        err_type="BadRequestError",
-        status_code=HTTPStatus.BAD_REQUEST,
-        param=param,
+        handler_module.logger.warning("Request validation failed: %s errors; param=%s", count, param)
+    response = ErrorResponse(
+        error=ErrorInfo(
+            message="\n".join(lines),
+            type="BadRequestError",
+            code=HTTPStatus.BAD_REQUEST,
+            param=param,
+        )
     )
     return JSONResponse(content=response.model_dump(), status_code=HTTPStatus.BAD_REQUEST)
 
 
 def install_validation_handler():
-    server_utils.validation_exception_handler = validation_exception_handler
+    handler_module.validation_exception_handler = validation_exception_handler
+    register = sys.modules.get("vllm.entrypoints.serve.exception_handling.register")
+    if register is not None:
+        register.validation_exception_handler = validation_exception_handler
     # Handle both frontend import orders without importing the API server here.
     api_server = sys.modules.get("vllm.entrypoints.openai.api_server")
     if api_server is not None:
