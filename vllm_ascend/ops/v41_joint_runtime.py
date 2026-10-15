@@ -2,8 +2,6 @@
 
 import torch
 
-from vllm_ascend.device.device_op import DeviceOperator
-
 # This library is rebuilt against the selected nightly stack.
 torch.ops.load_library("/opt/v41hcpostprenorm/native.so")
 
@@ -43,7 +41,9 @@ def dispatch(
     y, p, c, pre = torch.ops._C_ascend.npu_hc_pre_v3(
         h, fn, scale, base, mix, hc_mult=4, hc_sinkhorn_iters=iters, norm_eps=norm_eps, hc_eps=hc_eps
     )
-    norm, norm32 = DeviceOperator.rms_norm_cast(y, gamma, variance_eps)
+    # The qc A2 profile retains its qualified RMSNormCast path, including
+    # the rounded BF16 boundary used for FP32 routing.
+    norm, norm32 = torch.ops._C_ascend.npu_rms_norm_cast(y, gamma, variance_eps)
     return norm, p, c, pre, h, norm32
 
 
