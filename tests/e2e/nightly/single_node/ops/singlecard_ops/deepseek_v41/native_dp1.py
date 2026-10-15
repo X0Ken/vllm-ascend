@@ -19,7 +19,7 @@ def main():
   n=next(x for x in ast.parse(path.read_text()).body if isinstance(x,ast.FunctionDef) and x.name==name);exec(compile(ast.Module(body=[n],type_ignores=[]),str(path),'exec'),ns);return ns[name]
  spec=importlib.util.spec_from_file_location('dp1_real_slots',a.source_root/paths[0]);slotmod=importlib.util.module_from_spec(spec);spec.loader.exec_module(slotmod)
  ns={'torch':torch};scatter=fn('scatter_cache_sk',a.source_root/paths[1],ns)
- ns={'torch':torch};fn('_aligned_dspark_index_width',a.source_root/paths[2],ns);indices_fn=fn('build_dspark_swa_indices',a.source_root/paths[2],ns)
+ ns={'torch':torch,'build_dspark_swa_indices_triton':None};fn('_aligned_dspark_index_width',a.source_root/paths[2],ns);indices_fn=fn('build_dspark_swa_indices',a.source_root/paths[2],ns)
  def equal(x,y):return bool(torch.equal(x.detach().cpu(),y.detach().cpu()))
  # DP1 six-row buckets: real, empty and padded; independently executed results required.
  cases=[(physical,actual) for physical in [6,12,18,24,30,36,42,48] for actual in sorted({0,1,physical//6})]
@@ -29,7 +29,7 @@ def main():
    ql=ql_cpu.to('npu');raw=torch.empty(physical,dtype=torch.int64,device='npu');pos=torch.empty(physical,dtype=torch.int32,device='npu');values=torch.empty((physical,512),dtype=torch.bfloat16,device='npu')
    # Non-contiguous page stride models a plane view inside a layer-outermost allocation.
    backing=torch.empty((64,2,128,1,512),dtype=torch.bfloat16,device='npu');cache=backing[:,1]
-   builder=NS(_slot_mapping_2d=torch.empty((physical,2),dtype=torch.int32,device='npu'),kv_cache_spec=NS(storage_block_size=128));common=NS(slot_mapping=raw,query_start_loc=ql)
+   builder=NS(_flat_slot_mapping=torch.empty(physical,dtype=torch.int64,device='npu'),_slot_mapping_2d=torch.empty((physical,2),dtype=torch.int32,device='npu'),kv_cache_spec=NS(storage_block_size=128));common=NS(slot_mapping=raw,query_start_loc=ql)
    draft_q=5;draft_rows=padded*draft_q;draft_ql=torch.arange(padded+1,dtype=torch.int32,device='npu')*draft_q;seq=torch.empty(padded,dtype=torch.int32,device='npu');block_table=torch.arange(padded*8,dtype=torch.int32,device='npu').reshape(padded,8)
    index_buffer=torch.empty((draft_rows+3,1,256),dtype=torch.int32,device='npu')
    def inputs(replay):
@@ -55,6 +55,8 @@ def main():
       if compressed:valid=valid and (val+1)%2==0 and int(positions[row])%2==1 and not skip;val//=2
       if valid:want[row]=torch.tensor([val//128,val%128]);target[val//128,1,val%128,0]=v[row]
      assert equal(coords,want),('slot mismatch',physical,actual,ratio,skip)
+     flat=torch.where(want[:,0]>=0,want[:,0].to(torch.int64)*128+want[:,1],-1)
+     assert equal(builder._flat_slot_mapping,flat),('flat slots mismatch',physical,actual,ratio,skip)
      assert equal(backing,target),('cache touched wrong slot/plane or wrong value',physical,actual,ratio,skip)
      wi=torch.full((draft_rows,1,256),-1,dtype=torch.int32);wl=torch.zeros(draft_rows,dtype=torch.int32)
      for req in range(padded):
