@@ -42,6 +42,7 @@ from vllm_ascend.ops.rope_dsv4 import (
     get_full_cos_and_sin_dsa_for_layer,
 )
 from vllm_ascend.ops.triton.c2_ring_metadata import build_c2_ring_metadata
+from vllm_ascend.ops.triton.v41_kv_norm_rope_cache import kv_norm_rope_cache, supports
 from vllm_ascend.utils import (
     get_potential_max_tokens,
     npu_stream_switch,
@@ -537,10 +538,15 @@ class AscendDSAV41Impl:
         main_stream.wait_event(kv_matmul_done)
         with npu_stream_switch(aux_stream):
             aux_stream.wait_event(part3_start)
-            kv = attn.kv_norm(kv).view(-1, 1, attn.head_dim)
-            self._apply_rotary(attn, kv, kv_cos, kv_sin)
-            if not write_cache_on_main:
-                self._write_swa_cache(attn, swa_metadata, kv.squeeze(1))
+            cache = attn.dsa_attn.swa_cache_layer.kv_cache[0]
+            slots = swa_metadata.slot_mapping
+            if not write_cache_on_main and supports(kv, attn.kv_norm, kv_cos, kv_sin, slots, cache):
+                kv_norm_rope_cache(attn.kv_norm(kv), attn.kv_norm, kv_cos, kv_sin, slots, cache, normalize=False)
+            else:
+                kv = attn.kv_norm(kv).view(-1, 1, attn.head_dim)
+                self._apply_rotary(attn, kv, kv_cos, kv_sin)
+                if not write_cache_on_main:
+                    self._write_swa_cache(attn, swa_metadata, kv.squeeze(1))
         q = wq_b.matmul(q_b_quant, q_b_scale, bias=attn.wq_b.bias).unflatten(-1, (-1, attn.head_dim))
         main_stream.wait_stream(aux_stream)
         if write_cache_on_main:
