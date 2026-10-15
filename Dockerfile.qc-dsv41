@@ -3,8 +3,9 @@ FROM ${BASE_IMAGE}
 ARG SOURCE_COMMIT
 LABEL org.opencontainers.image.revision=${SOURCE_COMMIT} qc.source.branch=qc-ascend-dsv41-vllm-update
 RUN python3 -c 'import hashlib,json,pathlib; r=pathlib.Path("/vllm-workspace/vllm-ascend"); pathlib.Path("/opt/qc-native-base.json").write_text(json.dumps({str(p.relative_to(r)):hashlib.sha256(p.read_bytes()).hexdigest() for p in (r/"csrc").rglob("*") if p.is_file() and p.suffix in (".cpp",".h",".hpp",".cmake") and not any(x in p.parts for x in ("build","build_out","output","third_party"))}))'
+COPY vllm-source/ /vllm-workspace/vllm/
 COPY . /vllm-workspace/vllm-ascend/
 WORKDIR /vllm-workspace/vllm-ascend
-RUN bash -c 'source /usr/local/Ascend/ascend-toolkit/set_env.sh && python3 tools/qc_dsv41/install.py'
+RUN bash -c 'source /usr/local/Ascend/ascend-toolkit/set_env.sh && VLLM_TARGET_DEVICE=empty VLLM_VERSION_OVERRIDE=0.31.0 python3 -m pip install --no-deps --no-build-isolation -e /vllm-workspace/vllm && python3 tools/qc_dsv41/install.py'
 ENV ASCEND_CUSTOM_OPP_PATH=/vllm-workspace/vllm-ascend/vllm_ascend/_cann_ops_custom/vendors/custom_transformer:/opt/v41hcpostprenorm/vendor
 ENTRYPOINT ["/bin/bash"]
