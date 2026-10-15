@@ -3,9 +3,13 @@
 import os
 import subprocess
 import sys
+
+from setuptools_scm import get_version
 from pathlib import Path
 
 repo = Path("/vllm-workspace/vllm")
+os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = "0.31.0"
+get_version(root=str(repo), write_to="vllm/_version.py")
 # Git archives retain release timestamps, which predate cached nightly objects.
 # Refresh local source timestamps so Cargo checks every workspace crate again.
 for path in (repo / "rust").rglob("*"):
