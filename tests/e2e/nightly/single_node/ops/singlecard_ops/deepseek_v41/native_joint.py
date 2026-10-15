@@ -17,7 +17,6 @@ if not a.execute:
 assert not a.output.exists()
 import torch  # noqa: E402 - --execute gates NPU imports
 
-from vllm_ascend.device.device_op import DeviceOperator  # noqa: E402 - --execute gates NPU imports
 from vllm_ascend.utils import enable_custom_op  # noqa: E402 - --execute gates NPU imports
 
 torch.set_num_threads(1)
@@ -51,7 +50,7 @@ def baseline(args):
         h, fn, scale, base, mix, hc_mult=4, hc_sinkhorn_iters=20, norm_eps=1e-6, hc_eps=1e-6
     )
     y, post2, comb2, pre2 = outputs
-    y, y32 = DeviceOperator.rms_norm_cast(y, gamma, 1e-6)
+    y, y32 = torch.ops._C_ascend.npu_rms_norm_cast(y, gamma, 1e-6)
     return (y, post2, comb2, pre2, h, y32)
 
 
