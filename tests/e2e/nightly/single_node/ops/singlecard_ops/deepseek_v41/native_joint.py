@@ -55,7 +55,9 @@ def baseline(args):
 
 
 def candidate(args):
-    return torch.ops.v41_joint_runtime.dispatch(*args, 20, 1e-6, 1e-6, 1e-6)
+    from vllm_ascend.ops.v41_joint_runtime import dispatch
+
+    return dispatch(*args, 20, 1e-6, 1e-6, 1e-6)
 
 
 def make(n, seed, pattern):
