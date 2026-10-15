@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import torch
 import torch_npu
+
 from vllm_ascend.utils import enable_custom_op
 
 
@@ -30,14 +31,14 @@ def main():
     rows = []
     result = {"status": "running", "cases": rows}
     try:
-        for mode in (("full", "rope") if args.mode == "both" else (args.mode,)):
+        for mode in ("full", "rope") if args.mode == "both" else (args.mode,):
             for n in (1, 6, 20, 24, 48, 96, 192):
                 for trig_dtype in (torch.float32, torch.bfloat16):
                     for use_bias in (False, True):
                         torch.manual_seed(731 + n)
                         x = torch.randn(n, 512, device="npu", dtype=torch.bfloat16)
-                        gamma = (1 + torch.randn(512, device="npu") * .1).bfloat16()
-                        bias = (torch.randn(512, device="npu") * .01).bfloat16() if use_bias else None
+                        gamma = (1 + torch.randn(512, device="npu") * 0.1).bfloat16()
+                        bias = (torch.randn(512, device="npu") * 0.01).bfloat16() if use_bias else None
                         norm = SimpleNamespace(weight=gamma, bias=bias, bias_loaded=use_bias, variance_epsilon=1e-6)
                         phase = torch.randn(n, 1, 1, 32, device="npu").repeat_interleave(2, -1)
                         cos, sin = phase.cos().to(trig_dtype), phase.sin().to(trig_dtype)
@@ -50,23 +51,31 @@ def main():
                         if n > 1:
                             slots[-1].fill_(-1)
 
-                        def normalize():
+                        def normalize(bias=bias, gamma=gamma, use_bias=use_bias, x=x):
                             value, _ = torch_npu.npu_rms_norm(x, gamma, 1e-6)
                             if use_bias:
                                 value.add_(bias)
                             return value
 
-                        def baseline():
+                        def baseline(cos=cos, n=n, ref=ref, sin=sin, slots=slots):
                             value = normalize()
                             torch.ops._C_ascend.inplace_partial_rotary_mul(
-                                value.view(n, 1, 1, 512), cos, sin,
-                                rotary_mode="interleave", partial_slice=[448, 512],
+                                value.view(n, 1, 1, 512),
+                                cos,
+                                sin,
+                                rotary_mode="interleave",
+                                partial_slice=[448, 512],
                             )
                             torch.ops._C_ascend.npu_scatter_nd_update_sk(ref, slots, value)
 
-                        def candidate():
+                        def candidate(cos=cos, mode=mode, norm=norm, out=out, sin=sin, slots=slots, x=x):
                             module.kv_norm_rope_cache(
-                                x if mode == "full" else normalize(), norm, cos, sin, slots, out,
+                                x if mode == "full" else normalize(),
+                                norm,
+                                cos,
+                                sin,
+                                slots,
+                                out,
                                 normalize=mode == "full",
                             )
 
@@ -74,9 +83,15 @@ def main():
                         candidate()
                         torch.npu.synchronize()
                         diff = (ref_base.float() - out_base.float()).abs()
-                        row = {"mode": mode, "tokens": n, "trig": str(trig_dtype), "bias": use_bias,
-                               "exact": torch.equal(ref_base, out_base),
-                               "mismatches": int((diff != 0).sum()), "max_abs": float(diff.max())}
+                        row = {
+                            "mode": mode,
+                            "tokens": n,
+                            "trig": str(trig_dtype),
+                            "bias": use_bias,
+                            "exact": torch.equal(ref_base, out_base),
+                            "mismatches": int((diff != 0).sum()),
+                            "max_abs": float(diff.max()),
+                        }
                         rows.append(row)
                         # Graph-captured cache writes must follow changing input and device slots.
                         for _ in range(2):
@@ -92,7 +107,7 @@ def main():
                             x.copy_(torch.randn_like(x))
                             cos.copy_((phase + step).cos().to(trig_dtype))
                             sin.copy_((phase + step).sin().to(trig_dtype))
-                            slots[:, 0].copy_(((seq + step * 128) // 128))
+                            slots[:, 0].copy_((seq + step * 128) // 128)
                             if n > 1:
                                 slots[-1].fill_(-1)
                             ga.replay()
@@ -100,46 +115,94 @@ def main():
                             torch.npu.synchronize()
                             graph_exact &= torch.equal(ref_base, out_base)
                         row["graph_replays_exact"] = graph_exact
-                        row["unrelated_planes_unchanged"] = bool(torch.all(out_base[:, 0] == 17) and torch.all(out_base[:, 2] == 17))
+                        row["unrelated_planes_unchanged"] = bool(
+                            torch.all(out_base[:, 0] == 17) and torch.all(out_base[:, 2] == 17)
+                        )
         # Runtime launch metadata must not create kernels for each row count/stride.
         # Original strict 28 eager/graph cases above remain the admission gate.
-        if args.mode == "rope" and all(r["exact"] and r["graph_replays_exact"] and r["unrelated_planes_unchanged"] for r in rows):
+        if args.mode == "rope" and all(
+            r["exact"] and r["graph_replays_exact"] and r["unrelated_planes_unchanged"] for r in rows
+        ):
             cache_count = lambda: sum(len(v) for v in module._kv_store.cache.values())
             before = cache_count()
             checks = []
-            lengths = [1,3,6,7,13,20,23,24,31,47,48,63,95,96,127,159,160,191,192]
-            layouts = [(512,64,2,196608),(1024,128,4,65536),(512,1024,2,73856),(1024,65536,4,196608)]
+            lengths = [1, 3, 6, 7, 13, 20, 23, 24, 31, 47, 48, 63, 95, 96, 127, 159, 160, 191, 192]
+            layouts = [(512, 64, 2, 196608), (1024, 128, 4, 65536), (512, 1024, 2, 73856), (1024, 65536, 4, 196608)]
             for dtype in [torch.float32, torch.bfloat16]:
                 for n in lengths:
-                    for xrow,crow,srow,pstride in layouts:
-                        x = torch.empty_strided((n,512),(xrow,1),device="npu",dtype=torch.bfloat16)
+                    for xrow, crow, srow, pstride in layouts:
+                        x = torch.empty_strided((n, 512), (xrow, 1), device="npu", dtype=torch.bfloat16)
                         x.copy_(torch.randn_like(x))
-                        cs = torch.empty_strided((n,1,1,64),(crow,64,64,1),device="npu",dtype=dtype)
+                        cs = torch.empty_strided((n, 1, 1, 64), (crow, 64, 64, 1), device="npu", dtype=dtype)
                         # Allocate sin independently with the same explicit row stride.
-                        sn = torch.empty_strided((n,1,1,64),(crow,64,64,1),device="npu",dtype=dtype)
-                        phi = torch.randn(n,1,1,32,device="npu").repeat_interleave(2,-1)
-                        cs.copy_(phi.cos().to(dtype));sn.copy_(phi.sin().to(dtype))
-                        sl = torch.empty_strided((n,2),(srow,1),device="npu",dtype=torch.int32)
-                        seq = torch.arange(n,device="npu",dtype=torch.int32)+127
-                        sl.copy_(torch.stack((seq//128,seq%128),-1))
-                        if n>1:sl[-1].fill_(-1)
-                        size=7*pstride+128*512
-                        ab=torch.full((size,),17,device="npu",dtype=torch.bfloat16);bb=ab.clone()
-                        ac=torch.as_strided(ab,(8,128,512),(pstride,512,1));bc=torch.as_strided(bb,(8,128,512),(pstride,512,1))
-                        norm=SimpleNamespace(weight=torch.ones(512,device="npu",dtype=torch.bfloat16),bias=None,bias_loaded=False,variance_epsilon=1e-6)
-                        value=x.contiguous().clone()
+                        sn = torch.empty_strided((n, 1, 1, 64), (crow, 64, 64, 1), device="npu", dtype=dtype)
+                        phi = torch.randn(n, 1, 1, 32, device="npu").repeat_interleave(2, -1)
+                        cs.copy_(phi.cos().to(dtype))
+                        sn.copy_(phi.sin().to(dtype))
+                        sl = torch.empty_strided((n, 2), (srow, 1), device="npu", dtype=torch.int32)
+                        seq = torch.arange(n, device="npu", dtype=torch.int32) + 127
+                        sl.copy_(torch.stack((seq // 128, seq % 128), -1))
+                        if n > 1:
+                            sl[-1].fill_(-1)
+                        size = 7 * pstride + 128 * 512
+                        ab = torch.full((size,), 17, device="npu", dtype=torch.bfloat16)
+                        bb = ab.clone()
+                        ac = torch.as_strided(ab, (8, 128, 512), (pstride, 512, 1))
+                        bc = torch.as_strided(bb, (8, 128, 512), (pstride, 512, 1))
+                        norm = SimpleNamespace(
+                            weight=torch.ones(512, device="npu", dtype=torch.bfloat16),
+                            bias=None,
+                            bias_loaded=False,
+                            variance_epsilon=1e-6,
+                        )
+                        value = x.contiguous().clone()
                         # Baseline CANN consumes identical logical values after explicit
                         # materialization; candidate directly consumes each strided view.
-                        torch.ops._C_ascend.inplace_partial_rotary_mul(value.view(n,1,1,512),cs.contiguous(),sn.contiguous(),rotary_mode="interleave",partial_slice=[448,512])
-                        torch.ops._C_ascend.npu_scatter_nd_update_sk(ac,sl.contiguous(),value)
-                        module.kv_norm_rope_cache(x,norm,cs,sn,sl,bc,normalize=False)
+                        torch.ops._C_ascend.inplace_partial_rotary_mul(
+                            value.view(n, 1, 1, 512),
+                            cs.contiguous(),
+                            sn.contiguous(),
+                            rotary_mode="interleave",
+                            partial_slice=[448, 512],
+                        )
+                        torch.ops._C_ascend.npu_scatter_nd_update_sk(ac, sl.contiguous(), value)
+                        module.kv_norm_rope_cache(x, norm, cs, sn, sl, bc, normalize=False)
                         torch.npu.synchronize()
-                        assert torch.equal(ab,bb),("runtime-metadata-output",n,xrow,crow,srow,pstride,str(dtype))
-                        checks.append({"tokens":n,"x_row":xrow,"cos_row":crow,"slot_row":srow,"page_stride":pstride,"trig":str(dtype),"whole_storage_exact":True})
-            after=cache_count()
-            assert before==after,("runtime metadata compiled new kernel",before,after)
-            result["runtime_metadata_cache"]={"before":before,"after":after,"cases":checks,"checks":len(checks),"new_kernels":0,"baseline_layout_materialization_explicit":True}
-        result["status"] = "passed" if all(r["exact"] and r["graph_replays_exact"] and r["unrelated_planes_unchanged"] for r in rows) else "failed-numerical"
+                        assert torch.equal(ab, bb), (
+                            "runtime-metadata-output",
+                            n,
+                            xrow,
+                            crow,
+                            srow,
+                            pstride,
+                            str(dtype),
+                        )
+                        checks.append(
+                            {
+                                "tokens": n,
+                                "x_row": xrow,
+                                "cos_row": crow,
+                                "slot_row": srow,
+                                "page_stride": pstride,
+                                "trig": str(dtype),
+                                "whole_storage_exact": True,
+                            }
+                        )
+            after = cache_count()
+            assert before == after, ("runtime metadata compiled new kernel", before, after)
+            result["runtime_metadata_cache"] = {
+                "before": before,
+                "after": after,
+                "cases": checks,
+                "checks": len(checks),
+                "new_kernels": 0,
+                "baseline_layout_materialization_explicit": True,
+            }
+        result["status"] = (
+            "passed"
+            if all(r["exact"] and r["graph_replays_exact"] and r["unrelated_planes_unchanged"] for r in rows)
+            else "failed-numerical"
+        )
     except Exception as exc:
         result.update(status="failed-runtime", error=repr(exc))
         raise

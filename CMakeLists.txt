@@ -78,6 +78,11 @@ else()
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/aclnn_torch_adapter/*.cpp)
 endif()
 
+# This prototype has its own namespace and workspace allocator. Build it only
+# through tools/qc_dsv41/build_joint.py, outside the shared plugin library.
+list(REMOVE_ITEM VLLM_ASCEND_SRC
+    "${CMAKE_CURRENT_SOURCE_DIR}/csrc/aclnn_torch_adapter/v41_hc_post_pre_norm_binding.cpp")
+
 # Sparse KV cache offloading is currently supported on Atlas A3 only.
 if(SOC_VERSION MATCHES "ascend910_93.*")
   find_package(OpenMP REQUIRED)
