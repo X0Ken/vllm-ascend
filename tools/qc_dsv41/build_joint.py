@@ -13,7 +13,19 @@ output = Path("/opt/v41hcpostprenorm")
 output.mkdir(exist_ok=True)
 source = output / "build/csrc"
 source.parent.mkdir(exist_ok=True)
-shutil.copytree(repo / "csrc", source, ignore=shutil.ignore_patterns("build", "output", "build_out"))
+if source.exists():
+    shutil.rmtree(source)
+
+
+def ignore_build_outputs(directory, names):
+    # Only top-level build outputs are disposable. In particular, nlohmann's
+    # include/nlohmann/detail/output directory contains required source headers.
+    if Path(directory) == repo / "csrc":
+        return {"build", "output", "build_out"} & set(names)
+    return {"__pycache__"} & set(names)
+
+
+shutil.copytree(repo / "csrc", source, ignore=ignore_build_outputs)
 subprocess.run(
     [
         "bash",
