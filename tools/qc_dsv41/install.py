@@ -25,6 +25,7 @@ env = dict(
 subprocess.run(
     ["python3", "-m", "pip", "install", "--no-deps", "--no-build-isolation", "-e", str(repo)], env=env, check=True
 )
+subprocess.run(["python3", str(repo / "tools/qc_dsv41/normalize_metadata.py")], check=True)
 subprocess.run(
     ["patch", "--batch", "--fuzz=0", "-p1", "-i", str(repo / "vllm_ascend/patch/platform/v41_prefill_barrier.patch")],
     cwd="/vllm-workspace/vllm",
