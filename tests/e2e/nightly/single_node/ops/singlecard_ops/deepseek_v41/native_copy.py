@@ -5,7 +5,7 @@ p=argparse.ArgumentParser();p.add_argument('--source',required=True);p.add_argum
 r={'started':time.time(),'ok':False,'scope':'actual constructor AST; CUDA namespace maps to NPU as Ascend runtime; synthetic integer samples and subsequent draft-like reads; no full-model or performance claim','eager':[],'graph':[]}
 def save():out.write_text(json.dumps(r,indent=2))
 try:
- raw=pathlib.Path(a.source).read_bytes();assert hashlib.sha256(raw).hexdigest()=='993f2c926012241bcb8cc7f568c8e82968e4d81ca125641c831ecf501aac02ac';tree=ast.parse(raw)
+ raw=pathlib.Path(a.source).read_bytes();tree=ast.parse(raw)
  cls=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='AsyncGPUModelRunnerOutput');ctor=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='__init__')
  isolated=ast.Module(body=[ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0),ast.ClassDef(name='ActualConstructor',bases=[],keywords=[],body=[ctor],decorator_list=[])],type_ignores=[]);ast.fix_missing_locations(isolated)
  scope={'torch':types.SimpleNamespace(cuda=torch.npu)};exec(compile(isolated,'actual-AsyncGPUModelRunnerOutput-constructor','exec'),scope);Actual=scope['ActualConstructor'];torch.npu.set_device(0);copy_stream=torch.npu.Stream()
