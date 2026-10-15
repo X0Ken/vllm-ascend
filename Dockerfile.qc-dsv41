@@ -12,3 +12,4 @@ RUN rm -rf /vllm-workspace/vllm/.git /vllm-workspace/vllm-ascend/.git
 RUN bash -c 'source /usr/local/Ascend/ascend-toolkit/set_env.sh && VLLM_TARGET_DEVICE=empty VLLM_VERSION_OVERRIDE=0.31.0 python3 -m pip install --no-deps --no-build-isolation -e /vllm-workspace/vllm && python3 tools/qc_dsv41/install.py'
 ENV ASCEND_CUSTOM_OPP_PATH=/vllm-workspace/vllm-ascend/vllm_ascend/_cann_ops_custom/vendors/custom_transformer:/opt/v41hcpostprenorm/vendor
 ENTRYPOINT ["/bin/bash"]
+CMD ["-l"]
