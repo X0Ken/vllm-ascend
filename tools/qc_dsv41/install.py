@@ -30,4 +30,16 @@ subprocess.run(
     cwd="/vllm-workspace/vllm",
     check=True,
 )
+subprocess.run(
+    [
+        "patch",
+        "--batch",
+        "--fuzz=0",
+        "-p1",
+        "-i",
+        str(repo / "vllm_ascend/patch/platform/v41_repetition_defaults.patch"),
+    ],
+    cwd="/vllm-workspace/vllm",
+    check=True,
+)
 subprocess.run(["python3", str(repo / "tools/qc_dsv41/build_joint.py")], env=env, check=True)

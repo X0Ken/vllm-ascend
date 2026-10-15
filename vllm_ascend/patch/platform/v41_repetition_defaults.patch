@@ -1,0 +1,448 @@
+diff --git a/tests/entrypoints/launchers/test_cli_args.py b/tests/entrypoints/launchers/test_cli_args.py
+index de32e82ba4..4cccb695ac 100644
+--- a/tests/entrypoints/launchers/test_cli_args.py
++++ b/tests/entrypoints/launchers/test_cli_args.py
+@@ -15,6 +15,7 @@ from vllm.entrypoints.launchers.cli_args import (
+ )
+ from vllm.entrypoints.openai.models.protocol import LoRAModulePath
+ from vllm.exceptions import VLLMValidationError
++from vllm.sampling_params import RepetitionDetectionParams
+ from vllm.utils.argparse_utils import FlexibleArgumentParser
+ 
+ LORA_MODULE = {
+@@ -381,6 +382,32 @@ def test_default_chat_template_kwargs_invalid_json(serve_parser):
+         )
+ 
+ 
++def test_default_repetition_detection_config_parsing(serve_parser):
++    args = serve_parser.parse_args(
++        args=[
++            "--default-repetition-detection-config",
++            '{"min_pattern_size":2,"max_pattern_size":64,"min_count":4}',
++        ]
++    )
++
++    assert args.default_repetition_detection_config == RepetitionDetectionParams(
++        min_pattern_size=2,
++        max_pattern_size=64,
++        min_count=4,
++    )
++
++
++@pytest.mark.parametrize(
++    "value",
++    ["not json", "[]", '{"max_pattern_size":1,"min_count":1}'],
++)
++def test_default_repetition_detection_config_rejects_invalid_values(
++    serve_parser, value
++):
++    with pytest.raises(SystemExit):
++        serve_parser.parse_args(args=["--default-repetition-detection-config", value])
++
++
+ @pytest.mark.parametrize(
+     "args, raises",
+     [
+diff --git a/tests/entrypoints/openai/test_repetition_detection_defaults.py b/tests/entrypoints/openai/test_repetition_detection_defaults.py
+new file mode 100644
+index 0000000000..2e24d128dc
+--- /dev/null
++++ b/tests/entrypoints/openai/test_repetition_detection_defaults.py
+@@ -0,0 +1,66 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from vllm.entrypoints.anthropic.protocol import AnthropicMessagesRequest
++from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
++from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
++from vllm.entrypoints.openai.completion.protocol import CompletionRequest
++from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
++from vllm.sampling_params import RepetitionDetectionParams
++
++DEFAULT_CONFIG = RepetitionDetectionParams(
++    min_pattern_size=2,
++    max_pattern_size=64,
++    min_count=4,
++)
++REQUEST_CONFIG = RepetitionDetectionParams(
++    min_pattern_size=8,
++    max_pattern_size=128,
++    min_count=5,
++)
++DEFAULT_SAMPLING_PARAMS = {"repetition_detection": DEFAULT_CONFIG}
++
++
++def test_chat_repetition_detection_default_and_request_override():
++    request = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}])
++    params = request.to_sampling_params(32, DEFAULT_SAMPLING_PARAMS)
++    assert params.repetition_detection == DEFAULT_CONFIG
++
++    request.repetition_detection = REQUEST_CONFIG
++    params = request.to_sampling_params(32, DEFAULT_SAMPLING_PARAMS)
++    assert params.repetition_detection == REQUEST_CONFIG
++
++
++def test_completion_repetition_detection_default_and_request_override():
++    request = CompletionRequest(prompt="hi", max_tokens=32)
++    params = request.to_sampling_params(32, DEFAULT_SAMPLING_PARAMS)
++    assert params.repetition_detection == DEFAULT_CONFIG
++
++    request.repetition_detection = REQUEST_CONFIG
++    params = request.to_sampling_params(32, DEFAULT_SAMPLING_PARAMS)
++    assert params.repetition_detection == REQUEST_CONFIG
++
++
++def test_responses_repetition_detection_default_and_request_override():
++    request = ResponsesRequest(input="hi")
++    params = request.to_sampling_params(32, DEFAULT_SAMPLING_PARAMS)
++    assert params.repetition_detection == DEFAULT_CONFIG
++
++    request.repetition_detection = REQUEST_CONFIG
++    params = request.to_sampling_params(32, DEFAULT_SAMPLING_PARAMS)
++    assert params.repetition_detection == REQUEST_CONFIG
++
++
++def test_anthropic_repetition_detection_is_forwarded_to_chat():
++    request = AnthropicMessagesRequest(
++        model="model",
++        messages=[{"role": "user", "content": "hi"}],
++        max_tokens=32,
++        repetition_detection=REQUEST_CONFIG,
++    )
++    chat_request = AnthropicServingMessages._build_base_request(
++        request,
++        [{"role": "user", "content": "hi"}],
++    )
++    params = chat_request.to_sampling_params(32, DEFAULT_SAMPLING_PARAMS)
++    assert params.repetition_detection == REQUEST_CONFIG
+diff --git a/vllm/entrypoints/anthropic/protocol.py b/vllm/entrypoints/anthropic/protocol.py
+index 9bd40a9161..09ce285e7d 100644
+--- a/vllm/entrypoints/anthropic/protocol.py
++++ b/vllm/entrypoints/anthropic/protocol.py
+@@ -8,6 +8,7 @@ from typing import Annotated, Any, Literal
+ from pydantic import BaseModel, Field, field_validator, model_validator
+ 
+ import vllm.envs as envs
++from vllm.sampling_params import RepetitionDetectionParams
+ 
+ 
+ class AnthropicError(BaseModel):
+@@ -192,6 +193,10 @@ class AnthropicMessagesRequest(BaseModel):
+             "to 256 bit)."
+         ),
+     )
++    repetition_detection: RepetitionDetectionParams | None = Field(
++        default=None,
++        description="Parameters for detecting repetitive N-gram patterns in output.",
++    )
+     kv_transfer_params: dict[str, Any] | None = Field(
+         default=None,
+         description="KVTransfer parameters used for disaggregated serving.",
+diff --git a/vllm/entrypoints/anthropic/serving.py b/vllm/entrypoints/anthropic/serving.py
+index 22484c744d..9c2c306240 100644
+--- a/vllm/entrypoints/anthropic/serving.py
++++ b/vllm/entrypoints/anthropic/serving.py
+@@ -54,6 +54,7 @@ from vllm.entrypoints.serve.utils.request_logger import RequestLogger
+ from vllm.logger import init_logger
+ from vllm.renderers.hf import HfRenderer, resolve_chat_template
+ from vllm.renderers.online_renderer import OnlineRenderer
++from vllm.sampling_params import RepetitionDetectionParams
+ 
+ logger = init_logger(__name__)
+ 
+@@ -123,6 +124,7 @@ class AnthropicServingMessages(OpenAIServingChat):
+         enable_force_include_usage: bool = False,
+         default_chat_template_kwargs: dict[str, Any] | None = None,
+         disabled_thinking_effort: AnthropicDisabledThinkingEffortOption = "auto",
++        default_repetition_detection_config: RepetitionDetectionParams | None = None,
+     ):
+         super().__init__(
+             engine_client=engine_client,
+@@ -140,6 +142,7 @@ class AnthropicServingMessages(OpenAIServingChat):
+             enable_prompt_tokens_details=enable_prompt_tokens_details,
+             enable_force_include_usage=enable_force_include_usage,
+             default_chat_template_kwargs=default_chat_template_kwargs,
++            default_repetition_detection_config=(default_repetition_detection_config),
+         )
+         self.stop_reason_map = {
+             "stop": "end_turn",
+@@ -577,6 +580,7 @@ class AnthropicServingMessages(OpenAIServingChat):
+             top_p=anthropic_request.top_p,
+             top_k=anthropic_request.top_k,
+             cache_salt=anthropic_request.cache_salt,
++            repetition_detection=anthropic_request.repetition_detection,
+             kv_transfer_params=anthropic_request.kv_transfer_params,
+             ec_transfer_params=anthropic_request.ec_transfer_params,
+             vllm_xargs=anthropic_request.vllm_xargs,
+diff --git a/vllm/entrypoints/generate/api_router.py b/vllm/entrypoints/generate/api_router.py
+index c5703515d8..34776edad2 100644
+--- a/vllm/entrypoints/generate/api_router.py
++++ b/vllm/entrypoints/generate/api_router.py
+@@ -120,6 +120,9 @@ async def init_generate_state(
+             enable_per_request_metrics=args.enable_per_request_metrics,
+             enable_log_outputs=args.enable_log_outputs,
+             default_chat_template_kwargs=default_chat_template_kwargs,
++            default_repetition_detection_config=(
++                args.default_repetition_detection_config
++            ),
+         )
+         if "generate" in supported_tasks
+         else None
+@@ -145,6 +148,7 @@ async def init_generate_state(
+         enable_log_outputs=args.enable_log_outputs,
+         enable_log_deltas=args.enable_log_deltas,
+         enable_per_request_metrics=args.enable_per_request_metrics,
++        default_repetition_detection_config=(args.default_repetition_detection_config),
+     )
+     state.openai_serving_chat = (
+         OpenAIServingChat(**_chat_kwargs) if "generate" in supported_tasks else None
+@@ -164,6 +168,9 @@ async def init_generate_state(
+             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
+             enable_force_include_usage=args.enable_force_include_usage,
+             enable_per_request_metrics=args.enable_per_request_metrics,
++            default_repetition_detection_config=(
++                args.default_repetition_detection_config
++            ),
+         )
+         if "generate" in supported_tasks
+         else None
+@@ -186,6 +193,9 @@ async def init_generate_state(
+             enable_force_include_usage=args.enable_force_include_usage,
+             default_chat_template_kwargs=default_chat_template_kwargs,
+             disabled_thinking_effort=args.anthropic_disabled_thinking_effort,
++            default_repetition_detection_config=(
++                args.default_repetition_detection_config
++            ),
+         )
+         if "generate" in supported_tasks
+         else None
+diff --git a/vllm/entrypoints/launchers/cli_args.py b/vllm/entrypoints/launchers/cli_args.py
+index ce6692565c..a92a2995ac 100644
+--- a/vllm/entrypoints/launchers/cli_args.py
++++ b/vllm/entrypoints/launchers/cli_args.py
+@@ -22,6 +22,8 @@ from vllm.entrypoints.chat_utils import (
+     validate_chat_template,
+ )
+ from vllm.entrypoints.openai.models.protocol import LoRAModulePath
++from vllm.exceptions import VLLMValidationError
++from vllm.sampling_params import RepetitionDetectionParams
+ from vllm.tool_parsers import ToolParserManager
+ from vllm.tool_parsers.tool_strict_level import ToolStrictLevelName
+ from vllm.utils.argparse_utils import FlexibleArgumentParser
+@@ -32,6 +34,18 @@ from .utils.constants import (
+ )
+ 
+ 
++def _parse_repetition_detection_config(value: str) -> RepetitionDetectionParams:
++    try:
++        config = json.loads(value)
++        if not isinstance(config, dict):
++            raise TypeError("expected a JSON object")
++        return RepetitionDetectionParams(**config)
++    except (json.JSONDecodeError, TypeError, ValueError, VLLMValidationError) as exc:
++        raise argparse.ArgumentTypeError(
++            f"invalid repetition detection config: {exc}"
++        ) from exc
++
++
+ class LoRAParserAction(argparse.Action):
+     def __call__(
+         self,
+@@ -104,6 +118,10 @@ class BaseFrontendArgs:
+     with request values taking precedence. Useful for setting default
+     behavior for reasoning models. Example: '{"enable_thinking": false}'
+     to disable thinking mode by default for Qwen3/DeepSeek models."""
++    default_repetition_detection_config: RepetitionDetectionParams | None = None
++    """Default repetition detection parameters for generation requests. Request-level
++    values take precedence. Example: '{"min_pattern_size":2,
++    "max_pattern_size":64,"min_count":4}'."""
+     response_role: str = "assistant"
+     """The role name to return if `request.add_generation_prompt=true`."""
+     return_tokens_as_token_ids: bool = False
+@@ -233,6 +251,9 @@ class BaseFrontendArgs:
+         """
+         # Special case: default_chat_template_kwargs needs json.loads type
+         frontend_kwargs["default_chat_template_kwargs"]["type"] = json.loads
++        frontend_kwargs["default_repetition_detection_config"]["type"] = (
++            _parse_repetition_detection_config
++        )
+ 
+         # Special case: LoRA modules need custom parser action and
+         # optional_type(str)
+diff --git a/vllm/entrypoints/openai/chat_completion/protocol.py b/vllm/entrypoints/openai/chat_completion/protocol.py
+index 5c1bc594d7..9462d91aad 100644
+--- a/vllm/entrypoints/openai/chat_completion/protocol.py
++++ b/vllm/entrypoints/openai/chat_completion/protocol.py
+@@ -727,7 +727,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
+             allowed_token_ids=self.allowed_token_ids,
+             extra_args=extra_args or None,
+             skip_clone=True,  # Created fresh per request, safe to skip clone
+-            repetition_detection=self.repetition_detection,
++            repetition_detection=(
++                self.repetition_detection
++                if self.repetition_detection is not None
++                else default_sampling_params.get("repetition_detection")
++            ),
+             routed_experts_prompt_start=self.routed_experts_prompt_start,
+         )
+ 
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+index f22fed1e75..d130973b50 100644
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -62,7 +62,11 @@ from vllm.outputs import RequestOutput
+ from vllm.parser import ParserManager
+ from vllm.parser.abstract_parser import Parser
+ from vllm.renderers.online_renderer import OnlineRenderer
+-from vllm.sampling_params import BeamSearchParams, SamplingParams
++from vllm.sampling_params import (
++    BeamSearchParams,
++    RepetitionDetectionParams,
++    SamplingParams,
++)
+ from vllm.tokenizers import TokenizerLike
+ from vllm.utils.collection_utils import as_list
+ from vllm.utils.serial_utils import numpy2base64
+@@ -139,6 +143,7 @@ class OpenAIServingChat(GenerateBaseServing):
+         enable_log_deltas: bool = True,
+         default_chat_template_kwargs: dict[str, Any] | None = None,
+         enable_per_request_metrics: bool = False,
++        default_repetition_detection_config: RepetitionDetectionParams | None = None,
+     ) -> None:
+         super().__init__(
+             engine_client=engine_client,
+@@ -172,6 +177,10 @@ class OpenAIServingChat(GenerateBaseServing):
+         self.enable_force_include_usage = enable_force_include_usage
+         self.enable_per_request_metrics = enable_per_request_metrics
+         self.default_sampling_params = self.model_config.get_diff_sampling_param()
++        if default_repetition_detection_config is not None:
++            self.default_sampling_params["repetition_detection"] = (
++                default_repetition_detection_config
++            )
+         mc = self.model_config
+         self.override_max_tokens = (
+             self.default_sampling_params.get("max_tokens")
+diff --git a/vllm/entrypoints/openai/completion/protocol.py b/vllm/entrypoints/openai/completion/protocol.py
+index a0974cb91c..0ee0d124ff 100644
+--- a/vllm/entrypoints/openai/completion/protocol.py
++++ b/vllm/entrypoints/openai/completion/protocol.py
+@@ -384,7 +384,11 @@ class CompletionRequest(OpenAIBaseModel):
+             bad_words=self.bad_words,
+             extra_args=extra_args or None,
+             skip_clone=True,  # Created fresh per request, safe to skip clone
+-            repetition_detection=self.repetition_detection,
++            repetition_detection=(
++                self.repetition_detection
++                if self.repetition_detection is not None
++                else default_sampling_params.get("repetition_detection")
++            ),
+             thinking_token_budget=self.thinking_token_budget,
+             routed_experts_prompt_start=self.routed_experts_prompt_start,
+         )
+diff --git a/vllm/entrypoints/openai/completion/serving.py b/vllm/entrypoints/openai/completion/serving.py
+index d7e235da1b..305b198646 100644
+--- a/vllm/entrypoints/openai/completion/serving.py
++++ b/vllm/entrypoints/openai/completion/serving.py
+@@ -43,7 +43,11 @@ from vllm.logger import init_logger
+ from vllm.logprobs import Logprob
+ from vllm.outputs import RequestOutput
+ from vllm.renderers.online_renderer import OnlineRenderer
+-from vllm.sampling_params import BeamSearchParams, SamplingParams
++from vllm.sampling_params import (
++    BeamSearchParams,
++    RepetitionDetectionParams,
++    SamplingParams,
++)
+ from vllm.tokenizers import TokenizerLike
+ from vllm.utils.async_utils import merge_async_iterators
+ from vllm.utils.collection_utils import as_list
+@@ -64,6 +68,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
+         enable_prompt_tokens_details: bool = False,
+         enable_force_include_usage: bool = False,
+         enable_per_request_metrics: bool = False,
++        default_repetition_detection_config: RepetitionDetectionParams | None = None,
+     ):
+         super().__init__(
+             engine_client=engine_client,
+@@ -78,6 +83,10 @@ class OpenAIServingCompletion(GenerateBaseServing):
+         self.enable_per_request_metrics = enable_per_request_metrics
+ 
+         self.default_sampling_params = self.model_config.get_diff_sampling_param()
++        if default_repetition_detection_config is not None:
++            self.default_sampling_params["repetition_detection"] = (
++                default_repetition_detection_config
++            )
+         mc = self.model_config
+         self.override_max_tokens = (
+             self.default_sampling_params.get("max_tokens")
+diff --git a/vllm/entrypoints/openai/responses/protocol.py b/vllm/entrypoints/openai/responses/protocol.py
+index 7e286aa782..150c2f0fa4 100644
+--- a/vllm/entrypoints/openai/responses/protocol.py
++++ b/vllm/entrypoints/openai/responses/protocol.py
+@@ -71,6 +71,7 @@ from vllm.exceptions import VLLMValidationError
+ from vllm.logger import init_logger
+ from vllm.renderers import ChatParams, TokenizeParams, merge_kwargs
+ from vllm.sampling_params import (
++    RepetitionDetectionParams,
+     RequestOutputKind,
+     SamplingParams,
+     StructuredOutputsParams,
+@@ -318,6 +319,10 @@ class ResponsesRequest(OpenAIBaseModel):
+     )
+ 
+     repetition_penalty: float | None = None
++    repetition_detection: RepetitionDetectionParams | None = Field(
++        default=None,
++        description="Parameters for detecting repetitive N-gram patterns in output.",
++    )
+     seed: int | None = Field(None, ge=_INT64_MIN, le=_INT64_MAX)
+     stop: StopParam = []
+     ignore_eos: bool = False
+@@ -481,6 +486,11 @@ class ResponsesRequest(OpenAIBaseModel):
+             frequency_penalty=frequency_penalty,
+             presence_penalty=presence_penalty,
+             repetition_penalty=repetition_penalty,
++            repetition_detection=(
++                self.repetition_detection
++                if self.repetition_detection is not None
++                else default_sampling_params.get("repetition_detection")
++            ),
+             seed=self.seed,
+             ignore_eos=self.ignore_eos,
+             output_kind=(
+diff --git a/vllm/entrypoints/openai/responses/serving.py b/vllm/entrypoints/openai/responses/serving.py
+index f18c493259..14946f33d7 100644
+--- a/vllm/entrypoints/openai/responses/serving.py
++++ b/vllm/entrypoints/openai/responses/serving.py
+@@ -87,7 +87,11 @@ from vllm.renderers.online_renderer import (
+     ResponsesPreviousMessages,
+     ResponsesRenderResult,
+ )
+-from vllm.sampling_params import SamplingParams, StructuredOutputsParams
++from vllm.sampling_params import (
++    RepetitionDetectionParams,
++    SamplingParams,
++    StructuredOutputsParams,
++)
+ from vllm.tokenizers import TokenizerLike
+ from vllm.utils import random_uuid
+ from vllm.utils.collection_utils import as_list
+@@ -116,6 +120,7 @@ class OpenAIServingResponses(GenerateBaseServing):
+         enable_per_request_metrics: bool = False,
+         enable_log_outputs: bool = False,
+         default_chat_template_kwargs: dict[str, Any] | None = None,
++        default_repetition_detection_config: RepetitionDetectionParams | None = None,
+     ) -> None:
+         super().__init__(
+             engine_client=engine_client,
+@@ -145,6 +150,10 @@ class OpenAIServingResponses(GenerateBaseServing):
+         self.enable_per_request_metrics = enable_per_request_metrics
+ 
+         self.default_sampling_params = self.model_config.get_diff_sampling_param()
++        if default_repetition_detection_config is not None:
++            self.default_sampling_params["repetition_detection"] = (
++                default_repetition_detection_config
++            )
+         mc = self.model_config
+         self.override_max_tokens = (
+             self.default_sampling_params.get("max_tokens")
