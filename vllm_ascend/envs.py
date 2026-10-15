@@ -87,6 +87,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (safe for Ascend 910B/A3). Set to a positive value to override when
     # auto-detection is unavailable or for debugging UB overflow issues.
     "VLLM_ASCEND_ROPE_UB_SIZE_KB": lambda: int(os.getenv("VLLM_ASCEND_ROPE_UB_SIZE_KB") or 0),
+    # Promote BF16 tensor-parallel all-reduce to FP32 accumulation, then cast
+    # back once. Opt-in for the fixed DeepSeek V4.1 910B3 accuracy profile.
+    # Valid values: 0 (default) or 1. Not sensitive.
+    "VLLM_ASCEND_TP_BF16_ALLREDUCE_FP32": lambda: bool(int(os.getenv("VLLM_ASCEND_TP_BF16_ALLREDUCE_FP32", "0"))),
 }
 
 # end-env-vars-definition

@@ -2979,6 +2979,38 @@ class NPUModelRunner(GPUModelRunner):
             spec_decode_metadata,
         )
 
+        # Queue first-token D2H before DSpark submits draft kernels. The
+        # async wrapper stays private until sample_tokens returns; final
+        # metadata is attached after the unchanged draft/KV bookkeeping.
+        _v41_early_async_output = None
+        if (
+            self.use_async_scheduling
+            and self.speculative_config is not None
+            and pp.world_size == 1
+            and isinstance(self.drafter, AscendDSparkProposer)
+            and spec_decode_metadata is None
+                    ):
+            _v41_early_async_output = AsyncGPUModelRunnerOutput(
+                model_runner_output=ModelRunnerOutput(
+                    req_ids=req_ids_output_copy,
+                    req_id_to_index=req_id_to_index_output_copy,
+                    sampled_token_ids=valid_sampled_token_ids,
+                    spec_token_ids=output_spec_token_ids,
+                    logprobs=logprobs_lists,
+                    prompt_logprobs_dict=prompt_logprobs_dict,
+                    kv_connector_output=kv_connector_output,
+                    pooler_output=[],
+                    ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
+                    cudagraph_stats=cudagraph_stats,
+                ),
+                sampled_token_ids=sampler_output.sampled_token_ids,
+                logprobs_tensors=sampler_output.logprobs_tensors,
+                invalid_req_indices=invalid_req_indices,
+                async_output_copy_stream=self.async_output_copy_stream,
+                vocab_size=self.input_batch.vocab_size,
+                num_nans=num_nans_device,
+            )
+
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
                 if not early_pp_padded_drafter:
@@ -3046,7 +3078,11 @@ class NPUModelRunner(GPUModelRunner):
             return model_runner_output
 
         # R3 is served by the V2 runner through vLLM's AuxOutput connector.
-        async_output = AsyncGPUModelRunnerOutput(
+        async_output = _v41_early_async_output
+        if async_output is not None:
+            async_output._model_runner_output = model_runner_output
+        else:
+            async_output = AsyncGPUModelRunnerOutput(
             model_runner_output=model_runner_output,
             sampled_token_ids=sampler_output.sampled_token_ids,
             logprobs_tensors=sampler_output.logprobs_tensors,

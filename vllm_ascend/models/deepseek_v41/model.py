@@ -70,6 +70,7 @@ from vllm_ascend.models.common.ops.sequence_parallel import (
 from vllm_ascend.ops.dsa import AscendDeepseekSparseAttention, DSAModules
 from vllm_ascend.ops.rope_dsv4 import ComplexExpRotaryEmbedding
 from vllm_ascend.ops.triton.mul_add import muls_add_triton
+from vllm_ascend.ops.v41_joint_runtime import dispatch as joint_post_pre_norm
 from vllm_ascend.utils import (
     enable_dsa_cp,
     get_rotation_path,
@@ -907,17 +908,21 @@ class DeepseekV41DecoderLayer(nn.Module):
         x = self.self_attn(positions, x, llama_4_scaling)
         if use_sequence_parallel:
             x = sp_reduce_scatter(x)
-        hidden_states = self.hc_post(x, residual, attn_post, attn_comb)
-
-        residual = hidden_states
-        x, ffn_post, ffn_comb, ffn_pre = self.hc_pre(
-            hidden_states,
+        x, ffn_post, ffn_comb, ffn_pre, residual, x_fp32 = joint_post_pre_norm(
+            residual,
             self.hc_ffn_fn,
             self.hc_ffn_scale,
             self.hc_ffn_base,
             attn_pre,
+            x,
+            attn_post,
+            attn_comb,
+            self.post_attention_layernorm.weight,
+            self.hc_sinkhorn_iters,
+            self.norm_eps,
+            self.hc_eps,
+            self.post_attention_layernorm.variance_epsilon,
         )
-        x, x_fp32 = self.rms_norm_cast(x)
         x = self.mlp(
             x,
             input_ids=input_ids,

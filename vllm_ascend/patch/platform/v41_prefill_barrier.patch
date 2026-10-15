@@ -1,0 +1,31 @@
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -683,6 +683,8 @@
+         batch in the job queue is finished.
+         3. Update the scheduler from the output.
+         """
++        from vllm_ascend.patch.worker import v41_prefill_policy as policy
++
+         batch_queue = self.batch_queue
+         assert batch_queue is not None
+ 
+@@ -693,8 +695,10 @@
+ 
+         model_executed = False
+         deferred_scheduler_output = None
+-        if self.scheduler.has_requests():
++        if self.scheduler.has_requests() and not policy.pending_prefill(batch_queue, self.async_scheduling):
++            prefill_ids = policy.prefill_ids(self.scheduler.requests, self.async_scheduling)
+             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
++            policy.tag_output(scheduler_output, prefill_ids)
+             with self.log_error_detail(scheduler_output):
+                 exec_future = self.model_executor.execute_model(
+                     scheduler_output, non_block=True
+@@ -709,6 +713,7 @@
+                 if not scheduler_output.pending_structured_output_tokens:
+                     # We aren't waiting for any tokens, get any grammar output
+                     # and sample immediately.
++                    policy.backfill_structured_drafts(self, scheduler_output)
+                     grammar_output = self.scheduler.get_grammar_bitmask(
+                         scheduler_output
+                     )

@@ -1583,6 +1583,19 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 for idx in range(self.num_speculative_tokens):
                     markov_emb = self.model.markov_embed(draft_token_ids[:, idx])
                     logits_bias = self.model.markov_bias(markov_emb)
+                    # Greedy parallel DSpark returns only token IDs. Keep the
+                    # replicated GEMM and each serial Markov dependency intact.
+                    from vllm_ascend.ops.triton.v41_markov_argmax import add_argmax_out, supported
+
+                    greedy_output = draft_token_ids[:, idx + 1]
+                    if (
+                        not use_probabilistic
+                        and self.parallel_drafting
+                        and self.dynamic_spec is None
+                        and supported(logits[:, idx], logits_bias, greedy_output)
+                    ):
+                        add_argmax_out(logits[:, idx], logits_bias, greedy_output)
+                        continue
                     logits[:, idx].add_(logits_bias)
                     if use_probabilistic:
                         # Use probabilistic sampling instead of argmax.
