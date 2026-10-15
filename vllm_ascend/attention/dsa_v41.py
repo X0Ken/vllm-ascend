@@ -29,6 +29,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import CircularBufferSpec
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.attention.deepseek_v41_slots import slot_coordinates
 from vllm_ascend.attention.dsa_v1 import build_dspark_swa_indices, dsv4_dsa_overlap_stream
 from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
@@ -1085,30 +1086,17 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                         flat_output=self._flat_slot_mapping[:num_input_tokens],
                     )
                 else:
-                    if compressed and ratio != 1:
-                        active_slots = compressed_slot_mapping(active_slots, ratio)
-                    valid = active_slots >= 0
-                    if compressed and ratio == 2:
-                        if kwargs.get("skip_ring_state_update", False):
-                            valid.zero_()
-                        else:
-                            valid_end = common.query_start_loc[num_actual_reqs].clamp_max(num_actual_tokens)
-                            valid &= torch.arange(num_input_tokens, device=active_slots.device) < valid_end
-                            if positions is not None:
-                                valid &= positions.remainder(2) == 1
-                    physical = active_slots.clamp_min(0)
-                    self._slot_mapping_2d[:num_input_tokens, 0].copy_(
-                        torch.where(
-                            valid,
-                            torch.div(physical, storage_block_size, rounding_mode="floor"),
-                            -1,
-                        )
+                    prepared_slots = slot_coordinates(
+                        self,
+                        common,
+                        positions,
+                        num_input_tokens,
+                        num_actual_reqs,
+                        num_actual_tokens,
+                        ratio,
+                        compressed,
+                        kwargs.get("skip_ring_state_update", False),
                     )
-                    self._slot_mapping_2d[:num_input_tokens, 1].copy_(
-                        torch.where(valid, physical.remainder(storage_block_size), -1)
-                    )
-                    self._flat_slot_mapping[:num_input_tokens].copy_(torch.where(valid, active_slots, -1))
-                    prepared_slots = self._slot_mapping_2d[:num_input_tokens]
                     prepared_flat_slots = self._flat_slot_mapping[:num_input_tokens]
                 shared[slot_key] = prepared_slots
                 shared[flat_slot_key] = prepared_flat_slots
