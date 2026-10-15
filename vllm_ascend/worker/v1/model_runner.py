@@ -223,6 +223,7 @@ from vllm_ascend.worker.device_metadata import (
     DeviceMetadataTaskProvider,
 )
 from vllm_ascend.worker.kvpp_cache import allocate_kvpp_cache
+from vllm_ascend.worker.mm_prefill import has_scheduled_multimodal_tokens
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.spec_decode_utils import (
     correct_optimistic_seq_lens_cpu,
@@ -2650,9 +2651,17 @@ class NPUModelRunner(GPUModelRunner):
         # DeepSeek-V4 vision router needs raw sentinel ids during image
         # prefill, so keep that pass eager.
         num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)
-        has_encoder_input = num_encoder_reqs > 0 and (
-            self.model_config.is_encoder_decoder
-            or self.model_config.requires_raw_input_tokens
+        # Cache hits still contain image sentinel tokens. Compiling those
+        # prefills drops the vision-only routing correction just as on a cold
+        # encoder pass; the number of encoder jobs is not a modality test.
+        has_encoder_input = (
+            self.model_config.is_encoder_decoder and num_encoder_reqs > 0
+        ) or (
+            self.model_config.requires_raw_input_tokens
+            and (
+                num_encoder_reqs > 0
+                or has_scheduled_multimodal_tokens(self.requests, scheduler_output.num_scheduled_tokens)
+            )
         )
         # Run forward pass
         defer_kv_connector_finalize = self.speculative_config is not None and (
