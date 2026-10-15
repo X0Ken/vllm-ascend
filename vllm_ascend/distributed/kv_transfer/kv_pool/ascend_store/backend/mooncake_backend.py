@@ -13,7 +13,6 @@ import torch
 # Third Party
 from mooncake.store import ReplicateConfig  # type: ignore
 from vllm.config import ParallelConfig, get_current_vllm_config
-from vllm.distributed.parallel_state import get_world_group
 from vllm.logger import logger
 from vllm.utils.network_utils import get_ip
 
