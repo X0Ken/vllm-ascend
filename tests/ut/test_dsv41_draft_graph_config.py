@@ -135,3 +135,10 @@ def test_async_metadata_bounds_reject_optional_host_consumers(window, sparse, cp
             draft_window_size=window,
             sparse_kv_offload_config=SimpleNamespace(enabled=sparse),
         )._validate_dsv41_async_metadata(async_metadata_config())
+
+
+def test_inline_metadata_requires_async_bounds_validation():
+    with pytest.raises(ValueError, match="requires enable_dsv41_async_metadata"):
+        AscendConfig(
+            enable_dsv41_inline_metadata=True, sparse_kv_offload_config=SimpleNamespace(enabled=False)
+        )._validate_dsv41_async_metadata(SimpleNamespace())
