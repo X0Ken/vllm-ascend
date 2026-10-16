@@ -17,8 +17,9 @@ from vllm_ascend.utils import enable_custom_op
 @pytest.mark.parametrize("batch", [1, 3, 8, 32])
 @pytest.mark.parametrize("query_len", [1, 5])
 @pytest.mark.parametrize("input_padding", [0, 5])
+@pytest.mark.parametrize("upper_bound", [False, True])
 @torch.inference_mode()
-def test_draft_swa_graph_replays_changed_metadata(monkeypatch, batch, query_len, input_padding):
+def test_draft_swa_graph_replays_changed_metadata(monkeypatch, batch, query_len, input_padding, upper_bound):
     assert enable_custom_op()
     device = torch.device("npu:0")
     torch.npu.set_device(device)
@@ -148,7 +149,7 @@ def test_draft_swa_graph_replays_changed_metadata(monkeypatch, batch, query_len,
             num_actual_tokens=batch * query_len,
             max_query_len=query_len,
             max_seq_len=max(lengths),
-            is_prefilling=torch.ones(batch, dtype=torch.bool),
+            is_prefilling=torch.full((batch,), iteration % 2 == 1, dtype=torch.bool),
             causal=False,
         )
         query.normal_()
@@ -156,11 +157,21 @@ def test_draft_swa_graph_replays_changed_metadata(monkeypatch, batch, query_len,
         expected_meta = reference.build_for_drafting(SimpleNamespace(**common), 1)
         expected = consume(expected_meta).cpu()
         flags.enable_dsv41_draft_graph = True
-        actual_meta = candidate.build_for_drafting(SimpleNamespace(**common), 1)
+        actual_common = SimpleNamespace(**common)
+        if upper_bound:
+            actual_common.seq_lens_cpu = None
+            actual_common._seq_lens_cpu = None
+            actual_common.seq_lens_cpu_upper_bound = torch.tensor(lengths) + 5
+            actual_common.max_seq_len += 5
+        actual_meta = candidate.build_for_drafting(actual_common, 1)
         for field in fields:
             expected_tensor, actual_tensor = getattr(expected_meta, field), getattr(actual_meta, field)
             # Only the initialized native metadata payload is compared.
             if field == "smla_metadata":
+                # Conservative bounds may change tiling; replay outputs and
+                # every exact device input must still match bit for bit.
+                if upper_bound:
+                    continue
                 expected_tensor, actual_tensor = expected_tensor[:900], actual_tensor[:900]
             torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0, atol=0)
         current = tuple(getattr(actual_meta, field).data_ptr() for field in fields)

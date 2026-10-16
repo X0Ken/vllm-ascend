@@ -1188,7 +1188,8 @@ class TestInitializeAttnBackend(_DSparkProposerTestBase):
         assert proposer._layer_group_idx == [0] * 5
 
 
-def test_v41_full_graph_pads_queries_and_trims_output(monkeypatch):
+@pytest.mark.parametrize("target_uniform", [True, False])
+def test_v41_full_graph_pads_queries_and_trims_output(monkeypatch, target_uniform):
     """A live row in a larger target bucket must replay a complete K5 block."""
     import vllm_ascend.spec_decode.llm_base_proposer as module
 
@@ -1196,6 +1197,7 @@ def test_v41_full_graph_pads_queries_and_trims_output(monkeypatch):
     p.method, p.hidden_size, p.num_query_per_req = "dspark", 4, 5
     p.use_cuda_graph, p.parallel_drafting, p.uses_mrope = True, True, False
     p.dcp_size, p.supports_mm_inputs, p.enable_enpu = 1, False, False
+    p.use_prefill_query_graph = not target_uniform
     p.draft_window_size = None
     p.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(prefill_context_parallel_size=1))
     p.model = SimpleNamespace(combine_hidden_states=lambda x: x)
@@ -1205,6 +1207,12 @@ def test_v41_full_graph_pads_queries_and_trims_output(monkeypatch):
         _sync_metadata_across_dp=lambda n, **kwargs: (n, None, None),
         dynamic_eplb=False,
         device_metadata_executor=None,
+        uniform_decode_query_len=6,
+        cudagraph_dispatcher=SimpleNamespace(
+            dispatch=MagicMock(
+                return_value=(CUDAGraphMode.FULL, SimpleNamespace(num_tokens=12, num_reqs=2, uniform=True))
+            )
+        ),
     )
     p.query_start_loc = SimpleNamespace(cpu=torch.zeros(4, dtype=torch.int32), gpu=torch.zeros(4, dtype=torch.int32))
     p.query_start_loc.copy_to_gpu = lambda: p.query_start_loc.gpu.copy_(p.query_start_loc.cpu)
@@ -1221,7 +1229,7 @@ def test_v41_full_graph_pads_queries_and_trims_output(monkeypatch):
         seq_lens_cpu=torch.tensor([13]),
         _seq_lens_cpu=torch.tensor([13]),
         num_computed_tokens_cpu=None,
-        is_prefilling=torch.tensor([False]),
+        is_prefilling=torch.tensor([not target_uniform]),
         block_table_tensor=torch.ones((1, 2), dtype=torch.int32),
         slot_mapping=torch.full((5,), -1),
     )
@@ -1236,7 +1244,7 @@ def test_v41_full_graph_pads_queries_and_trims_output(monkeypatch):
     def build_metadata(*args):
         assert cad.query_start_loc.tolist() == [0, 5, 10]
         assert cad.seq_lens.tolist() == [13, 0]
-        assert cad.is_prefilling.tolist() == [False, False]
+        assert cad.is_prefilling.tolist() == [not target_uniform, False]
         assert cad.num_actual_tokens == cad.num_input_tokens == 10
         meta = SimpleNamespace(num_prefills=0)
         return [{"draft.attn": meta}], meta
@@ -1268,8 +1276,12 @@ def test_v41_full_graph_pads_queries_and_trims_output(monkeypatch):
         torch.ones(1, dtype=torch.int64),
         torch.arange(5),
         cad,
-        SimpleNamespace(uniform=True, num_reqs=2),
+        SimpleNamespace(uniform=target_uniform, num_reqs=2 if target_uniform else None),
         MagicMock(),
     )
+    if not target_uniform:
+        p.runner.cudagraph_dispatcher.dispatch.assert_called_once_with(
+            num_tokens=6, uniform_decode=True, has_lora=False
+        )
     assert result.shape == (1, 5)
     assert events == ["context-kv", "query-graph"]

@@ -551,8 +551,11 @@ class NPUModelRunner(GPUModelRunner):
         # AscendMLABackend, and DSV4 compressed attention metadata) need
         # ``optimistic_seq_lens_cpu`` to match the corrected GPU seq_lens
         # in async spec decode mode; others (SFA, GDN, etc.) do not.
-        self._needs_seq_lens_cpu_sync = self.use_compress or issubclass(
-            self.attn_backend, (AscendAttentionBackend, AscendMLABackend)
+        self._use_v41_upper_bound_seq_lens = (
+            getattr(get_ascend_config(), "enable_dsv41_async_metadata", False) is True
+        )
+        self._needs_seq_lens_cpu_sync = not self._use_v41_upper_bound_seq_lens and (
+            self.use_compress or issubclass(self.attn_backend, (AscendAttentionBackend, AscendMLABackend))
         )
 
         # kv role
@@ -3786,11 +3789,19 @@ class NPUModelRunner(GPUModelRunner):
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
             seq_lens=self.seq_lens[:num_reqs_padded],
-            # Always pass optimistic_seq_lens_cpu via _seq_lens_cpu so NPU
-            # attention backends can get CPU seq_lens without GPU->CPU sync.
-            # This is separate from seq_lens_cpu (None in async) which eagle
-            # proposer checks to distinguish async/non-async behavior.
-            _seq_lens_cpu=self.optimistic_seq_lens_cpu[:num_reqs_padded],
+            # Most backends require exact host lengths after rejection correction.
+            # V4.1 can instead consume exact device lengths and max_seq_len as a
+            # tiling bound. Keep its exact host mirror unset in that mode; never
+            # advertise optimistic bounds as exact lengths to a downstream user.
+            _seq_lens_cpu=(
+                None
+                if (
+                    getattr(self, "_use_v41_upper_bound_seq_lens", False)
+                    and self.use_async_spec_decode
+                    and not for_cudagraph_capture
+                )
+                else self.optimistic_seq_lens_cpu[:num_reqs_padded]
+            ),
             seq_lens_cpu_upper_bound=self.optimistic_seq_lens_cpu[:num_reqs_padded],
             # TODO
             seq_lens_cpu=seq_lens_cpu,

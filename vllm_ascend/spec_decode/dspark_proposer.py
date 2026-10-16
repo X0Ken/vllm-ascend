@@ -74,6 +74,9 @@ class AscendDSparkProposer(AscendDflashProposer):
             )
         # V4.1 query-only graphs keep variable-length context KV work eager.
         self.use_cuda_graph = self.use_cuda_graph and get_ascend_config().enable_dsv41_draft_graph
+        self.use_prefill_query_graph = self.use_cuda_graph and getattr(
+            get_ascend_config(), "enable_dsv41_prefill_draft_graph", False
+        )
         # Max query tokens depend on whether sampling from anchor or not.
         self.max_query_tokens = self.max_batch_size * self.num_query_per_req
         # Position ids for the draft query block [max_query_tokens].
