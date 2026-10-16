@@ -228,7 +228,7 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         worker.cache_coordinator.cacheable_group_ids = {0}
         worker.cache_coordinator.lookup_mask.return_value = ([True],)
         worker.cache_coordinator.store_mask.return_value = ([False],)
-        worker.cache_coordinator.find_longest_cache_hit.return_value = ((), 128)
+        worker.cache_coordinator.restorable_prefixes.return_value = [128]
         worker.m_store = MagicMock()
         worker.m_store.exists.return_value = [1]
 
@@ -251,9 +251,59 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         worker.cache_coordinator.lookup_mask.assert_called_once_with(128)
         worker.cache_coordinator.store_mask.assert_not_called()
         worker.m_store.exists.assert_called_once_with(["key"])
-        worker.cache_coordinator.find_longest_cache_hit.assert_called_once()
-        self.assertFalse(worker.cache_coordinator.find_longest_cache_hit.call_args.kwargs["apply_eagle"])
+        worker.cache_coordinator.restorable_prefixes.assert_called_once()
+        self.assertEqual(
+            worker.cache_coordinator.restorable_prefixes.call_args.args[2], {0: [{bytes.fromhex("ab" * 32)}]}
+        )
         worker.token_database.process_tokens.assert_not_called()
+
+    def test_external_lookup_intersects_complete_windows_across_rank_keys(self):
+        import torch
+        from vllm.v1.kv_cache_interface import KVCacheGroupSpec, SlidingWindowSpec
+
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import AscendStoreCoordinator
+
+        cls = self._make_worker_class()
+        worker = object.__new__(cls)
+        spec = SlidingWindowSpec(block_size=128, num_kv_heads=1, head_size=1, dtype=torch.float32, sliding_window=256)
+        worker.cache_coordinator = AscendStoreCoordinator([KVCacheGroupSpec(["swa"], spec)], 128, 128, [128], ["swa"])
+        worker.hash_block_size = 128
+        worker.num_kv_cache_groups = 1
+        hashes = [bytes([i]) * 32 for i in range(6)]
+        worker.token_database = MagicMock()
+        worker.token_database.get_block_size.return_value = 128
+        worker.token_database.hash_block_size = 128
+        worker.token_database.process_token_key_strings.side_effect = lambda *args, **kwargs: [
+            (i * 128, (i + 1) * 128, str(i), h) for i, h in enumerate(hashes)
+        ]
+        worker._expand_lookup_key_variants = lambda key, *args: [f"{key}:0", f"{key}:1"]
+        present = [{0, 1, 4, 5}, {0, 1, 3, 4}]
+        worker.m_store = MagicMock()
+        worker.m_store.exists.side_effect = lambda keys: [
+            int(int(key.split(":")[0]) in present[int(key.split(":")[1])]) for key in keys
+        ]
+        self.assertEqual(worker._lookup_with_coordinator(768, hashes, [0], False, True), 256)
+        worker.m_store.exists.return_value = []
+        worker.m_store.exists.side_effect = lambda keys: [1] * (len(keys) - 1)
+        with self.assertRaisesRegex(RuntimeError, "count mismatch"):
+            worker._lookup_with_coordinator(768, hashes, [0], False, True)
+
+    def test_lookup_expands_every_pcp_pp_dcp_and_head_shard(self):
+        cls = self._make_worker_class()
+        worker = object.__new__(cls)
+        worker.pcp_size = worker.pp_size = worker.dcp_size = 2
+        worker.get_group_tp_size = lambda group_id: 2
+        key = "model@pcp:0@dcp:0@head_or_tp_rank:0@pp_rank:0@group:0@hash"
+        expanded = worker._expand_lookup_keys_by_rank([key], 0)
+        expected = {
+            f"model@pcp:{p}@dcp:{d}@head_or_tp_rank:{h}@pp_rank:{s}@group:0@hash"
+            for p in range(2)
+            for d in range(2)
+            for h in range(2)
+            for s in range(2)
+        }
+        self.assertEqual(len(expanded), 16)
+        self.assertEqual(set(expanded), expected)
 
     def test_layerwise_multi_group_layout_includes_mtp(self):
         import torch

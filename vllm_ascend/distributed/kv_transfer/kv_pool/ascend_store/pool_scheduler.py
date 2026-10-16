@@ -27,6 +27,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
     backend_map,
     get_layerwise_protocol,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import AscendStoreCoordinator
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
     build_layerwise_cache_layout,
     build_layerwise_reuse_layout,
@@ -131,6 +132,19 @@ class KVPoolScheduler:
         self.lcm_block_size = math.lcm(*(self.grouped_block_size[i] for i in self.cacheable_group_ids))
         self.cache_transfer_granularity = infer_cache_transfer_granularity(
             self.grouped_block_size, self.lcm_block_size, self.cacheable_group_ids
+        )
+        self.cache_coordinator = (
+            AscendStoreCoordinator(
+                kv_cache_groups,
+                scheduler_block_size=self.cache_transfer_granularity,
+                hash_block_size=self.hash_block_size,
+                group_block_sizes=self.grouped_block_size,
+                group_cache_families=self.kv_cache_group_families,
+                use_eagle=self.use_eagle,
+                retention_interval=self.retention_interval,
+            )
+            if kv_cache_groups is not None and self.use_hybrid
+            else None
         )
         # request_id -> full_token_ids
         self._request_trackers: dict[str, RequestTracker] = {}
@@ -274,6 +288,8 @@ class KVPoolScheduler:
         num_computed_tokens: int,
         include_layers: bool = False,
     ) -> int:
+        if self.cache_coordinator is not None:
+            return self._get_coordinated_hit_tokens(request, token_len, include_layers=include_layers)
         num_blocks = token_len // self._block_size
         # In layerwise mode, always query from block 0 because the remote
         # pool stores per-layer data that may not match local prefix cache.
@@ -327,12 +343,65 @@ class KVPoolScheduler:
             len(self.kv_cache_group_ids),
         )
 
+    def _get_coordinated_hit_tokens(
+        self,
+        request: "Request",
+        token_len: int,
+        *,
+        include_layers: bool = False,
+        use_protocol: bool = False,
+    ) -> int:
+        assert self.cache_coordinator is not None
+        rank_hits: dict[int, list[set[bytes | str]]] = {}
+        hashes = request.block_hashes[: token_len // self.hash_block_size]
+        masks = self.cache_coordinator.lookup_mask(
+            cdiv(token_len, self.cache_transfer_granularity) * self.cache_transfer_granularity
+        )
+        shard_width = self.num_layers if include_layers and not use_protocol else 1
+        for group_id in sorted(self.cacheable_group_ids):
+            group_hashes = get_block_hashes(hashes, self.grouped_block_size[group_id], self.hash_block_size)
+            selected = [h for i, h in enumerate(group_hashes) if masks[group_id] is None or masks[group_id][i]]
+            if use_protocol:
+                keys_by_block = [self._make_layerwise_hit_check_keys(group_id, block_hash_to_str(h)) for h in selected]
+            else:
+                keys_by_block = self._generate_store_query_keys(
+                    selected, include_layers=include_layers, kv_cache_group_id=group_id
+                )
+            keys = [key for variants in keys_by_block for key in variants]
+            if use_protocol:
+                infos = self.store_scheduler.batch_get_key_info(keys) if keys else []
+                states = [int(info.size() > 0) for info in infos]
+            else:
+                states = self.store_scheduler.batch_is_exist(keys) if keys else []
+            if len(states) != len(keys):
+                logger.error("KV pool key-state count mismatch: expected=%d, actual=%d", len(keys), len(states))
+                return 0
+            variant_count = len(keys_by_block[0]) if keys_by_block else shard_width
+            if shard_width <= 0 or variant_count % shard_width:
+                raise RuntimeError("KV pool layer shard layout is inconsistent")
+            rank_count = variant_count // shard_width
+            group_hits: list[set[bytes | str]] = [set() for _ in range(rank_count)]
+            offset = 0
+            for block_hash, variants in zip(selected, keys_by_block, strict=True):
+                if len(variants) != variant_count:
+                    raise RuntimeError("KV pool rank shard count changed")
+                for rank in range(rank_count):
+                    start = offset + rank * shard_width
+                    if all(value == 1 for value in states[start : start + shard_width]):
+                        group_hits[rank].add(block_hash)
+                offset += variant_count
+            rank_hits[group_id] = group_hits
+        candidates = self.cache_coordinator.restorable_prefixes(hashes, token_len, rank_hits)
+        return candidates[-1] if candidates else 0
+
     def _get_layerwise_hit_tokens(
         self,
         request: "Request",
         token_len: int,
         num_computed_tokens: int,
     ) -> int:
+        if self.cache_coordinator is not None:
+            return self._get_coordinated_hit_tokens(request, token_len, use_protocol=True)
         # In layerwise mode, always query from block 0 because the remote
         # pool stores per-layer data that may not match local prefix cache.
         num_hash_blocks = token_len // self.hash_block_size
@@ -474,14 +543,24 @@ class KVPoolScheduler:
         ):
             return 0, False
 
+        # Choose only complete, aligned restore boundaries. A later arithmetic
+        # trim could land inside a hole in a sparse group's valid checkpoints.
+        restore_limit = prompt_token_len
+        if self.cache_coordinator is not None:
+            restore_limit = prompt_token_len - 1
+            if self.use_layerwise and self.use_eagle:
+                restore_limit = min(restore_limit, request.num_tokens - self.lcm_block_size)
+            restore_limit = self._floor_to_cache_transfer_granularity(max(0, restore_limit))
+            if restore_limit < self.cache_transfer_granularity:
+                return 0, False
         if self.use_layerwise_transfer:
-            token_len = prompt_token_len
+            token_len = restore_limit
             num_external_hit_tokens = self._get_layerwise_hit_tokens(request, token_len, num_computed_tokens)
         else:
             if self._discard_partial_chunks:
-                token_len = self._floor_to_cache_transfer_granularity(prompt_token_len)
+                token_len = self._floor_to_cache_transfer_granularity(restore_limit)
             else:
-                token_len = prompt_token_len
+                token_len = restore_limit
 
             if token_len < self.cache_transfer_granularity:
                 return 0, False
@@ -506,7 +585,7 @@ class KVPoolScheduler:
             return 0, False
 
         store_skip_tokens = num_external_hit_tokens
-        if self.use_layerwise and self.use_eagle:
+        if self.cache_coordinator is None and self.use_layerwise and self.use_eagle:
             # Keep the draft model's recomputation zone intact: the
             # generation-point hidden states must be freshly computed, and the
             # local prefix-cache path already drops its trailing block
@@ -522,7 +601,10 @@ class KVPoolScheduler:
                     num_computed_tokens,
                     num_external_hit_tokens - self.lcm_block_size,
                 )
-        if num_external_hit_tokens == request.num_tokens:
+        if self.cache_coordinator is not None:
+            if num_external_hit_tokens > token_len or num_external_hit_tokens % self.cache_transfer_granularity:
+                raise RuntimeError("KV pool returned an unverified restore boundary")
+        elif num_external_hit_tokens == request.num_tokens:
             num_external_hit_tokens -= 1
         if len(self.cacheable_group_ids) != len(self.original_block_size):
             # Private compressor state is rebuilt locally. Recompute the last

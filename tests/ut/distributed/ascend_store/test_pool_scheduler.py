@@ -136,6 +136,23 @@ class TestKVPoolScheduler(unittest.TestCase):
         self.assertEqual(scheduler.load_specs["r1"].kvpool_store_skip_tokens, 64)
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_hybrid_lookup_caps_before_selecting_a_complete_window(self, mock_client_cls):
+        scheduler = KVPoolScheduler(self._make_config(block_size=16), use_layerwise=False)
+        scheduler.cache_coordinator = object()
+        request = MagicMock(
+            prompt_token_ids=list(range(64)), num_tokens=64, request_id="aligned", block_hashes=[b"h"] * 4
+        )
+        mock_client_cls.return_value.lookup.return_value = 48
+        self.assertEqual(scheduler.get_num_new_matched_tokens(request, 0), (48, False))
+        self.assertEqual(mock_client_cls.return_value.lookup.call_args.args[0], 48)
+        self.assertEqual(scheduler.load_specs["aligned"].kvpool_cached_tokens, 48)
+        # A backend may not return a longer/unaligned point and rely on a later
+        # trim: that shorter point has not been checked against sparse windows.
+        mock_client_cls.return_value.lookup.return_value = 64
+        with self.assertRaisesRegex(RuntimeError, "unverified restore boundary"):
+            scheduler.get_num_new_matched_tokens(request, 0)
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
     def test_layerwise_mtp_hit_uses_safe_load_extent(self, mock_client_cls):
         scheduler = KVPoolScheduler(
             self._make_config(block_size=16, extra_config={"backend": "memcache"}),
@@ -859,6 +876,76 @@ class TestKVPoolSchedulerGetLayerwiseHitTokens(unittest.TestCase):
                 request.block_hashes = [b"\xaa"] * hash_count
                 result = scheduler._get_layerwise_hit_tokens(request, token_count, computed_tokens)
                 self.assertEqual(result, expected)
+
+    def test_layerwise_hit_intersects_complete_rank_windows(self):
+        import torch
+        from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec, SlidingWindowSpec
+
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import AscendStoreCoordinator
+
+        scheduler = self._make_scheduler()
+        spec = SlidingWindowSpec(block_size=128, num_kv_heads=1, head_size=1, dtype=torch.float32, sliding_window=256)
+        scheduler.cache_coordinator = AscendStoreCoordinator(
+            [
+                KVCacheGroupSpec(
+                    ["full"], FullAttentionSpec(block_size=128, num_kv_heads=1, head_size=1, dtype=torch.float32)
+                ),
+                KVCacheGroupSpec(["swa"], spec),
+            ],
+            128,
+            128,
+            [128, 128],
+            ["c1", "swa"],
+        )
+        scheduler.hash_block_size = scheduler.cache_transfer_granularity = 128
+        scheduler.grouped_block_size = [128, 128]
+        scheduler.cacheable_group_ids = {0, 1}
+        scheduler._make_layerwise_hit_check_keys = lambda group, h: [f"{group}:{h}:0", f"{group}:{h}:1"]
+        present = [{0, 1, 4, 5}, {0, 1, 3, 4}]
+
+        def infos(keys):
+            result = []
+            for key in keys:
+                group, block_hash, rank = key.split(":")
+                info = MagicMock()
+                info.size.return_value = int(group == "0" or bytes.fromhex(block_hash)[0] in present[int(rank)])
+                result.append(info)
+            return result
+
+        scheduler.store_scheduler.batch_get_key_info.side_effect = infos
+        request = MagicMock(block_hashes=[bytes([i]) * 32 for i in range(6)])
+        self.assertEqual(scheduler._get_layerwise_hit_tokens(request, 768, 0), 256)
+
+        # The compatibility path must query group 1 as well as group 0, and
+        # require every layer in a rank shard before admitting its window.
+        def keys_by_block(hashes, include_layers=False, kv_cache_group_id=0):
+            return [
+                [
+                    f"{kv_cache_group_id}:{h.hex()}:{r}:{layer}"
+                    for r in range(2)
+                    for layer in range(2 if include_layers else 1)
+                ]
+                for h in hashes
+            ]
+
+        scheduler._generate_store_query_keys = keys_by_block
+
+        def states(keys):
+            result = []
+            for key in keys:
+                group, block_hash, rank, layer = key.split(":")
+                result.append(int(group == "0" or bytes.fromhex(block_hash)[0] in present[int(rank)]))
+            return result
+
+        scheduler.store_scheduler.batch_is_exist.side_effect = states
+        for include_layers in [False, True]:
+            with self.subTest(include_layers=include_layers):
+                self.assertEqual(scheduler._get_store_lookup_hit_tokens(request, 768, 0, include_layers), 256)
+        missing_layer = f"1:{(bytes([1]) * 32).hex()}:1:1"
+        scheduler.store_scheduler.batch_is_exist.side_effect = lambda keys: [
+            value if key != missing_layer else 0 for key, value in zip(keys, states(keys), strict=True)
+        ]
+        self.assertEqual(scheduler._get_store_lookup_hit_tokens(request, 768, 0, True), 128)
 
 
 class TestKVPoolSchedulerUpdateStateAfterAllocBranches(unittest.TestCase):

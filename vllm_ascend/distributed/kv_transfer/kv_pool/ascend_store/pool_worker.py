@@ -35,7 +35,6 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import (
     AscendStoreCoordinator,
-    ExternalCachedBlockPool,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
     KVCacheStoreKeyLayerRecvingThread,
@@ -2223,18 +2222,19 @@ class KVPoolWorker:
         return f"{key[:value_start]}{value}{key[value_end:]}"
 
     def _expand_lookup_keys_by_rank(self, keys: list[str], group_id: int) -> list[str]:
-        # All-rank KV pool lookup currently assumes PCP=1.
         expanded: list[str] = []
         num_head_or_tp_ranks = self.get_group_tp_size(group_id)
         # Keep each rank shard's block/layer keys contiguous to match
         # lookup_scheduler()'s [rank_shard][block] result slicing.
-        for pp_rank in range(self.pp_size):
-            for dcp_rank in range(self.dcp_size):
-                for head_or_tp_rank in range(num_head_or_tp_ranks):
-                    for key in keys:
-                        rank_key = self._replace_key_field(key, "dcp", dcp_rank)
-                        rank_key = self._replace_key_field(rank_key, "head_or_tp_rank", head_or_tp_rank)
-                        expanded.append(self._replace_key_field(rank_key, "pp_rank", pp_rank))
+        for pcp_rank in range(self.pcp_size):
+            for pp_rank in range(self.pp_size):
+                for dcp_rank in range(self.dcp_size):
+                    for head_or_tp_rank in range(num_head_or_tp_ranks):
+                        for key in keys:
+                            rank_key = self._replace_key_field(key, "pcp", pcp_rank)
+                            rank_key = self._replace_key_field(rank_key, "dcp", dcp_rank)
+                            rank_key = self._replace_key_field(rank_key, "head_or_tp_rank", head_or_tp_rank)
+                            expanded.append(self._replace_key_field(rank_key, "pp_rank", pp_rank))
         return expanded
 
     def _expand_lookup_key_variants(self, key: str, group_id: int, include_all_ranks: bool) -> list[str]:
@@ -2256,7 +2256,7 @@ class KVPoolWorker:
         if sorted(kv_cache_group_ids) != list(range(self.num_kv_cache_groups)):
             return None
 
-        exists: set[tuple[int, bytes]] = set()
+        group_rank_hits: dict[int, list[set[bytes]]] = {}
         aligned_len = (
             (token_len + self.cache_coordinator.lcm_block_size - 1)
             // self.cache_coordinator.lcm_block_size
@@ -2271,11 +2271,11 @@ class KVPoolWorker:
             chunk_hashes: list[BlockHash | str] = []
             variant_counts: list[int] = []
             group_block_size = self.token_database.get_block_size(group_id)
+            local_hashes: set[bytes] = set()
             if hbm_hit_tokens:
                 grouped_hashes = get_block_hashes(block_hashes, group_block_size, self.token_database.hash_block_size)
-                exists.update(
-                    (group_id, block_hash_to_bytes(chunk_hash))
-                    for chunk_hash in grouped_hashes[: hbm_hit_tokens // group_block_size]
+                local_hashes.update(
+                    block_hash_to_bytes(h) for h in grouped_hashes[: hbm_hit_tokens // group_block_size]
                 )
             lookup_start = hbm_hit_tokens // group_block_size * group_block_size
             lookup_mask = lookup_masks[group_id] if lookup_masks is not None and group_id < len(lookup_masks) else None
@@ -2300,14 +2300,21 @@ class KVPoolWorker:
                 chunk_hashes.append(chunk_hash)
                 variant_counts.append(len(variants))
 
+            rank_count = variant_counts[0] if variant_counts else 1
+            rank_hits = [set(local_hashes) for _ in range(rank_count)]
+            group_rank_hits[group_id] = rank_hits
             if not keys:
                 continue
             res = self.m_store.exists(keys)  # type: ignore[assignment]
+            if len(res) != len(keys):
+                raise RuntimeError(f"KV pool exists count mismatch: expected={len(keys)}, actual={len(res)}")
             offset = 0
             for chunk_hash, count in zip(chunk_hashes, variant_counts, strict=True):
-                values = res[offset : offset + count]  # type: ignore[index]
-                if values and all(value == 1 for value in values):
-                    exists.add((group_id, block_hash_to_bytes(chunk_hash)))
+                if count != rank_count:
+                    raise RuntimeError("KV pool rank shard count changed within one group")
+                for rank, value in enumerate(res[offset : offset + count]):
+                    if value == 1:
+                        rank_hits[rank].add(block_hash_to_bytes(chunk_hash))
                 offset += count
 
             logger.debug(
@@ -2315,17 +2322,13 @@ class KVPoolWorker:
                 group_id,
                 token_len,
                 len(keys),
-                sum(1 for group, _ in exists if group == group_id),
+                len(set.intersection(*rank_hits)),
                 len(chunk_hashes),
                 keys[:3],
             )
 
-        _, hit_length = self.cache_coordinator.find_longest_cache_hit(
-            block_hashes,
-            token_len,
-            ExternalCachedBlockPool(self.hash_block_size, exists),
-            apply_eagle=False,
-        )
+        candidates = self.cache_coordinator.restorable_prefixes(block_hashes, token_len, group_rank_hits)
+        hit_length = candidates[-1] if candidates else 0
         logger.debug(
             "KV pool coordinator lookup final token_len=%d groups=%s hit=%d",
             token_len,

@@ -756,3 +756,39 @@ def test_swa_reachable_block_mask_sparse_with_lcm_alignment() -> None:
         f"expected {expected} cached blocks ({4}/{128} per segment), got {true_blocks}/{total_blocks}"
     )
     assert true_blocks > 0 and true_blocks < total_blocks, f"mask should be sparse, got {true_blocks}/{total_blocks}"
+
+
+@pytest.mark.parametrize("use_eagle", [False, True])
+def test_distinct_target_and_draft_swa_share_external_rewind(use_eagle):
+    """Ascend manager reconstruction must preserve the common restore window."""
+    base = _make_deepseek_v4_kv_cache_config()
+    full = replace(base.kv_cache_groups[0].kv_cache_spec, block_size=128)
+    target = SlidingWindowMLASpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float16,
+        sliding_window=128,
+    )
+    draft = replace(target, head_size=256)
+    coordinator = AscendHybridKVCacheCoordinator.__new__(AscendHybridKVCacheCoordinator)
+    coordinator.kv_cache_config = replace(
+        base,
+        kv_cache_groups=[
+            KVCacheGroupSpec(["full"], full),
+            KVCacheGroupSpec(["target"], target),
+            KVCacheGroupSpec(["draft"], draft),
+        ],
+    )
+    coordinator.single_type_managers = tuple(_FakeEagleManager() for _ in range(3))
+    coordinator.eagle_group_ids = {2} if use_eagle else set()
+    coordinator.scheduler_block_size = 128
+    coordinator.dcp_world_size = 1
+    coordinator.enable_caching = True
+    coordinator.verify_and_split_kv_cache_groups()
+    assert coordinator.single_type_managers[1].use_eagle is False
+    assert coordinator.single_type_managers[2].use_eagle is use_eagle
+    assert all(
+        manager.external_prefix_rewind_tokens == (128 if use_eagle else 0)
+        for manager in coordinator.single_type_managers
+    )

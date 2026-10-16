@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import replace
 from importlib import import_module
 from typing import Any, cast
@@ -9,11 +9,15 @@ from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import BlockHash, BlockHashList, KVCacheBlock
-from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
+from vllm.v1.core.single_type_kv_cache_manager import (
+    SingleTypeKVCacheManager,
+    sliding_window_restore_start,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
     KVCacheSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 
@@ -145,6 +149,17 @@ class AscendStoreCoordinator:
         *,
         apply_eagle: bool = True,
     ) -> tuple[tuple[list[bool], ...], int]:
+        if not apply_eagle:
+            exists = cached_block_pool._exists
+            rank_hits = {
+                gid: [[h for group_id, h in exists if group_id == gid]]
+                if exists is not None
+                else [get_block_hashes(block_hashes, self.group_effective_block_sizes[gid], self.hash_block_size)]
+                for gid in self.cacheable_group_ids
+            }
+            candidates = self.restorable_prefixes(block_hashes, max_length, rank_hits)
+            hit_length = candidates[-1] if candidates else 0
+            return self.load_mask(block_hashes, hit_length), hit_length
         blocks_per_group, hit_length = self._find_hit_blocks(
             block_hashes,
             max_length,
@@ -159,13 +174,101 @@ class AscendStoreCoordinator:
         block_hashes: list[BlockHash],
         token_len: int,
     ) -> tuple[list[bool], ...]:
-        masks, _ = self.find_longest_cache_hit(
-            block_hashes,
-            token_len,
-            ExternalCachedBlockPool(self.hash_block_size),
-            apply_eagle=False,
+        return tuple(
+            self._restore_mask(group_id, block_hashes, token_len) for group_id in range(len(self.kv_cache_groups))
         )
-        return masks
+
+    @property
+    def external_prefix_rewind_tokens(self) -> int:
+        return self.lcm_block_size if self.eagle_attn_group_indices else 0
+
+    def _restore_block_range(self, group_id: int, token_len: int) -> tuple[int, int]:
+        spec = self.group_effective_specs[group_id]
+        end = token_len // spec.block_size
+        if isinstance(spec, SlidingWindowSpec):
+            start = (
+                sliding_window_restore_start(token_len, spec.sliding_window, self.external_prefix_rewind_tokens)
+                // spec.block_size
+            )
+            return start, end
+        return 0, end
+
+    def _restore_mask(self, group_id: int, block_hashes: list[BlockHash], token_len: int) -> list[bool]:
+        if group_id not in self.cacheable_group_ids:
+            return []
+        spec = self.group_effective_specs[group_id]
+        if isinstance(spec, (FullAttentionSpec, SlidingWindowSpec)):
+            start, end = self._restore_block_range(group_id, token_len)
+            return [False] * start + [True] * (end - start)
+        manager_cls = _get_manager_class(_unwrap_spec(self.kv_cache_groups[group_id].kv_cache_spec))
+        pool = ExternalCachedBlockPool(self.hash_block_size)
+        blocks, _ = _find_longest_cache_hit(
+            manager_cls,
+            block_hashes=self.block_hashes_for_spec(block_hashes, spec),
+            max_length=token_len,
+            kv_cache_group_ids=[group_id],
+            block_pool=cast(BlockPool, pool),
+            kv_cache_spec=spec,
+            drop_eagle_block=False,
+            alignment_tokens=self.lcm_block_size,
+        )
+        return [block is not pool.null_block for block in blocks[0]]
+
+    def restorable_prefixes(
+        self,
+        block_hashes: list[BlockHash],
+        token_len: int,
+        group_rank_hits: Mapping[int, Sequence[Iterable[BlockHash | str]]],
+    ) -> list[int]:
+        """Intersect complete restore windows across every group and rank shard.
+
+        Full-prefix groups are downward closed; SWA and state checkpoints are
+        not. Keep all valid boundaries until every required shard has voted.
+        Rank keys are queried by the caller, so this needs no device collective.
+        """
+        candidates = list(range(self.lcm_block_size, token_len + 1, self.lcm_block_size))
+        if not self.cacheable_group_ids:
+            return []
+        for group_id in sorted(self.cacheable_group_ids):
+            rank_hits = group_rank_hits.get(group_id)
+            if not rank_hits:
+                return []
+            spec = self.group_effective_specs[group_id]
+            hashes = get_block_hashes(block_hashes, spec.block_size, self.hash_block_size)
+            for hits in rank_hits:
+                present = {block_hash_to_bytes(h) for h in hits}
+                if isinstance(spec, (FullAttentionSpec, SlidingWindowSpec)):
+                    missing = [0]
+                    for block_hash in hashes:
+                        missing.append(missing[-1] + (block_hash_to_bytes(block_hash) not in present))
+                    valid = []
+                    for boundary in candidates:
+                        start, end = self._restore_block_range(group_id, boundary)
+                        if end < len(missing) and missing[end] == missing[start]:
+                            valid.append(boundary)
+                else:
+                    # Preserve the manager's checkpoint semantics for recurrent
+                    # and other sparse specs instead of treating them as FULL.
+                    valid = []
+                    pool = ExternalCachedBlockPool(self.hash_block_size, {(group_id, h) for h in present})
+                    manager_cls = _get_manager_class(_unwrap_spec(self.kv_cache_groups[group_id].kv_cache_spec))
+                    for boundary in candidates:
+                        _, hit = _find_longest_cache_hit(
+                            manager_cls,
+                            block_hashes=self.block_hashes_for_spec(block_hashes, spec),
+                            max_length=boundary,
+                            kv_cache_group_ids=[group_id],
+                            block_pool=cast(BlockPool, pool),
+                            kv_cache_spec=spec,
+                            drop_eagle_block=False,
+                            alignment_tokens=self.lcm_block_size,
+                        )
+                        if hit == boundary:
+                            valid.append(boundary)
+                candidates = valid
+                if not candidates:
+                    return []
+        return candidates
 
     def _reachable_masks(
         self,
@@ -194,7 +297,12 @@ class AscendStoreCoordinator:
                 kv_cache_spec=spec,
                 use_eagle=group_id in self.eagle_reachable_group_ids,
                 retention_interval=retention_interval,
-                num_prompt_tokens=num_prompt_tokens,
+                reachable_boundaries=() if num_prompt_tokens is None else (num_prompt_tokens - 1,),
+                **(
+                    {"external_prefix_rewind_tokens": self.external_prefix_rewind_tokens}
+                    if isinstance(spec, SlidingWindowSpec)
+                    else {}
+                ),
             )
             masks.append((num_chunks, mask))
         return masks
@@ -241,24 +349,17 @@ class AscendStoreCoordinator:
         """
         aligned_len = cdiv(token_len, self.lcm_block_size) * self.lcm_block_size
         lookup_masks = self.lookup_mask(aligned_len)
-        exists: set[tuple[int, bytes]] = set()
+        group_rank_hits: dict[int, list[Iterable[BlockHash | str]]] = {}
         block_hashes_to_check = block_hashes[: token_len // self.hash_block_size]
 
         for group_id in self.cacheable_group_ids:
             group_block_size = self.group_effective_block_sizes[group_id]
             group_block_hashes = get_block_hashes(block_hashes_to_check, group_block_size, self.hash_block_size)
             hits = query_group_hits(group_id, group_block_hashes, lookup_masks[group_id])
-            exists.update((group_id, block_hash_to_bytes(hit)) for hit in hits)
+            group_rank_hits[group_id] = [hits]
 
-        if not exists:
-            logger.debug("%s: token_len=%d no pooled blocks found", log_context, token_len)
-            return 0
-        _, hit_length = self.find_longest_cache_hit(
-            block_hashes,
-            token_len,
-            ExternalCachedBlockPool(self.hash_block_size, exists),
-            apply_eagle=False,
-        )
+        candidates = self.restorable_prefixes(block_hashes, token_len, group_rank_hits)
+        hit_length = candidates[-1] if candidates else 0
         logger.debug("%s: token_len=%d hit_tokens=%d", log_context, token_len, hit_length)
         return hit_length
 
@@ -430,6 +531,9 @@ def _reachable_block_mask(
     try:
         return reachable_block_mask(**kwargs)
     except TypeError as exc:
+        if "external_prefix_rewind_tokens" in str(exc):
+            kwargs.pop("external_prefix_rewind_tokens", None)
+            return _reachable_block_mask(manager_cls, **kwargs)
         if "retention_interval" not in str(exc) and "num_prompt_tokens" not in str(exc):
             logger.debug("KV cache manager does not support reachable_block_mask kwargs: %s", exc)
             return reachable_block_mask(
