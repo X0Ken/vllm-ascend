@@ -1905,3 +1905,53 @@ and an actual `SWA bounded replay is active` message in the service log.
 Startup success or a true configuration field alone does not prove replay was
 exercised. Cross-chunk regression should also use a token budget smaller than
 the SWA window.
+
+## 13. QC 910B3 TP8 Profile (vLLM 0.31)
+
+`Dockerfile.qc-dsv41` builds the QC image for one eight-card 910B3 (A2)
+node with TP8/DP1/EP8 and
+`chiro2001/DeepSeek-V4.1-Flash-w4a8-Ascend`. The build pins the tested
+`nightly-main` digest and the vLLM 0.31.0 source revision. Provide a clean
+vLLM `db9527a46873454610df6dbedf79a36d6bf1a7f6` source tree as
+`vllm-source/` in the build context. The installer applies the QC core
+patches and builds the Rust parser, Ascend operators and Joint operator.
+
+```shell
+docker build -f Dockerfile.qc-dsv41 \
+  --build-arg SOURCE_COMMIT="$(git rev-parse HEAD)" \
+  -t vllm-ascend-qc-dsv41:vllm-update .
+```
+
+The image installs and preloads jemalloc 5.2.1 and checks its library SHA256
+against the p8 binary. It also sets the tested FP32 TP reduction, Model Runner
+V1, `OMP_NUM_THREADS=1` and `TASK_QUEUE_ENABLE=1` defaults.
+
+Run inside the Ascend container with the existing driver/device mounts and
+independent 512 GiB CPU KV configuration. `MODEL_DIR` names the checked local
+checkpoint; `KV_TRANSFER_CONFIG` contains the configured connector JSON.
+Use these serving parameters for the QC latency profile:
+
+```shell
+vllm serve "${MODEL_DIR:?}" \
+  --host 0.0.0.0 --port 8941 --served-model-name dsv41 \
+  --api-key "${API_KEY:?}" \
+  --tokenizer-mode deepseek_v41 --dtype bfloat16 --quantization ascend \
+  --tensor-parallel-size 8 --data-parallel-size 1 --enable-expert-parallel \
+  --max-model-len 1048576 --max-num-batched-tokens 8192 --max-num-seqs 32 \
+  --gpu-memory-utilization 0.90 --safetensors-load-strategy lazy \
+  --async-scheduling --enable-prefix-caching --no-swa-bounded-replay \
+  --enable-auto-tool-choice --tool-call-parser deepseek_v41 \
+  --engram-config '{"cpu_offload":true,"dp_shared_memory":false}' \
+  --speculative-config '{"method":"dspark","num_speculative_tokens":5,"enforce_eager":false}' \
+  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[6,12,18,24,30,36,42,48,96,192]}' \
+  --additional-config '{"enable_dsa_cp":false,"enable_cpu_binding":true,"enable_flashcomm1":true,"multistream_overlap_shared_expert":true,"ascend_compilation_config":{"enable_npugraph_ex":true,"enable_static_kernel":true,"enable_super_kernel":false},"enable_dsv41_draft_graph":true,"enable_dsv41_async_metadata":true,"enable_dsv41_prefill_draft_graph":true,"enable_dsv41_inline_metadata":false,"enable_dsv41_deferred_corrections":true}' \
+  --kv-transfer-config "${KV_TRANSFER_CONFIG:?}"
+```
+
+The V4.1 options validate DP1, no context parallelism or LoRA, Model Runner V1,
+async scheduling and padded DSpark. GPU lengths and positions remain exact;
+CPU sequence lengths provide an upper bound. Deferred count correction applies
+only to existing full-width decode requests using V4.1 metadata builders. The
+correction still executes after forward submission; new, resumed and prefill
+requests keep the original ordering. Runtime logs identify when this guarded
+path is exercised.
