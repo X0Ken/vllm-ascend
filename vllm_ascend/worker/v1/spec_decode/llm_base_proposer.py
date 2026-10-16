@@ -2530,7 +2530,15 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             _num_computed_tokens_cpu=common_attn_metadata._num_computed_tokens_cpu,
             seq_lens=common_attn_metadata.seq_lens,
             is_prefilling=common_attn_metadata.is_prefilling,
-            max_seq_len=common_attn_metadata.max_seq_len,
+            max_seq_len=(
+                common_attn_metadata.max_seq_len
+                if (
+                    self.method == "dspark"
+                    and common_attn_metadata.seq_lens_cpu is None
+                    and common_attn_metadata._seq_lens_cpu is None
+                )
+                else 0
+            ),
             req_topk_buffer_slots=common_attn_metadata.req_topk_buffer_slots,
             req_topk_buffer_active=common_attn_metadata.req_topk_buffer_active,
             offload_dummy=common_attn_metadata.offload_dummy,

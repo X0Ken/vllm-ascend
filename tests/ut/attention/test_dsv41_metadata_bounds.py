@@ -46,6 +46,7 @@ def test_bounds_preserve_device_lengths_and_request_classification(extra, prefil
 @pytest.mark.parametrize("exact_host", [False, True])
 def test_padded_draft_keeps_upper_bound_when_exact_host_is_unset(exact_host):
     proposer = AscendSpecDecodeBaseProposer.__new__(AscendSpecDecodeBaseProposer)
+    proposer.method = "dspark"
     proposer.dcp_size = 1
     proposer.arange = torch.arange(16, dtype=torch.int32)
     proposer.runner = MagicMock()
@@ -90,5 +91,5 @@ def test_padded_draft_keeps_upper_bound_when_exact_host_is_unset(exact_host):
     assert spec_common_attn_metadata._seq_lens_cpu is internal_seq_lens_cpu
     assert spec_common_attn_metadata.seq_lens_cpu is None
 
-    assert spec_common_attn_metadata.max_seq_len == 14
+    assert spec_common_attn_metadata.max_seq_len == (0 if exact_host else 14)
     assert spec_common_attn_metadata.seq_lens_cpu_upper_bound is upper_bound
