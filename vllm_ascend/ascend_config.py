@@ -572,6 +572,8 @@ class AscendConfig:
     enable_dsv41_async_metadata: bool = False
     # Build target metadata on the main stream before replay.
     enable_dsv41_inline_metadata: bool = False
+    # Submit GPU-exact V4.1 decode before correcting optimistic CPU counts.
+    enable_dsv41_deferred_corrections: bool = False
     multistream_dsv4_dsa_overlap: bool = True
     # Prepare Engram hashes, lookups and DP/TP exchanges on an auxiliary stream;
     # FULL graphs wait on descriptor-specific external events at consumers.
@@ -715,6 +717,8 @@ class AscendConfig:
             raise ValueError("enable_dsv41_draft_graph requires enough batched tokens for all draft queries")
 
     def _validate_dsv41_async_metadata(self, vc: VllmConfig) -> None:
+        if self.enable_dsv41_deferred_corrections and not self.enable_dsv41_async_metadata:
+            raise ValueError("enable_dsv41_deferred_corrections requires enable_dsv41_async_metadata")
         if self.enable_dsv41_inline_metadata and not self.enable_dsv41_async_metadata:
             raise ValueError("enable_dsv41_inline_metadata requires enable_dsv41_async_metadata")
         if not self.enable_dsv41_async_metadata:

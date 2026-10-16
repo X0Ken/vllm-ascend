@@ -568,6 +568,10 @@ class NPUModelRunner(GPUModelRunner):
         self._use_v41_upper_bound_seq_lens = (
             getattr(get_ascend_config(), "enable_dsv41_async_metadata", False) is True
         )
+        self._defer_v41_state_corrections = (
+            self._use_v41_upper_bound_seq_lens
+            and getattr(get_ascend_config(), "enable_dsv41_deferred_corrections", False) is True
+        )
         self._needs_seq_lens_cpu_sync = not self._use_v41_upper_bound_seq_lens and (
             self.use_compress or issubclass(self.attn_backend, (AscendAttentionBackend, AscendMLABackend))
         )
@@ -2569,22 +2573,13 @@ class NPUModelRunner(GPUModelRunner):
                             self.mamba_state_idx,
                         )
 
-                if self.use_compress:
-                    if deferred_state_corrections_fn:
-                        deferred_state_corrections_fn()
-                        deferred_state_corrections_fn = None
-                    num_reqs = self.input_batch.num_reqs
-                    req_indices = np.repeat(
-                        self.arange_np[:num_reqs], num_scheduled_tokens_np
-                    )
-                    dsa_positions_np = self._dsa_positions_np_buf[
-                        :total_num_scheduled_tokens
-                    ]
-                    np.add(
-                        self.input_batch.num_computed_tokens_cpu[req_indices],
-                        self.query_pos.np[:total_num_scheduled_tokens],
-                        out=dsa_positions_np,
-                    )
+                deferred_state_corrections_fn = self._prepare_compressed_cpu_positions(
+                    scheduler_output,
+                    cudagraph_mode,
+                    num_scheduled_tokens_np,
+                    total_num_scheduled_tokens,
+                    deferred_state_corrections_fn,
+                )
 
                 use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
                 ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
@@ -2797,6 +2792,61 @@ class NPUModelRunner(GPUModelRunner):
         # previous model forward without breaking async scheduling.
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
+        return None
+
+    def _can_defer_v41_state_corrections(self, scheduler_output, cudagraph_mode) -> bool:
+        if not getattr(self, "_defer_v41_state_corrections", False) or cudagraph_mode != CUDAGraphMode.FULL:
+            return False
+        if self.cache_config.mamba_cache_mode == "align" or scheduler_output.scheduled_new_reqs:
+            return False
+        if scheduler_output.scheduled_cached_reqs.resumed_req_ids:
+            return False
+        req_ids = self.input_batch.req_ids
+        previous = self.input_batch.prev_req_id_to_index or {}
+        if not req_ids or not self.num_spec_tokens:
+            return False
+        drafts = scheduler_output.scheduled_spec_decode_tokens
+        if any(
+            req_id not in previous
+            or len(drafts.get(req_id, ())) != self.num_spec_tokens
+            or scheduler_output.num_scheduled_tokens[req_id] != self.num_spec_tokens + 1
+            for req_id in req_ids
+        ):
+            return False
+        # V4.1 consumes exact GPU positions. Legacy DSA and mixed backends
+        # consume positions_cpu and must retain the early CPU correction.
+        groups = [group for groups in self.attn_groups for group in groups]
+        return bool(groups) and all(
+            isinstance(group.get_metadata_builder(), AscendDSAV41MetadataBuilder) for group in groups
+        )
+
+    def _prepare_compressed_cpu_positions(
+        self,
+        scheduler_output,
+        cudagraph_mode,
+        num_scheduled_tokens_np,
+        total_num_scheduled_tokens,
+        deferred_state_corrections_fn: Callable[[], None] | None,
+    ) -> Callable[[], None] | None:
+        if not self.use_compress:
+            return deferred_state_corrections_fn
+        if self._can_defer_v41_state_corrections(scheduler_output, cudagraph_mode):
+            # Keep the correction callback: execute_model invokes it after
+            # model submission, before returning to sampling/bookkeeping.
+            # Only the unused legacy CPU position construction is skipped.
+            if deferred_state_corrections_fn is not None:
+                logger.info_once("V4.1 defers CPU token corrections until after forward submission.")
+            return deferred_state_corrections_fn
+        if deferred_state_corrections_fn:
+            deferred_state_corrections_fn()
+        num_reqs = self.input_batch.num_reqs
+        req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens_np)
+        dsa_positions_np = self._dsa_positions_np_buf[:total_num_scheduled_tokens]
+        np.add(
+            self.input_batch.num_computed_tokens_cpu[req_indices],
+            self.query_pos.np[:total_num_scheduled_tokens],
+            out=dsa_positions_np,
+        )
         return None
 
     def _num_drafter_query_tokens(self) -> int:
