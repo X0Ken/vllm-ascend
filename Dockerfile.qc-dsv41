@@ -1,15 +1,24 @@
-ARG BASE_IMAGE=quay.io/ascend/vllm-ascend:nightly-main
+ARG BASE_IMAGE=quay.io/ascend/vllm-ascend:nightly-main@sha256:3f68d538d356244f0a10c4dd89b65b47e67dd62e21346a7d9888714f9e3ece50
 FROM ${BASE_IMAGE}
+ARG BASE_IMAGE
 ARG SOURCE_COMMIT
 ARG VLLM_COMMIT=db9527a46873454610df6dbedf79a36d6bf1a7f6
-LABEL qc.vllm.commit=${VLLM_COMMIT}
+LABEL qc.vllm.commit=${VLLM_COMMIT} qc.base.image=${BASE_IMAGE}
 LABEL org.opencontainers.image.revision=${SOURCE_COMMIT} qc.source.branch=qc-ascend-dsv41-vllm-update
+RUN apt-get update && apt-get install -y --no-install-recommends libjemalloc2=5.2.1-4ubuntu1 && \
+    echo '6fa9db2a963459985457776a1301e94a53a006bea58776cbf9168f021156c70c  /lib/aarch64-linux-gnu/libjemalloc.so.2' | sha256sum -c - && \
+    rm -rf /var/lib/apt/lists/*
 RUN python3 -c 'import hashlib,json,pathlib; r=pathlib.Path("/vllm-workspace/vllm-ascend"); pathlib.Path("/opt/qc-native-base.json").write_text(json.dumps({str(p.relative_to(r)):hashlib.sha256(p.read_bytes()).hexdigest() for p in (r/"csrc").rglob("*") if p.is_file() and p.suffix in (".cpp",".h",".hpp",".cmake") and not any(x in p.parts for x in ("build","build_out","output","third_party"))}))'
 COPY vllm-source/ /vllm-workspace/vllm/
 COPY . /vllm-workspace/vllm-ascend/
 WORKDIR /vllm-workspace/vllm-ascend
 RUN rm -rf /vllm-workspace/vllm/.git /vllm-workspace/vllm-ascend/.git
 RUN bash -c 'source /usr/local/Ascend/ascend-toolkit/set_env.sh && VLLM_TARGET_DEVICE=empty VLLM_VERSION_OVERRIDE=0.31.0 python3 -m pip install --no-deps --no-build-isolation -e /vllm-workspace/vllm && python3 -m pip install "fastapi[standard]>=0.133.0,<0.137.0" "starlette>=1.0.1,<2" xgrammar==0.2.7 oss-harmony && python3 tools/qc_dsv41/build_rust.py && python3 tools/qc_dsv41/install.py'
-ENV ASCEND_CUSTOM_OPP_PATH=/opt/v41hcpostprenorm/installed/vendors/v41hcpostprenorm_transformer:/vllm-workspace/vllm-ascend/vllm_ascend/_cann_ops_custom/vendors/custom_transformer
+ENV ASCEND_CUSTOM_OPP_PATH=/opt/v41hcpostprenorm/installed/vendors/v41hcpostprenorm_transformer:/vllm-workspace/vllm-ascend/vllm_ascend/_cann_ops_custom/vendors/custom_transformer \
+    LD_PRELOAD=/lib/aarch64-linux-gnu/libjemalloc.so.2 \
+    VLLM_ASCEND_TP_BF16_ALLREDUCE_FP32=1 \
+    VLLM_USE_V2_MODEL_RUNNER=0 \
+    OMP_NUM_THREADS=1 \
+    TASK_QUEUE_ENABLE=1
 ENTRYPOINT ["/bin/bash"]
 CMD ["-l"]
