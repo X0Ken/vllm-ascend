@@ -2573,6 +2573,8 @@ class NPUModelRunner(GPUModelRunner):
                             self.mamba_state_idx,
                         )
 
+                if self.use_compress:
+                    num_reqs = self.input_batch.num_reqs
                 deferred_state_corrections_fn = self._prepare_compressed_cpu_positions(
                     scheduler_output,
                     cudagraph_mode,
