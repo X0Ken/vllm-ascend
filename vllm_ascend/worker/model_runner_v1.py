@@ -6463,14 +6463,28 @@ class NPUModelRunner(GPUModelRunner):
             for builder in attn_group.metadata_builders
             if isinstance(builder, DeviceMetadataTaskProvider)
         }
-        if device_metadata_providers:
-            self.device_metadata_executor = DeviceMetadataExecutor()
-            self.device_metadata_providers = device_metadata_providers
-            for provider in device_metadata_providers.values():
-                provider.enable_device_metadata()
+        self._initialize_device_metadata_providers(device_metadata_providers)
 
         # Calculate reorder batch threshold (if needed)
         self.calculate_reorder_batch_threshold()
+
+    def _initialize_device_metadata_providers(self, providers: dict[int, DeviceMetadataTaskProvider]) -> None:
+        if not providers:
+            return
+        if getattr(get_ascend_config(), "enable_dsv41_inline_metadata", False) is True:
+            if not all(isinstance(provider, AscendDSAV41MetadataBuilder) for provider in providers.values()):
+                raise ValueError("V4.1 inline metadata requires V4.1 builders exclusively")
+            # Publish every producer on the same stream as model replay. This
+            # retains device lengths and persistent outputs, while avoiding
+            # graph-external events and stream joins. RoPE ownership is still
+            # initialized before building compressor metadata.
+            for provider in providers.values():
+                provider.prepare_source_rope()
+            return
+        self.device_metadata_executor = DeviceMetadataExecutor()
+        self.device_metadata_providers = providers
+        for provider in providers.values():
+            provider.enable_device_metadata()
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
