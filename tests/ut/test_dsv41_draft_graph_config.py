@@ -146,7 +146,10 @@ def test_inline_metadata_requires_async_bounds_validation():
 
 def test_deferred_corrections_require_gpu_metadata():
     with pytest.raises(ValueError, match="requires enable_dsv41_async_metadata"):
-        AscendConfig(enable_dsv41_deferred_corrections=True)._validate_dsv41_async_metadata(SimpleNamespace())
+        AscendConfig(
+            enable_dsv41_deferred_corrections=True,
+            sparse_kv_offload_config=SimpleNamespace(enabled=False),
+        )._validate_dsv41_async_metadata(SimpleNamespace())
 
 
 def test_deferred_corrections_use_async_metadata_validation():
