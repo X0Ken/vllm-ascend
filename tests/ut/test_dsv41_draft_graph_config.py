@@ -74,3 +74,64 @@ def test_dynamic_budget_requires_eager_draft(method, enabled):
             ascend._validate_dsv41_draft_graph(config())
     else:
         ascend._validate_dsv41_draft_graph(config())
+
+
+def test_prefill_graph_requires_decode_graph_opt_in():
+    with pytest.raises(ValueError, match="requires enable_dsv41_draft_graph"):
+        AscendConfig(
+            enable_dsv41_prefill_draft_graph=True, sparse_kv_offload_config=SimpleNamespace(enabled=False)
+        )._validate_dsv41_draft_graph(config())
+
+
+def async_metadata_config():
+    vc = config()
+    vc.use_v2_model_runner = False
+    vc.scheduler_config.async_scheduling = True
+    vc.parallel_config.data_parallel_size = 1
+    vc.speculative_config.disable_padded_drafter_batch = False
+    return vc
+
+
+def test_async_metadata_bounds_supported_config():
+    AscendConfig(
+        enable_dsv41_async_metadata=True, sparse_kv_offload_config=SimpleNamespace(enabled=False)
+    )._validate_dsv41_async_metadata(async_metadata_config())
+
+
+@pytest.mark.parametrize(
+    "path,value,message",
+    [
+        ("model_config.hf_text_config.model_type", "qwen3", "DeepSeek V4.1"),
+        ("parallel_config.data_parallel_size", 2, "DP1"),
+        ("parallel_config.prefill_context_parallel_size", 2, "context parallelism"),
+        ("parallel_config.decode_context_parallel_size", 2, "context parallelism"),
+        ("use_v2_model_runner", True, "Model Runner V1"),
+        ("lora_config", object(), "LoRA"),
+        ("scheduler_config.async_scheduling", False, "async scheduling"),
+        ("speculative_config", None, "padded DSpark"),
+        ("speculative_config.method", "mtp", "padded DSpark"),
+        ("speculative_config.disable_padded_drafter_batch", True, "padded DSpark"),
+    ],
+)
+def test_async_metadata_bounds_reject_exact_host_consumers(path, value, message):
+    vc = async_metadata_config()
+    parts = path.split(".")
+    parent = vc
+    for part in parts[:-1]:
+        parent = getattr(parent, part)
+    setattr(parent, parts[-1], value)
+    with pytest.raises(ValueError, match=message):
+        AscendConfig(
+            enable_dsv41_async_metadata=True, sparse_kv_offload_config=SimpleNamespace(enabled=False)
+        )._validate_dsv41_async_metadata(vc)
+
+
+@pytest.mark.parametrize("window,sparse,cp", [(128, False, False), (None, True, False), (None, False, True)])
+def test_async_metadata_bounds_reject_optional_host_consumers(window, sparse, cp):
+    with pytest.raises(ValueError):
+        AscendConfig(
+            enable_dsv41_async_metadata=True,
+            enable_dsa_cp=cp,
+            draft_window_size=window,
+            sparse_kv_offload_config=SimpleNamespace(enabled=sparse),
+        )._validate_dsv41_async_metadata(async_metadata_config())

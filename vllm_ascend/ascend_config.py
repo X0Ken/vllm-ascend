@@ -566,13 +566,18 @@ class AscendConfig:
     enable_cpu_binding: bool = True
     # Capture DSpark query blocks only; target-context KV preparation stays eager.
     enable_dsv41_draft_graph: bool = False
+    # Query blocks have a uniform K even when the target is doing prefill.
+    enable_dsv41_prefill_draft_graph: bool = False
+    # Device lengths stay exact; host lengths serve only as tiling bounds.
+    enable_dsv41_async_metadata: bool = False
     multistream_dsv4_dsa_overlap: bool = True
     # Prepare Engram hashes, lookups and DP/TP exchanges on an auxiliary stream;
     # FULL graphs wait on descriptor-specific external events at consumers.
     # Default to overlap on A5 only; explicit settings override this policy.
     multistream_engram_overlap: bool = dataclasses.field(
-        default_factory=lambda: get_current_hardware_profile().device_adaptor_family
-        == DeviceAdaptorFamily.FP8_OPTIMIZED
+        default_factory=lambda: (
+            get_current_hardware_profile().device_adaptor_family == DeviceAdaptorFamily.FP8_OPTIMIZED
+        )
     )
     enable_prefill_mc2: bool = False
     multistream_overlap_shared_expert: bool = False
@@ -679,6 +684,8 @@ class AscendConfig:
         return self
 
     def _validate_dsv41_draft_graph(self, vllm_config: VllmConfig) -> None:
+        if self.enable_dsv41_prefill_draft_graph and not self.enable_dsv41_draft_graph:
+            raise ValueError("enable_dsv41_prefill_draft_graph requires enable_dsv41_draft_graph")
         if not self.enable_dsv41_draft_graph:
             return
         model = vllm_config.model_config
@@ -705,6 +712,30 @@ class AscendConfig:
         if scheduler.max_num_seqs * speculative.num_speculative_tokens > scheduler.max_num_batched_tokens:
             raise ValueError("enable_dsv41_draft_graph requires enough batched tokens for all draft queries")
 
+    def _validate_dsv41_async_metadata(self, vc: VllmConfig) -> None:
+        if not self.enable_dsv41_async_metadata:
+            return
+        model_type = getattr(vc.model_config.hf_text_config, "model_type", "")
+        if model_type not in ("deepseek_v41", "deepseek_v41_text", "deepseek_v4.1_text"):
+            raise ValueError("enable_dsv41_async_metadata requires DeepSeek V4.1")
+        parallel = vc.parallel_config
+        if (
+            parallel.data_parallel_size != 1
+            or parallel.prefill_context_parallel_size != 1
+            or parallel.decode_context_parallel_size != 1
+            or self.enable_dsa_cp
+        ):
+            raise ValueError("enable_dsv41_async_metadata requires DP1 without context parallelism")
+        if vc.use_v2_model_runner or not vc.scheduler_config.async_scheduling:
+            raise ValueError("enable_dsv41_async_metadata requires async scheduling with Model Runner V1")
+        if vc.lora_config is not None:
+            raise ValueError("enable_dsv41_async_metadata does not support LoRA")
+        spec = vc.speculative_config
+        if spec is None or spec.method != "dspark" or spec.disable_padded_drafter_batch:
+            raise ValueError("enable_dsv41_async_metadata requires padded DSpark drafting")
+        if self.draft_window_size is not None or self.sparse_kv_offload_config.enabled:
+            raise ValueError("enable_dsv41_async_metadata does not support draft windows or sparse KV offload")
+
     # ---- derivations + cross-config downgrades/mutex ----
     # Business validation: invoked explicitly by init_ascend_config (NOT a
     # pydantic after-validator). Preserves the original __init__ ordering —
@@ -713,6 +744,7 @@ class AscendConfig:
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
         self._validate_dsv41_draft_graph(vc)
+        self._validate_dsv41_async_metadata(vc)
         engram_config = getattr(vc, "engram_config", None)
         if (
             engram_config is not None

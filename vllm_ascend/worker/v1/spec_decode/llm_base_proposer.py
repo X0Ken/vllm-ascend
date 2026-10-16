@@ -1086,15 +1086,26 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         uniform_decode = target_model_batch_desc.uniform
 
         if self.method == "dspark" and self.use_cuda_graph:
+            draft_batch_desc = target_model_batch_desc
+            use_query_graph = uniform_decode
+            if not uniform_decode and getattr(self, "use_prefill_query_graph", False):
+                # Context projection stays eager. Only the fixed-K query block
+                # replays a graph already captured for this request-count bucket.
+                query_mode, draft_batch_desc = self.runner.cudagraph_dispatcher.dispatch(
+                    num_tokens=batch_size * self.runner.uniform_decode_query_len,
+                    uniform_decode=True,
+                    has_lora=has_lora,
+                )
+                use_query_graph = query_mode == CUDAGraphMode.FULL
             draft_tokens = (
-                target_model_batch_desc.num_reqs * self.num_query_per_req
-                if uniform_decode and target_model_batch_desc.num_reqs
+                draft_batch_desc.num_reqs * self.num_query_per_req
+                if use_query_graph and draft_batch_desc.num_reqs
                 else num_tokens
             )
             num_input_tokens, num_tokens_across_dp, _ = self.runner._sync_metadata_across_dp(
                 draft_tokens, is_draft_model=True
             )
-            aclgraph_runtime_mode = CUDAGraphMode.FULL if uniform_decode else CUDAGraphMode.NONE
+            aclgraph_runtime_mode = CUDAGraphMode.FULL if use_query_graph else CUDAGraphMode.NONE
             batch_descriptor = BatchDescriptor(
                 num_tokens=num_input_tokens, num_reqs=num_input_tokens // self.num_query_per_req, uniform=True
             )
@@ -2496,7 +2507,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # ``_seq_lens_cpu`` field unchanged. In async-spec mode only the
         # latter is populated (subclass field is None to signal "GPU is
         # authoritative"); dropping ``_seq_lens_cpu`` here causes downstream
-        # backends (e.g. attention_cp) to crash on a None subscript.
+        # backends (e.g. attention_cp) to crash on a None subscript. V4.1's
+        # opt-in upper-bound mode deliberately leaves both exact mirrors unset.
         spec_common_attn_metadata = AscendCommonAttentionMetadata(
             query_start_loc=common_attn_metadata.query_start_loc,
             query_start_loc_cpu=query_start_loc_cpu,
@@ -2518,7 +2530,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             _num_computed_tokens_cpu=common_attn_metadata._num_computed_tokens_cpu,
             seq_lens=common_attn_metadata.seq_lens,
             is_prefilling=common_attn_metadata.is_prefilling,
-            max_seq_len=0,
+            max_seq_len=common_attn_metadata.max_seq_len,
             req_topk_buffer_slots=common_attn_metadata.req_topk_buffer_slots,
             req_topk_buffer_active=common_attn_metadata.req_topk_buffer_active,
             offload_dummy=common_attn_metadata.offload_dummy,
