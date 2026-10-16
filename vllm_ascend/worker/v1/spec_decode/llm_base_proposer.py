@@ -2533,7 +2533,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             max_seq_len=(
                 common_attn_metadata.max_seq_len
                 if (
-                    self.method == "dspark"
+                    getattr(self, "method", None) == "dspark"
                     and common_attn_metadata.seq_lens_cpu is None
                     and common_attn_metadata._seq_lens_cpu is None
                 )

@@ -4234,6 +4234,8 @@ class TestKVPPExecute(unittest.TestCase):
                 runner.vllm_config = SimpleNamespace()
                 runner.parallel_config = SimpleNamespace(num_ubatches=1)
                 runner.model_config = SimpleNamespace(
+                    is_encoder_decoder=False,
+                    requires_raw_input_tokens=False,
                     enforce_eager=True,
                     hf_config=SimpleNamespace(model_type="test"),
                     hf_text_config=SimpleNamespace(model_type="test"),
