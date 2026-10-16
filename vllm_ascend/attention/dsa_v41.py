@@ -920,8 +920,29 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
         )
 
     def build_for_drafting(self, common_attn_metadata, draft_index, **kwargs):
-        # DSpark issues one eager block per step. Group-local tables and slots
-        # remain independent; the builder owns the operator metadata buffers.
+        # Stable query starts and block tables are shared by capture and replay.
+        if get_ascend_config().enable_dsv41_draft_graph:
+            table = common_attn_metadata.block_table_tensor
+            if not hasattr(self, "_draft_block_table"):
+                self._draft_block_table = torch.empty(
+                    (self.vllm_config.scheduler_config.max_num_seqs, table.shape[1]),
+                    dtype=table.dtype,
+                    device=table.device,
+                )
+            self._draft_block_table[: table.shape[0]].copy_(table)
+            common_attn_metadata.block_table_tensor = self._draft_block_table[: table.shape[0]]
+            # Capture and live drafting originate from different qsl staging
+            # buffers. Keep the pointer consumed by SMLA fixed across both.
+            if not hasattr(self, "_draft_query_start_loc"):
+                self._draft_query_start_loc = torch.empty(
+                    self.vllm_config.scheduler_config.max_num_seqs + 1,
+                    dtype=common_attn_metadata.query_start_loc.dtype,
+                    device=table.device,
+                )
+            rows = common_attn_metadata.query_start_loc.shape[0]
+            self._draft_query_start_loc[:rows].copy_(common_attn_metadata.query_start_loc)
+            common_attn_metadata.query_start_loc = self._draft_query_start_loc[:rows]
+            return self.build(0, common_attn_metadata, full_graph_mode=True)
         return self.build(0, common_attn_metadata)
 
     def prepare_source_rope(self) -> None:

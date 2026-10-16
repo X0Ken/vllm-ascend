@@ -564,6 +564,8 @@ class AscendConfig:
 
     # ---- user-input switches: bool/int/list/str, auto type validation ----
     enable_cpu_binding: bool = True
+    # Capture DSpark query blocks only; target-context KV preparation stays eager.
+    enable_dsv41_draft_graph: bool = False
     multistream_dsv4_dsa_overlap: bool = True
     # Prepare Engram hashes, lookups and DP/TP exchanges on an auxiliary stream;
     # FULL graphs wait on descriptor-specific external events at consumers.
@@ -676,6 +678,33 @@ class AscendConfig:
             self.enable_fused_mc2 = 1
         return self
 
+    def _validate_dsv41_draft_graph(self, vllm_config: VllmConfig) -> None:
+        if not self.enable_dsv41_draft_graph:
+            return
+        model = vllm_config.model_config
+        model_type = getattr(getattr(model, "hf_text_config", None), "model_type", "")
+        if model_type not in ("deepseek_v41", "deepseek_v41_text", "deepseek_v4.1_text"):
+            raise ValueError("enable_dsv41_draft_graph requires a DeepSeek V4.1 target model")
+        speculative = vllm_config.speculative_config
+        if speculative is None or speculative.method != "dspark":
+            raise ValueError("enable_dsv41_draft_graph requires DSpark speculative decoding")
+        if speculative.draft_sample_method != "greedy":
+            raise ValueError("enable_dsv41_draft_graph requires greedy draft sampling")
+        if self.dynamic_spec_config.method is not None:
+            raise ValueError("enable_dsv41_draft_graph does not support dynamic speculative budgets")
+        draft_hf = speculative.draft_model_config.hf_config
+        draft_hf = getattr(draft_hf, "text_config", draft_hf)
+        if not getattr(draft_hf, "sample_from_anchor", True):
+            raise ValueError("enable_dsv41_draft_graph requires sample_from_anchor=True")
+        parallel = vllm_config.parallel_config
+        if parallel.prefill_context_parallel_size != 1 or parallel.decode_context_parallel_size != 1:
+            raise ValueError("enable_dsv41_draft_graph does not support context parallelism")
+        if vllm_config.lora_config is not None:
+            raise ValueError("enable_dsv41_draft_graph does not support LoRA")
+        scheduler = vllm_config.scheduler_config
+        if scheduler.max_num_seqs * speculative.num_speculative_tokens > scheduler.max_num_batched_tokens:
+            raise ValueError("enable_dsv41_draft_graph requires enough batched tokens for all draft queries")
+
     # ---- derivations + cross-config downgrades/mutex ----
     # Business validation: invoked explicitly by init_ascend_config (NOT a
     # pydantic after-validator). Preserves the original __init__ ordering —
@@ -683,6 +712,7 @@ class AscendConfig:
     # the max_num_batched_tokens that sequence-parallel writeback corrected).
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
+        self._validate_dsv41_draft_graph(vc)
         engram_config = getattr(vc, "engram_config", None)
         if (
             engram_config is not None

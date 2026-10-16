@@ -5,7 +5,7 @@ from vllm.config.parallel import ParallelConfig
 
 
 def _use_sequence_parallel_moe(self: ParallelConfig) -> bool:
-    """Enable MoE sequence parallelism for TP/EP topologies, including DP=1."""
+    """Use the p8 MoE layout for DP=1 to avoid small-batch SP padding."""
     return (
         self.all2all_backend
         in (
@@ -18,11 +18,12 @@ def _use_sequence_parallel_moe(self: ParallelConfig) -> bool:
             "mori_low_latency",
             "nixl_ep",
         )
+        and self.data_parallel_size > 1
         and self.enable_expert_parallel
         and self.tensor_parallel_size > 1
     )
 
 
-# Upstream additionally requires data_parallel_size > 1. On Ascend, FlashComm
-# supports the TP/EP, DP=1 topology and still needs SP's rank-local token layout.
+# Keep upstream's DP>1 requirement in the V4.1 performance branch. For DP=1,
+# SP forces K5 target graphs to multiples of lcm(6, TP), increasing c1-c8 work.
 ParallelConfig.use_sequence_parallel_moe = property(_use_sequence_parallel_moe)

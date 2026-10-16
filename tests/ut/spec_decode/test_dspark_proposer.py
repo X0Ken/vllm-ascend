@@ -267,6 +267,8 @@ class _DSparkProposerTestBase:
         hf_config: SimpleNamespace | None = None,
         draft_attn_causal: bool | None = None,
         draft_sample_method: str = "greedy",
+        graph_enabled: bool = False,
+        parent_graph: bool = True,
     ):
         device = torch.device("cpu")
         vllm_config = cls._make_vllm_config(hf_config or SimpleNamespace(), draft_sample_method)
@@ -278,6 +280,7 @@ class _DSparkProposerTestBase:
             runner: object | None = None,
         ) -> None:
             del runner
+            proposer.use_cuda_graph = parent_graph
             proposer.draft_model_config = vllm_config.speculative_config.draft_model_config
             proposer.num_speculative_tokens = block_size
             proposer.max_batch_size = num_reqs
@@ -300,6 +303,7 @@ class _DSparkProposerTestBase:
                 "vllm_ascend.worker.v1.spec_decode.dspark_proposer.get_ascend_config",
                 return_value=SimpleNamespace(
                     dynamic_spec_config=dynamic_spec_config,
+                    enable_dsv41_draft_graph=graph_enabled,
                 ),
             ),
         ):
@@ -713,6 +717,13 @@ class TestDummySlotMappingCleanup(_DSparkProposerTestBase):
 
 class TestDSparkInitialization(_DSparkProposerTestBase):
     """Tests for DSpark initialization configuration."""
+
+    @pytest.mark.parametrize("enabled,parent", [(False, True), (True, False), (True, True)])
+    def test_draft_graph_respects_parent_and_opt_in(self, enabled, parent):
+        proposer = self._make_proposer(
+            max_num_tokens=32, num_reqs=2, block_size=5, graph_enabled=enabled, parent_graph=parent
+        )
+        assert proposer.use_cuda_graph is (enabled and parent)
 
     @pytest.mark.parametrize(
         ("hf_config", "expected_sample_from_anchor", "expected_num_query_per_req", "draft_sample_method"),
@@ -1185,3 +1196,90 @@ class TestInitializeAttnBackend(_DSparkProposerTestBase):
         assert set(proposer.draft_attn_groups[0].layer_names) == set(draft_layers)
         assert proposer.draft_attn_groups[0].kv_cache_group_id == 0
         assert proposer._layer_group_idx == [0] * 5
+
+
+def test_v41_full_graph_pads_queries_and_trims_output(monkeypatch):
+    """A live row in a larger target bucket must replay a complete K5 block."""
+    import vllm_ascend.spec_decode.llm_base_proposer as module
+
+    p = AscendSpecDecodeBaseProposer.__new__(AscendSpecDecodeBaseProposer)
+    p.method, p.hidden_size, p.num_query_per_req = "dspark", 4, 5
+    p.use_cuda_graph, p.parallel_drafting, p.uses_mrope = True, True, False
+    p.dcp_size, p.supports_mm_inputs, p.enable_enpu = 1, False, False
+    p.draft_window_size = None
+    p.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(prefill_context_parallel_size=1))
+    p.model = SimpleNamespace(combine_hidden_states=lambda x: x)
+    p.runner = SimpleNamespace(
+        dcp_manager=None,
+        input_batch=SimpleNamespace(lora_id_to_lora_request={}),
+        _sync_metadata_across_dp=lambda n, **kwargs: (n, None, None),
+        dynamic_eplb=False,
+        device_metadata_executor=None,
+    )
+    p.query_start_loc = SimpleNamespace(cpu=torch.zeros(4, dtype=torch.int32), gpu=torch.zeros(4, dtype=torch.int32))
+    p.query_start_loc.copy_to_gpu = lambda: p.query_start_loc.gpu.copy_(p.query_start_loc.cpu)
+    p.query_start_loc_group = [torch.zeros(4, dtype=torch.int32)]
+    p.slot_mapping_group = [torch.full((10,), -1, dtype=torch.int32)]
+    p.seq_lens_group = [torch.zeros(3, dtype=torch.int32)]
+    p.positions, p.token_indices_to_sample = torch.zeros(10, dtype=torch.int32), torch.zeros(10, dtype=torch.int32)
+    cad = SimpleNamespace(
+        batch_size=lambda: 1,
+        num_reqs=1,
+        query_start_loc=torch.tensor([0, 5], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 5], dtype=torch.int32),
+        seq_lens=torch.tensor([13]),
+        seq_lens_cpu=torch.tensor([13]),
+        _seq_lens_cpu=torch.tensor([13]),
+        num_computed_tokens_cpu=None,
+        is_prefilling=torch.tensor([False]),
+        block_table_tensor=torch.ones((1, 2), dtype=torch.int32),
+        slot_mapping=torch.full((5,), -1),
+    )
+    p.set_inputs_first_pass = lambda **kwargs: (5, torch.arange(5), cad, None)
+    p._pad_draft_buffers = MagicMock()
+    p.draft_attn_groups = [MagicMock()]
+    p._maybe_update_metadata = MagicMock()
+    p._update_full_graph_params_if_needed = MagicMock()
+    p._context_slot_mapping_buffers = object()
+    events = []
+
+    def build_metadata(*args):
+        assert cad.query_start_loc.tolist() == [0, 5, 10]
+        assert cad.seq_lens.tolist() == [13, 0]
+        assert cad.is_prefilling.tolist() == [False, False]
+        assert cad.num_actual_tokens == cad.num_input_tokens == 10
+        meta = SimpleNamespace(num_prefills=0)
+        return [{"draft.attn": meta}], meta
+
+    p.build_draft_attn_metadata = build_metadata
+    p.build_model_inputs_first_pass = lambda *args: events.append("context-kv")
+
+    def replay(**kwargs):
+        assert events == ["context-kv"]
+        events.append("query-graph")
+        return torch.ones((2, 5), dtype=torch.int64)
+
+    p._runnable = replay
+
+    @contextmanager
+    def forward_context(*args, **kwargs):
+        assert kwargs["aclgraph_runtime_mode"] == CUDAGraphMode.FULL
+        assert kwargs["batch_descriptor"].num_tokens == 10
+        yield
+
+    monkeypatch.setattr(module, "_HIDDEN_STATE_DRAFTER_TYPES", (object,))
+    monkeypatch.setattr(module, "set_ascend_forward_context", forward_context)
+    monkeypatch.setattr(module, "get_forward_context", lambda: SimpleNamespace())
+    result = p._propose(
+        5,
+        torch.ones(6, dtype=torch.int64),
+        torch.zeros(6, dtype=torch.int32),
+        torch.ones((6, 4)),
+        torch.ones(1, dtype=torch.int64),
+        torch.arange(5),
+        cad,
+        SimpleNamespace(uniform=True, num_reqs=2),
+        MagicMock(),
+    )
+    assert result.shape == (1, 5)
+    assert events == ["context-kv", "query-graph"]
