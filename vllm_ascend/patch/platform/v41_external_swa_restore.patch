@@ -1,0 +1,340 @@
+diff --git a/tests/v1/core/test_single_type_kv_cache_manager.py b/tests/v1/core/test_single_type_kv_cache_manager.py
+index f20a96f5cc..e0de2d6cb3 100644
+--- a/tests/v1/core/test_single_type_kv_cache_manager.py
++++ b/tests/v1/core/test_single_type_kv_cache_manager.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import random
++from types import SimpleNamespace
+ 
+ import pytest
+ import torch
+@@ -914,3 +915,160 @@ def test_predictor_matches_allocator_blocks_calculation_with_admission_cap():
+             f"but allocator pulled {len(new_blocks)}"
+         )
+         total_computed = num_tokens
++
++
++@pytest.mark.parametrize("window", [128, 256])
++@pytest.mark.parametrize("use_eagle", [False, True])
++@pytest.mark.parametrize("common_rewind", [0, 128])
++@pytest.mark.parametrize("retention", [None, 0, 256])
++def test_external_swa_restore_remains_reusable(
++    window, use_eagle, common_rewind, retention
++):
++    """External adoption must restore the full next-lookup window, without leaks."""
++    block_size = 128
++    spec = SlidingWindowSpec(
++        block_size=block_size,
++        num_kv_heads=1,
++        head_size=1,
++        dtype=torch.float32,
++        sliding_window=window,
++    )
++    pool = BlockPool(num_gpu_blocks=64, enable_caching=True, hash_block_size=block_size)
++    manager = get_sliding_window_manager(spec, pool)
++    manager.use_eagle = use_eagle
++    manager.external_prefix_rewind_tokens = common_rewind
++    restored_tokens = 10 * block_size
++    prompt_tokens = restored_tokens + 17
++    request = SimpleNamespace(
++        request_id="restore",
++        num_prompt_tokens=prompt_tokens,
++        shared_prefix_boundary=None,
++        block_hashes=[BlockHash(str(i).encode()) for i in range(12)],
++    )
++    predicted = manager.get_num_blocks_to_allocate(
++        request.request_id, prompt_tokens, [], restored_tokens, 0, prompt_tokens
++    )
++    free_before = pool.get_num_free_blocks()
++    manager.add_local_computed_blocks(request.request_id, [], 0, restored_tokens)
++    manager.allocate_external_computed_blocks(request.request_id, 0, restored_tokens)
++    manager.allocate_new_blocks(request.request_id, prompt_tokens, prompt_tokens)
++    assert free_before - pool.get_num_free_blocks() == predicted
++    manager.cache_blocks(
++        request,
++        restored_tokens,
++        retention_interval=retention,
++        replay_boundaries=[prompt_tokens - 1],
++    )
++    pool.free_blocks(manager.pop_blocks_for_free(request.request_id))
++    expected = restored_tokens - (block_size if use_eagle else 0)
++    for max_length in (prompt_tokens - 1, prompt_tokens + 2 * block_size):
++        _, hit = manager.find_longest_cache_hit(
++            request.block_hashes, max_length, [0], pool, spec, use_eagle, block_size
++        )
++        assert hit == expected
++    if common_rewind and not use_eagle:
++        # Target SWA must also serve the boundary selected by its draft sibling.
++        _, rewind_hit = manager.find_longest_cache_hit(
++            request.block_hashes,
++            restored_tokens - common_rewind,
++            [0],
++            pool,
++            spec,
++            False,
++            block_size,
++        )
++        assert rewind_hit == restored_tokens - common_rewind
++    assert pool.get_num_free_blocks() == pool.num_gpu_blocks - 1
++    computed, hit = manager.find_longest_cache_hit(
++        request.block_hashes,
++        prompt_tokens - 1,
++        [0],
++        pool,
++        spec,
++        use_eagle,
++        block_size,
++    )
++    request.request_id = "mixed-local-external"
++    predicted = manager.get_num_blocks_to_allocate(
++        request.request_id,
++        prompt_tokens,
++        computed[0],
++        restored_tokens,
++        hit,
++        prompt_tokens,
++    )
++    free_before = pool.get_num_free_blocks()
++    manager.add_local_computed_blocks(
++        request.request_id, computed[0], hit, restored_tokens - hit
++    )
++    manager.allocate_external_computed_blocks(
++        request.request_id, hit, restored_tokens - hit
++    )
++    manager.allocate_new_blocks(request.request_id, prompt_tokens, prompt_tokens)
++    assert free_before - pool.get_num_free_blocks() == predicted
++    manager.cache_blocks(
++        request,
++        restored_tokens,
++        retention_interval=retention,
++        replay_boundaries=[prompt_tokens - 1],
++    )
++    pool.free_blocks(manager.pop_blocks_for_free(request.request_id))
++    assert pool.get_num_free_blocks() == pool.num_gpu_blocks - 1
++
++
++def test_swa_missing_latest_checkpoint_falls_back_to_older_window():
++    """A missing tail must not discard a complete older EAGLE checkpoint."""
++    block_size = 128
++    spec = SlidingWindowSpec(
++        block_size=block_size,
++        num_kv_heads=1,
++        head_size=1,
++        dtype=torch.float32,
++        sliding_window=128,
++    )
++    pool = BlockPool(num_gpu_blocks=64, enable_caching=True, hash_block_size=block_size)
++    manager = get_sliding_window_manager(spec, pool)
++    manager.use_eagle = True
++    request = SimpleNamespace(
++        request_id="cold",
++        num_prompt_tokens=1297,
++        shared_prefix_boundary=None,
++        block_hashes=[BlockHash(str(i).encode()) for i in range(12)],
++    )
++    manager.allocate_new_blocks(request.request_id, 1297, 1297)
++    manager.cache_blocks(
++        request, 1280, replay_boundaries=[request.num_prompt_tokens - 1]
++    )
++    latest = manager.req_to_blocks[request.request_id][9].block_id
++    pool.free_blocks(manager.pop_blocks_for_free(request.request_id))
++    pool.evict_blocks({latest})
++    _, hit = manager.find_longest_cache_hit(
++        request.block_hashes, 1296, [0], pool, spec, True, block_size
++    )
++    assert hit == 8 * block_size
++    assert pool.get_num_free_blocks() == pool.num_gpu_blocks - 1
++
++
++@pytest.mark.parametrize("extra_retained", [0, 128, 512])
++@pytest.mark.parametrize("external", [0, 128, 1024])
++def test_external_restore_preserves_multi_module_replay_history(
++    extra_retained, external
++):
++    """Adoption must not free history already required by the 0.31 MTP runner."""
++    spec = SlidingWindowSpec(
++        block_size=128,
++        num_kv_heads=1,
++        head_size=1,
++        dtype=torch.float32,
++        sliding_window=256,
++    )
++    pool = BlockPool(num_gpu_blocks=32, enable_caching=True, hash_block_size=128)
++    manager = get_sliding_window_manager(spec, pool)
++    manager.extra_retained_tokens = extra_retained
++    manager.external_prefix_rewind_tokens = 128
++    actual = manager.get_num_skipped_tokens_for_external(1280, external)
++    if external == 0:
++        assert actual == manager.get_num_skipped_tokens(1280)
++    else:
++        assert actual == max(0, 1280 - 256 + 1 - max(extra_retained, 128))
++        assert actual <= manager.get_num_skipped_tokens(1280)
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index daf0cd12c0..2c98514cf6 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -147,6 +147,12 @@ class KVCacheCoordinator(ABC):
+             )
+             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
+         )
++        # Windowed groups must retain history for the common EAGLE rewind.
++        for manager in self.single_type_managers:
++            manager.external_prefix_rewind_tokens = (
++                self.scheduler_block_size if self.eagle_group_ids else 0
++            )
++
+         # Match Mamba checkpoints to Eagle's attention replay boundary.
+         if use_eagle:
+             for manager in self.single_type_managers:
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index a097c9e924..c27ffbbcff 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -48,6 +48,13 @@ if TYPE_CHECKING:
+ logger = init_logger(__name__)
+ 
+ 
++def sliding_window_restore_start(
++    num_tokens: int, sliding_window: int, rewind_tokens: int = 0
++) -> int:
++    """First token needed to restore a window and its replay history."""
++    return max(0, num_tokens - sliding_window + 1 - rewind_tokens)
++
++
+ class SingleTypeKVCacheManager(ABC):
+     """An abstract base class for a manager that handle the kv cache management
+     logic of one specific type of attention layer.
+@@ -141,6 +148,7 @@ class SingleTypeKVCacheManager(ABC):
+         # aligned segment (SWA). Initialized lazily by the coordinator after
+         # determining the attention groups.
+         self.use_eagle = False
++        self.external_prefix_rewind_tokens = 0
+         # ``CacheConfig.enable_mamba_shared_prefix_checkpoint``, narrowed and set
+         # by ``KVCacheManager``; only an EAGLE Mamba "align" group ever gets it.
+         self.shared_prefix_checkpoint = False
+@@ -175,6 +183,12 @@ class SingleTypeKVCacheManager(ABC):
+             and num_local_computed_tokens % self.block_size != 0
+         )
+ 
++    def get_num_skipped_tokens_for_external(
++        self, num_computed_tokens: int, num_external_computed_tokens: int
++    ) -> int:
++        """Return the allocation skip while adopting external computed tokens."""
++        return self.get_num_skipped_tokens(num_computed_tokens)
++
+     def get_num_blocks_to_allocate(
+         self,
+         request_id: str,
+@@ -237,7 +251,9 @@ class SingleTypeKVCacheManager(ABC):
+             # num_required_blocks may be smaller than num_req_blocks.
+             return max(num_required_blocks - num_req_blocks, 0)
+ 
+-        num_skipped_tokens = self.get_num_skipped_tokens(total_computed_tokens)
++        num_skipped_tokens = self.get_num_skipped_tokens_for_external(
++            total_computed_tokens, total_computed_tokens - num_local_computed_tokens
++        )
+         num_local_computed_blocks = len(new_computed_blocks) + num_req_blocks
+         # Number of whole blocks that are skipped by the attention window.
+         # If nothing is skipped, this is 0.
+@@ -295,7 +311,9 @@ class SingleTypeKVCacheManager(ABC):
+         num_total_computed_tokens = (
+             num_local_computed_tokens + num_external_computed_tokens
+         )
+-        num_skipped_tokens = self.get_num_skipped_tokens(num_total_computed_tokens)
++        num_skipped_tokens = self.get_num_skipped_tokens_for_external(
++            num_total_computed_tokens, num_external_computed_tokens
++        )
+         num_skipped_blocks = num_skipped_tokens // self.block_size
+         if num_skipped_blocks > 0:
+             # It is possible that all new computed blocks are skipped when
+@@ -347,7 +365,9 @@ class SingleTypeKVCacheManager(ABC):
+         num_total_computed_tokens = (
+             num_local_computed_tokens + num_external_computed_tokens
+         )
+-        num_skipped_tokens = self.get_num_skipped_tokens(num_total_computed_tokens)
++        num_skipped_tokens = self.get_num_skipped_tokens_for_external(
++            num_total_computed_tokens, num_external_computed_tokens
++        )
+         if num_skipped_tokens > 0:
+             # Some external computed tokens may be skipped too.
+             num_external_computed_tokens = min(
+@@ -510,6 +530,12 @@ class SingleTypeKVCacheManager(ABC):
+         if request.shared_prefix_boundary:
+             reachable_boundaries.append(request.shared_prefix_boundary)
+ 
++        restore_kwargs = {}
++        if isinstance(self.kv_cache_spec, SlidingWindowSpec):
++            restore_kwargs["external_prefix_rewind_tokens"] = max(
++                self.external_prefix_rewind_tokens,
++                self.block_size if self.use_eagle else 0,
++            )
+         block_mask = self.reachable_block_mask(
+             start_block=num_cached_blocks,
+             end_block=num_full_blocks,
+@@ -519,6 +545,7 @@ class SingleTypeKVCacheManager(ABC):
+             retention_interval=retention_interval,
+             reachable_boundaries=reachable_boundaries,
+             dcp_world_size=self.dcp_world_size,
++            **restore_kwargs,
+         )
+         self.block_pool.cache_full_blocks(
+             request=request,
+@@ -1080,6 +1107,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
+         reachable_boundaries: Sequence[int] = (),
+         dcp_world_size: int = 1,
+         final_segment_end_block: int | None = None,
++        external_prefix_rewind_tokens: int = 0,
+     ) -> list[bool] | None:
+         assert isinstance(kv_cache_spec, SlidingWindowSpec)
+         if alignment_tokens is None:
+@@ -1148,8 +1176,48 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
+                 for j in range(max(start_block, end - need), min(end_block, end)):
+                     mask[j - start_block] = True
+ 
++        # Keep the same restore window used by allocation and external loading.
++        # Existing tails above also preserve the EAGLE proof block.
++        if external_prefix_rewind_tokens:
++            restore_boundaries = set(reachable_boundaries)
++            if segment_tokens is not None:
++                first = cdiv(start_block * block_size, segment_tokens)
++                last = end_block * block_size // segment_tokens
++                restore_boundaries.update(
++                    n * segment_tokens for n in range(max(1, first), last + 1)
++                )
++            for boundary in restore_boundaries:
++                boundary = boundary // alignment_tokens * alignment_tokens
++                first_block = (
++                    sliding_window_restore_start(
++                        boundary,
++                        kv_cache_spec.sliding_window,
++                        external_prefix_rewind_tokens,
++                    )
++                    // block_size
++                )
++                last_block = boundary // block_size
++                for j in range(
++                    max(start_block, first_block), min(end_block, last_block)
++                ):
++                    mask[j - start_block] = True
+         return mask
+ 
++    def get_num_skipped_tokens_for_external(
++        self, num_computed_tokens: int, num_external_computed_tokens: int
++    ) -> int:
++        if num_external_computed_tokens <= 0:
++            return self.get_num_skipped_tokens(num_computed_tokens)
++        return sliding_window_restore_start(
++            num_computed_tokens,
++            self.sliding_window,
++            max(
++                self.external_prefix_rewind_tokens,
++                self.extra_retained_tokens,
++                self.block_size if self.use_eagle else 0,
++            ),
++        )
++
+     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
+         """Get the number of tokens that will be skipped for attention computation.
+ 

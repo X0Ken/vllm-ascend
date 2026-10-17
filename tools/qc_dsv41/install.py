@@ -26,21 +26,22 @@ subprocess.run(
     ["python3", "-m", "pip", "install", "--no-deps", "--no-build-isolation", "-e", str(repo)], env=env, check=True
 )
 subprocess.run(["python3", str(repo / "tools/qc_dsv41/normalize_metadata.py")], check=True)
-subprocess.run(
-    ["patch", "--batch", "--fuzz=0", "-p1", "-i", str(repo / "vllm_ascend/patch/platform/v41_prefill_barrier.patch")],
-    cwd="/vllm-workspace/vllm",
-    check=True,
-)
-subprocess.run(
-    [
-        "patch",
-        "--batch",
-        "--fuzz=0",
-        "-p1",
-        "-i",
-        str(repo / "vllm_ascend/patch/platform/v41_repetition_defaults.patch"),
-    ],
-    cwd="/vllm-workspace/vllm",
-    check=True,
-)
+for patch_name in (
+    "v41_prefill_barrier.patch",
+    "v41_repetition_defaults.patch",
+    "v41_external_swa_restore.patch",
+):
+    subprocess.run(
+        [
+            "patch",
+            "--batch",
+            "--forward",
+            "--fuzz=0",
+            "-p1",
+            "-i",
+            str(repo / "vllm_ascend/patch/platform" / patch_name),
+        ],
+        cwd="/vllm-workspace/vllm",
+        check=True,
+    )
 subprocess.run(["python3", str(repo / "tools/qc_dsv41/build_joint.py")], env=env, check=True)
