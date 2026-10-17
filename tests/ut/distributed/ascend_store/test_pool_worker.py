@@ -702,6 +702,37 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         hits = [[16, 32, 48], [32, 48], [16, 32], [32, 48, 64]]
         self.assertEqual(32, cls._max_intersection_hit_position(hits))
 
+    def test_external_lookup_intersects_complete_windows_across_rank_keys(self):
+        import torch
+        from vllm.v1.kv_cache_interface import KVCacheGroupSpec, SlidingWindowSpec
+
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import AscendStoreCoordinator
+
+        cls = self._make_worker_class()
+        worker = object.__new__(cls)
+        spec = SlidingWindowSpec(block_size=128, num_kv_heads=1, head_size=1, dtype=torch.float32, sliding_window=256)
+        worker.cache_coordinator = AscendStoreCoordinator([KVCacheGroupSpec(["swa"], spec)], 128, 128, [128], ["swa"])
+        worker.hash_block_size = 128
+        worker.num_kv_cache_groups = 1
+        hashes = [bytes([i]) * 32 for i in range(6)]
+        worker.token_database = MagicMock()
+        worker.token_database.get_block_size.return_value = 128
+        worker.token_database.hash_block_size = 128
+        worker.token_database.process_token_key_strings.side_effect = lambda *args, **kwargs: [
+            (i * 128, (i + 1) * 128, str(i), h) for i, h in enumerate(hashes)
+        ]
+        worker._expand_lookup_key_variants = lambda key, *args: [f"{key}:0", f"{key}:1"]
+        present = [{0, 1, 4, 5}, {0, 1, 3, 4}]
+        worker.m_store = MagicMock()
+        worker.m_store.exists.side_effect = lambda keys: [
+            int(int(key.split(":")[0]) in present[int(key.split(":")[1])]) for key in keys
+        ]
+        self.assertEqual(worker._lookup_with_coordinator(768, hashes, [0], False, True), 256)
+        worker.m_store.exists.return_value = []
+        worker.m_store.exists.side_effect = lambda keys: [1] * (len(keys) - 1)
+        with self.assertRaisesRegex(RuntimeError, "count mismatch"):
+            worker._lookup_with_coordinator(768, hashes, [0], False, True)
+
     def _make_sparse_swa_coordinator(self):
         import torch
         from vllm.v1.kv_cache_interface import KVCacheGroupSpec, SlidingWindowSpec
@@ -746,7 +777,7 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         worker.token_database.process_token_key_strings.side_effect = process_token_key_strings
         return worker
 
-    def test_external_coordinator_lookup_uses_only_lookup_mask(self):
+    def test_external_coordinator_rejects_incomplete_window_tail(self):
         cls = self._make_worker_class()
         worker = self._make_lookup_worker(cls, self._make_sparse_swa_coordinator())
         worker.m_store.exists.return_value = [1]
@@ -766,9 +797,8 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
                 include_all_ranks=False,
             )
 
-        # Only the reachable tail block is queried; its presence covers the
-        # whole segment, so the hit still spans the full token length.
-        self.assertEqual(hit, 256)
+        # A tail hit alone cannot restore the complete sliding window.
+        self.assertEqual(hit, 0)
         worker.m_store.exists.assert_called_once_with(["key1"])
         store_mask.assert_not_called()
         worker.token_database.process_tokens.assert_not_called()

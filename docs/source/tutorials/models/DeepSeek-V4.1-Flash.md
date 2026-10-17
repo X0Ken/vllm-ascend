@@ -922,14 +922,14 @@ the SWA window.
 node with TP8/DP1/EP8 and
 `chiro2001/DeepSeek-V4.1-Flash-w4a8-Ascend`. The build pins the tested
 `nightly-main` digest and the vLLM 0.31.0 source revision. Provide a clean
-vLLM `db9527a46873454610df6dbedf79a36d6bf1a7f6` source tree as
+vLLM `4cd1027fc214169d835a45502805fab0cbda9749` source tree (the QC v0.31 port of external SWA restore history) as
 `vllm-source/` in the build context. The installer applies the QC core
 patches and builds the Rust parser, Ascend operators and Joint operator.
 
 ```shell
 docker build -f Dockerfile.qc-dsv41 \
   --build-arg SOURCE_COMMIT="$(git rev-parse HEAD)" \
-  -t vllm-ascend-qc-dsv41:vllm-update .
+  -t vllm-ascend-qc-dsv41:p9-20261017 .
 ```
 
 The image installs and preloads jemalloc 5.2.1 and checks its library SHA256
@@ -950,6 +950,7 @@ vllm serve "${MODEL_DIR:?}" \
   --max-model-len 1048576 --max-num-batched-tokens 8192 --max-num-seqs 32 \
   --gpu-memory-utilization 0.90 --safetensors-load-strategy lazy \
   --async-scheduling --enable-prefix-caching --no-swa-bounded-replay \
+  --default-repetition-detection-config '{"min_pattern_size":8,"max_pattern_size":512,"min_count":8}' \
   --enable-auto-tool-choice --tool-call-parser deepseek_v41 \
   --engram-config '{"cpu_offload":true,"dp_shared_memory":false}' \
   --speculative-config '{"method":"dspark","num_speculative_tokens":5,"enforce_eager":false}' \
@@ -965,3 +966,28 @@ only to existing full-width decode requests using V4.1 metadata builders. The
 correction still executes after forward submission; new, resumed and prefill
 requests keep the original ordering. Runtime logs identify when this guarded
 path is exercised.
+
+### 13.1 P9 shared CPU KV deployment
+
+The `p9-20261017` profile pairs the vLLM 0.31 port of
+`e100dddfd91e99d4ac90c28be82cdf4f73346c65` with the Ascend port of
+`6ac6e501614f85e5d7731c1ffd9d1f8db855e211`. Use both components together.
+External lookup intersects complete windows across every cache group and
+physical rank/layer key. Allocation, loading and retention preserve the common
+EAGLE rewind window. The port keeps 0.31 multi-module history retention,
+DCP-scaled masks, PCP replica key sharing and bounded layerwise readability
+queries. An arithmetic trim after lookup cannot replace window validation.
+
+Nodes 193 and 240 use separate TP8/DP1/EP8 model instances and one dedicated
+Mooncake Master at `172.20.84.240:50097` (metrics `9017`). Each rank contributes
+64 GiB of CPU KV, for 512 GiB per node and 1 TiB total. Keep the existing
+`defer_setup` and `release_model_file_cache` settings. Both instances must use
+the same weights, key geometry and paired code versions. Before replacing an
+older provider, drain all consumers and wait for clients, keys, capacity and
+allocated bytes to reach zero; preserve the Master process.
+
+Serve on port `8941` with lookup RPC port `19017` on each node. Keep the
+instances outside the production Router. Set `VLLM_HOST_IP` and `HCCL_IF_IP`
+to the individual node IP, use node-local read-only weights, and pass the
+profile above with the shared connector configuration. Preserve existing
+node API credentials in protected files.

@@ -346,6 +346,13 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         # NOTE: use 16k as the alignment tokens for model with compress ratio
         block_sizes = [self._get_effective_block_size(group.spec) for group in self.attention_groups]
         self.lcm_block_size = lcm(*block_sizes)
+        # This constructor recreates the upstream managers. Restore the common
+        # rewind requirement for target SWA as well as the EAGLE draft group.
+        rewind_tokens = (
+            (getattr(self, "scheduler_block_size", None) or self.lcm_block_size) if self.eagle_group_ids else 0
+        )
+        for manager in self.single_type_managers:
+            manager.external_prefix_rewind_tokens = rewind_tokens
 
     def find_longest_cache_hit(
         self,

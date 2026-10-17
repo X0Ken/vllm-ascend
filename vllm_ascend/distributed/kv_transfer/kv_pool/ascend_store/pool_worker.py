@@ -21,6 +21,7 @@ from vllm.distributed import (
 )
 from vllm.distributed.kv_events import BlockStored
 from vllm.logger import logger
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import BlockHash, maybe_convert_block_hash
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
@@ -83,6 +84,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     LayerMultiBlockReqMeta,
     LayerTransferTask,
     ReqMeta,
+    block_hash_to_bytes,
     block_hash_to_str,
     get_block_hashes,
     get_group_block_size,
@@ -3609,6 +3611,8 @@ class KVPoolWorker:
             return None
         coordinator = self.cache_coordinator
 
+        group_rank_hits: dict[int, list[set[bytes]]] = {}
+
         def query_group_hits(
             group_id: int,
             group_block_hashes: Sequence[BlockHash | str],
@@ -3645,13 +3649,20 @@ class KVPoolWorker:
                 chunk_hashes.append(chunk_hash)
                 variant_counts.append(len(variants))
 
+            rank_count = variant_counts[0] if variant_counts else 1
+            rank_hits = [{block_hash_to_bytes(h) for h in present} for _ in range(rank_count)]
+            group_rank_hits[group_id] = rank_hits
             if keys:
-                res = self.m_store.exists(keys)  # type: ignore[assignment]
+                res = self.m_store.exists(keys)
+                if len(res) != len(keys):
+                    raise RuntimeError(f"KV pool exists count mismatch: expected={len(keys)}, actual={len(res)}")
                 offset = 0
                 for chunk_hash, count in zip(chunk_hashes, variant_counts, strict=True):
-                    values = res[offset : offset + count]  # type: ignore[index]
-                    if values and all(value == 1 for value in values):
-                        present.append(chunk_hash)
+                    if count != rank_count:
+                        raise RuntimeError("KV pool rank shard count changed within one group")
+                    for rank, value in enumerate(res[offset : offset + count]):
+                        if value == 1:
+                            rank_hits[rank].add(block_hash_to_bytes(chunk_hash))
                     offset += count
 
             logger.debug(
@@ -3664,12 +3675,15 @@ class KVPoolWorker:
             )
             return present
 
-        return coordinator.find_reachable_hit_tokens(
-            block_hashes,
-            token_len,
-            query_group_hits,
-            log_context="KV pool coordinator lookup",
-        )
+        aligned_len = cdiv(token_len, coordinator.lcm_block_size) * coordinator.lcm_block_size
+        masks = coordinator.lookup_mask(aligned_len)
+        for group_id in sorted(coordinator.cacheable_group_ids):
+            hashes = get_block_hashes(
+                block_hashes, coordinator.group_effective_block_sizes[group_id], self.hash_block_size
+            )
+            query_group_hits(group_id, hashes, masks[group_id])
+        candidates = coordinator.restorable_prefixes(block_hashes, token_len, group_rank_hits)
+        return candidates[-1] if candidates else 0
 
     def lookup_scheduler(
         self,
