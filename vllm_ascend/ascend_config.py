@@ -572,6 +572,16 @@ class AscendConfig:
     enable_dsv41_inline_metadata: bool = False
     # Submit GPU-exact V4.1 decode before correcting optimistic CPU counts.
     enable_dsv41_deferred_corrections: bool = False
+    # Optional ports from chiro2001/deepseek-v4.1-flash-ascend910B.
+    # Keep device-dependent changes opt-in until validated on the serving stack.
+    enable_dsv41_moe_allgather: bool = False
+    enable_dsv41_moe_mask_range: bool = False
+    enable_dsv41_o_proj_2d: bool = False
+    enable_dsv41_qli_no_candidate: bool = False
+    enable_dsv41_engram_wkv_tp: bool = False
+    enable_dsv41_kv_repack: bool = False
+    enable_dsv41_admission_gate: bool = False
+    dsv41_gate_max_prefills: int = 1
     multistream_dsv4_dsa_overlap: bool = True
     # Prepare Engram hashes, lookups and DP/TP exchanges on an auxiliary stream;
     # FULL graphs wait on descriptor-specific external events at consumers.
@@ -663,6 +673,13 @@ class AscendConfig:
     _sparse_li_c4_layer_ids: set[int] = dataclasses.field(default_factory=set, init=False, repr=False)
     _sparse_li_c4_layer_names: set[str] = dataclasses.field(default_factory=set, init=False, repr=False)
     _sparse_li_layer_filter_enabled: bool = dataclasses.field(default=False, init=False, repr=False)
+
+    @field_validator("dsv41_gate_max_prefills", mode="before")
+    @classmethod
+    def _validate_gate_max_prefills(cls, value):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError("dsv41_gate_max_prefills must be a positive integer")
+        return value
 
     @model_validator(mode="after")
     def _validate_user_input_ranges(self):

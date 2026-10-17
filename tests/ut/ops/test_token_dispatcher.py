@@ -1054,3 +1054,34 @@ class TestTokenDispatcherWithAll2AllV(TestBase):
         self.assertIsNotNone(result.group_list)
         self.assertIsNotNone(result.dynamic_scale)
         self.assertEqual(result.group_list_type, 1)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("rank", [0, 1, 3])
+def test_contiguous_expert_mask_matches_indexed_map(dtype, rank):
+    from vllm_ascend.ops.fused_moe.token_dispatcher import ContiguousExpertRange
+
+    expert_map = torch.full((16,), -1, dtype=torch.int32)
+    first, last = rank * 4, (rank + 1) * 4
+    expert_map[first:last] = torch.arange(4, dtype=torch.int32)
+    ids = torch.tensor([[0, 3, 4, 7], [8, 11, 12, 15]], dtype=dtype)
+    cache = ContiguousExpertRange()
+    expected = expert_map[ids] != -1
+    assert torch.equal(cache.mask(expert_map, ids, first, last), expected)
+    assert cache.bounds[0].dtype == dtype
+    assert torch.equal(cache.mask(expert_map, ids, first, last, capturing=True), expected)
+    assert cache.mask(expert_map, ids[:0], first, last).shape == (0, 4)
+
+
+def test_expert_range_invalidates_after_remap_and_falls_back_during_capture():
+    from vllm_ascend.ops.fused_moe.token_dispatcher import ContiguousExpertRange
+
+    expert_map = torch.tensor([0, 1, -1, -1], dtype=torch.int32)
+    ids = torch.arange(4, dtype=torch.int32)
+    cache = ContiguousExpertRange()
+    assert torch.equal(cache.mask(expert_map, ids, 0, 2, capturing=True), expert_map[ids] != -1)
+    assert cache.expert_map is None
+    cache.mask(expert_map, ids, 0, 2)
+    expert_map[:] = torch.tensor([-1, 0, -1, 1])
+    assert torch.equal(cache.mask(expert_map, ids, 0, 2), expert_map[ids] != -1)
+    assert cache.bounds is None

@@ -402,6 +402,12 @@ def select_moe_comm_method(
         # is a single fused C++ op. This covers both normal model
         # forward and _dummy_run during profile_run.
         moe_comm_type = MoECommType.ALLTOALL
+    elif getattr(get_ascend_config(), "enable_dsv41_moe_allgather", False) is True and getattr(
+        vllm_config.model_config.hf_text_config, "model_type", ""
+    ) in ("deepseek_v41", "deepseek_v41_text", "deepseek_v4.1_text"):
+        # Keep LoRA's AllToAll requirement above this override. Other models
+        # retain their hardware policy, including draft-model selection.
+        moe_comm_type = MoECommType.ALLGATHER
     elif moe_comm_policy is MoECommPolicy.ALLGATHER:
         moe_comm_type = MoECommType.ALLGATHER
     else:

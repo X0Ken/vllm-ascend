@@ -8,6 +8,7 @@ from torch import nn
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.dsa_v41 import (
     DeepseekV41CacheLayer,
     scatter_cache_sk,
@@ -48,6 +49,7 @@ class DeepseekV41Indexer(nn.Module):
         super().__init__()
         self.owns_k = owns_k
         self.packed_cache_ops = DeviceOperator.get_dsv41_packed_cache_ops()
+        self.no_candidate = getattr(get_ascend_config(), "enable_dsv41_qli_no_candidate", False) is True
         self.compress_ratio = compress_ratio
         self.n_heads = int(config.index_n_heads)
         self.width = int(config.index_head_dim)
@@ -271,6 +273,11 @@ class DeepseekV41Indexer(nn.Module):
         )
         op_metadata = source_metadata.qli_metadata
         wait_for_device_metadata(DeviceMetadataStage.INDEXER, id(op_metadata))
+        if self.no_candidate:
+            # Search the full source at every layer. Do not pass a stale
+            # candidate tensor to the native op in unfiltered mode.
+            is_candidate_source = False
+            uses_candidate_filter = False
         mode = 1 if is_candidate_source else 2 if uses_candidate_filter else 3
         selected, _, candidate_out = torch.ops._C_ascend.npu_quant_lightning_indexer_v3(
             quantized_query,

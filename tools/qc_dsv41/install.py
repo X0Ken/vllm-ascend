@@ -30,6 +30,8 @@ for patch_name in (
     "v41_prefill_barrier.patch",
     "v41_repetition_defaults.patch",
     "v41_external_swa_restore.patch",
+    "v41_frontend_compat.patch",
+    "v41_admission_gate.patch",
 ):
     subprocess.run(
         [
@@ -44,4 +46,7 @@ for patch_name in (
         cwd="/vllm-workspace/vllm",
         check=True,
     )
+# Renderers live in Rust as well as Python. Build only after applying the
+# frontend patch so the packaged server executes the corrected renderer.
+subprocess.run(["python3", str(repo / "tools/qc_dsv41/build_rust.py")], env=env, check=True)
 subprocess.run(["python3", str(repo / "tools/qc_dsv41/build_joint.py")], env=env, check=True)

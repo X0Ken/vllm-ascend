@@ -16,6 +16,7 @@ from vllm_ascend.core.kv_cache_interface import (
 )
 from vllm_ascend.models.deepseek_v41.cache_config import (
     STATE_RING_ROWS,
+    get_deepseek_v41_cache_offsets,
     get_deepseek_v41_kv_cache_config,
     get_deepseek_v41_pool_bytes_per_block,
     group_cache_specs,
@@ -315,6 +316,7 @@ def allocate_cache_views(config, device="cpu"):
     from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
     specs = {n: s for g in config.kv_cache_groups for n, s in g.kv_cache_spec.kv_cache_specs.items()}
+    offsets = get_deepseek_v41_cache_offsets(config.kv_cache_groups)
     backings, caches = [], {}
     for allocation in config.kv_cache_tensors:
         raw = torch.zeros(allocation.size, dtype=torch.uint8, device=device)
@@ -324,11 +326,9 @@ def allocate_cache_views(config, device="cpu"):
             shape = (config.num_blocks, get_storage_block_size(spec), spec.num_kv_heads, spec.head_size)
             shapes = [shape]
             dtypes = [spec.dtype]
-            offset = 0
+            offset = offsets[name]
             is_index = isinstance(spec, AscendMLAAttentionSpec) and spec.scale_dim
             if is_index:
-                source_name = name.removesuffix(".indexer.k_cache") + ".long_kv_cache"
-                offset = specs[source_name].unpadded_page_size_bytes
                 shapes.append((config.num_blocks, get_storage_block_size(spec), spec.num_kv_heads, spec.scale_dim))
                 dtypes.append(spec.scale_dtype)
             views = NPUModelRunner._adjust_kv_layout(

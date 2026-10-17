@@ -25,6 +25,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import PropertyMock, patch
 
+import pytest
 from vllm.config import DeviceConfig, KVTransferConfig
 from vllm.config import VllmConfig as _VllmConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -2179,3 +2180,36 @@ class TestEngramSharedMemoryDefaults(TestBase):
         config.engram_config = None
         AscendConfig(sparse_kv_offload_config=SparseKVOffloadConfig()).derive_and_validate(config)
         self.assertIsNone(config.engram_config)
+
+
+@pytest.mark.parametrize("enabled", [False, True, "false", "true"])
+def test_dsv41_port_switches(enabled):
+    names = (
+        "enable_dsv41_moe_allgather",
+        "enable_dsv41_moe_mask_range",
+        "enable_dsv41_o_proj_2d",
+        "enable_dsv41_qli_no_candidate",
+        "enable_dsv41_engram_wkv_tp",
+        "enable_dsv41_kv_repack",
+        "enable_dsv41_admission_gate",
+    )
+    defaults = AscendConfig(sparse_kv_offload_config=SimpleNamespace(enabled=False))
+    assert all(getattr(defaults, name) is False for name in names)
+    config = AscendConfig(sparse_kv_offload_config=SimpleNamespace(enabled=False), **dict.fromkeys(names, enabled))
+    assert all(getattr(config, name) is (enabled in (True, "true")) for name in names)
+    assert config.dsv41_gate_max_prefills == 1
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "2"])
+def test_dsv41_port_gate_rejects_invalid_limit(value):
+    with pytest.raises(ValueError, match="positive integer"):
+        AscendConfig(sparse_kv_offload_config=SimpleNamespace(enabled=False), dsv41_gate_max_prefills=value)
+
+
+def test_dsv41_port_gate_accepts_positive_limit():
+    assert (
+        AscendConfig(
+            sparse_kv_offload_config=SimpleNamespace(enabled=False), dsv41_gate_max_prefills=2
+        ).dsv41_gate_max_prefills
+        == 2
+    )

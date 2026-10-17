@@ -155,35 +155,20 @@ def get_cos_and_sin_dsa(
                 buf_cos, buf_sin = group_buffers
                 num_tokens = pos_tensor.size(0)
 
-                # This is semantically equivalent to the previous
-                # `full_rope_cos[pos_tensor] / full_rope_sin[pos_tensor]`
-                # indexing followed by `copy_`; the change only combines the
-                # indexing and the write into the preallocated output buffers.
-                #
-                # gather_idx is built so torch.gather picks the same rows: each
-                # row contains the token index repeated along the rotary dim.
-                # pos_tensor -> reshape(-1, 1, 1, 1) gives each token its own
-                # row; expand() broadcasts that row across the rotary dim to
-                # match full_rope_* (which is [max_pos, 1, 1, rotary_dim]),
-                # so torch.gather(..., dim=0) selects row pos_tensor[i].
-                gather_idx = (
-                    pos_tensor.to(torch.long).reshape(-1, 1, 1, 1).expand(num_tokens, 1, 1, full_rope_cos.size(-1))
-                )
+                # index_select writes directly to stable graph buffers and
+                # avoids expanding an index over every rotary component.
+                indices = pos_tensor.reshape(-1).to(torch.long)
                 if draft_index is None:
-                    torch.gather(full_rope_cos, 0, gather_idx, out=buf_cos[:num_tokens])
-                    torch.gather(full_rope_sin, 0, gather_idx, out=buf_sin[:num_tokens])
-
-                    batch_result[config_key][group_name] = (buf_cos[:num_tokens], buf_sin[:num_tokens])
+                    out_cos, out_sin = buf_cos[:num_tokens], buf_sin[:num_tokens]
                 else:
-                    torch.gather(full_rope_cos, 0, gather_idx, out=buf_cos[draft_index - 1][:num_tokens])
-                    torch.gather(full_rope_sin, 0, gather_idx, out=buf_sin[draft_index - 1][:num_tokens])
-                    batch_result[config_key][group_name] = (
-                        buf_cos[draft_index - 1][:num_tokens],
-                        buf_sin[draft_index - 1][:num_tokens],
-                    )
+                    out_cos = buf_cos[draft_index - 1][:num_tokens]
+                    out_sin = buf_sin[draft_index - 1][:num_tokens]
+                torch.index_select(full_rope_cos, 0, indices, out=out_cos)
+                torch.index_select(full_rope_sin, 0, indices, out=out_sin)
+                batch_result[config_key][group_name] = (out_cos, out_sin)
             else:
-                curr_cos = full_rope_cos[pos_tensor]
-                curr_sin = full_rope_sin[pos_tensor]
+                curr_cos = torch.index_select(full_rope_cos, 0, pos_tensor.reshape(-1).to(torch.long))
+                curr_sin = torch.index_select(full_rope_sin, 0, pos_tensor.reshape(-1).to(torch.long))
                 batch_result[config_key][group_name] = (curr_cos, curr_sin)
 
     return RopeDataProxy(batch_result, is_cos=True), RopeDataProxy(batch_result, is_cos=False)

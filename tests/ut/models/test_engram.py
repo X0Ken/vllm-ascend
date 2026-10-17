@@ -383,3 +383,67 @@ def test_native_mxfp8_requires_e8m0_scales_before_allocation(tmp_path):
     )
     with pytest.raises(ValueError, match="requires E8M0 scales"):
         embedding_mod.preflight_engram_checkpoint(tmp_path, [1])
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_engram_wkv_tp_loads_output_shard_and_gathers_in_order(monkeypatch, rank):
+    from vllm.model_executor import parameter
+    from vllm.model_executor.layers import linear
+
+    from vllm_ascend.models.deepseek_v41.engram import layer
+    from vllm_ascend.ops import linear as ascend_linear
+
+    monkeypatch.setattr(layer, "get_ascend_config", lambda: SimpleNamespace(enable_dsv41_engram_wkv_tp=True))
+    monkeypatch.setattr(ascend_linear, "get_parallel_op", lambda *_a, **_kw: (None, rank, 2))
+    monkeypatch.setattr(
+        ascend_linear.AscendUnquantizedLinearMethod,
+        "apply",
+        lambda self, module, x, bias=None: torch.nn.functional.linear(x, module.weight, bias),
+    )
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: rank)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 2)
+    config = SimpleNamespace(
+        hidden_size=4,
+        hc_mult=2,
+        rms_norm_eps=1e-6,
+        engram_max_ngram_size=3,
+        engram_n_heads=2,
+        engram_head_dim=2,
+    )
+    engram = layer.AscendEngram(config, None, "engram")
+    weights = torch.arange(12 * 8, dtype=torch.float32).reshape(12, 8) / 100
+    engram.wkv.weight.weight_loader(engram.wkv.weight, weights)
+    torch.testing.assert_close(engram.wkv.weight, weights[rank * 6 : (rank + 1) * 6])
+    rows = torch.randn(6, 8)
+    expected = torch.nn.functional.linear(rows, weights)
+
+    def gather(local):
+        torch.testing.assert_close(local, expected[:, rank * 6 : (rank + 1) * 6])
+        return expected
+
+    monkeypatch.setattr(linear, "tensor_model_parallel_all_gather", gather)
+    torch.testing.assert_close(engram.wkv(rows), expected)
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_engram_wkv_tp_gathers_sequence_shards_before_output_columns(monkeypatch, rank):
+    from vllm_ascend.models.deepseek_v41.engram import layer
+
+    engram = layer.AscendEngram.__new__(layer.AscendEngram)
+    torch.nn.Module.__init__(engram)
+    engram.shard_wkv = True
+    rows = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+    weights = torch.randn(12, 8)
+    local = rows.chunk(2)[rank]
+
+    def gather(value, dim):
+        assert dim == 0
+        torch.testing.assert_close(value, local)
+        return rows
+
+    monkeypatch.setattr(layer, "tensor_model_parallel_all_gather", gather)
+    monkeypatch.setattr(layer, "get_tensor_model_parallel_rank", lambda: rank)
+    monkeypatch.setattr(layer, "get_tensor_model_parallel_world_size", lambda: 2)
+    engram.wkv = lambda full: torch.nn.functional.linear(full, weights)
+    actual = engram._project_rows(local, sequence_parallel=True)
+    torch.testing.assert_close(actual, torch.nn.functional.linear(local, weights))

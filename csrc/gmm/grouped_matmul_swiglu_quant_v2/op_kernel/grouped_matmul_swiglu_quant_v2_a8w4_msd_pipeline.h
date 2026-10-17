@@ -99,6 +99,27 @@ __aicore__ inline void GMMSwigluQuantPipelineSchedule<mmType>::Process()
 
     // 1.前处理提前下发一次
     preProcess.Process(workspaceSplitConfig, 0, pipe);
+#if defined(VLLM_ASCEND_GMM1_SINGLE_SEGMENT) && VLLM_ASCEND_GMM1_SINGLE_SEGMENT
+    // A single segment has no next pre-process or previous post-process.
+    // Retain both producer/consumer barriers and the vector pipe resets.
+    if (workspaceSplitConfig.loopCount == 1) {
+        UpdateWorkSpaceSplitConfig(workspaceSplitConfig, 0);
+        if ASCEND_IS_AIV {
+            pipe->Reset();
+        }
+        SyncAll<false>();
+        midProcess.Process(workspaceSplitConfig, 0);
+        if ASCEND_IS_AIV {
+            pipe->Reset();
+        }
+        SyncAll<false>();
+        postProcess.Process(workspaceSplitConfig, 0, pipe);
+        if ASCEND_IS_AIV {
+            pipe->Destroy();
+        }
+        return;
+    }
+#endif
     for (int64_t workspaceSplitLoopIdx = 0; workspaceSplitLoopIdx < workspaceSplitConfig.loopCount;
          workspaceSplitLoopIdx++) {
         // 更新workspaceSplitConfig

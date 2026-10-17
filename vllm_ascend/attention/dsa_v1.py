@@ -1613,6 +1613,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         **kwargs,
     ):
         self.vllm_config = kwargs["vllm_config"]
+        self.use_o_proj_2d = getattr(get_ascend_config(), "enable_dsv41_o_proj_2d", False) is True
         self.num_heads = n_heads
         self.n_local_heads = n_local_heads
         self.scale = scale
@@ -1750,6 +1751,14 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                 perm_x2=(0, 1, 2),
                 perm_y=(1, 0, 2),
             )
+        if (
+            self.use_o_proj_2d
+            and self.n_local_groups == 1
+            and self.wo_a.weight.ndim == 3
+            and self.wo_a.weight.shape[0] == 1
+        ):
+            # [T, 1, K] @ [1, K, N]; keep the grouped output contract.
+            return torch.mm(o_proj_input.squeeze(1), self.wo_a.weight.squeeze(0)).unsqueeze(1)
         return torch_npu.npu_transpose_batchmatmul(
             o_proj_input,
             self.wo_a.weight,

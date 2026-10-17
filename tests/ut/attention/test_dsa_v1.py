@@ -2781,6 +2781,7 @@ def test_pcp_local_o_projection_adds_static_quant_bias_once(tp_size, reduce_resu
 def test_o_proj_capacity_covers_profile_and_decode(tp_size, decode_capacity, scheduler_capacity):
     impl = AscendDSAImpl.__new__(AscendDSAImpl)
     impl.n_local_groups = tp_size
+    impl.use_o_proj_2d = False
     impl.support_fp8_attention = False
     impl.wo_a = SimpleNamespace(weight=torch.ones(1, 2, 2))
     impl.wo_b = lambda x: x
@@ -2837,6 +2838,7 @@ def test_o_proj_capacity_covers_profile_and_decode(tp_size, decode_capacity, sch
 def test_a5_fp8_o_proj_keeps_otp_collectives(tp_size, num_tokens):
     impl = _make_impl()
     impl.n_local_groups = tp_size
+    impl.use_o_proj_2d = False
     impl.support_fp8_attention = True
     impl.wo_a = SimpleNamespace(
         weight=torch.ones(1, 2, 2),
@@ -2952,3 +2954,15 @@ def test_dspark_compressed_tq_metadata_keeps_full_context(use_tq, ratio, deferre
     assert metadata_op.call_args.kwargs["seqused_kv"].tolist() == [261 if compressed_tq else 133]
     assert (metadata.dspark_swa_indices is None) == compressed_tq
     assert metadata.ori_win_left == (127 if compressed_tq else 132)
+
+
+@pytest.mark.parametrize("tokens", [0, 1, 6, 32])
+def test_single_group_o_projection_2d_preserves_grouped_values(tokens):
+    impl = _make_impl()
+    impl.n_local_groups = 1
+    impl.support_fp8_attention = False
+    impl.wo_a = SimpleNamespace(weight=torch.randn(1, 4, 3))
+    x = torch.randn(tokens, 1, 4)
+    expected = torch.bmm(x.transpose(0, 1), impl.wo_a.weight).transpose(0, 1)
+    impl.use_o_proj_2d = True
+    torch.testing.assert_close(impl._wo_a_bmm(x), expected)

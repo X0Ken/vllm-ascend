@@ -554,3 +554,16 @@ def test_set_ascend_forward_context_pins_current_vllm_config(monkeypatch, model_
             assert forward_context.moe_comm_method is (expected if model_owned else legacy_method)
 
     assert seen["inside"] is False
+
+
+@pytest.mark.parametrize("lora", [False, True])
+def test_dsv41_allgather_override_preserves_lora_requirement(monkeypatch, lora):
+    monkeypatch.setattr(afc, "get_ascend_config", lambda: SimpleNamespace(enable_dsv41_moe_allgather=True))
+    monkeypatch.setattr(afc, "is_moe_model", lambda _: True)
+    monkeypatch.setattr(afc, "get_mc2_tokens_capacity", lambda: 128)
+    monkeypatch.setattr(afc, "get_ep_group", lambda: SimpleNamespace(world_size=8))
+    runtime = _make_vllm_config()
+    runtime.model_config.hf_text_config.model_type = "deepseek_v41"
+    runtime.lora_config = object() if lora else None
+    expected = MoECommType.ALLTOALL if lora else MoECommType.ALLGATHER
+    assert afc.select_moe_comm_method(6, runtime) is expected
