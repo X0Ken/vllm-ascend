@@ -1,5 +1,6 @@
 import importlib
 import math
+import time
 from collections.abc import Sequence
 from typing import Any
 
@@ -8,6 +9,7 @@ import zmq
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.logger import logger
+from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -326,6 +328,8 @@ class KVPoolScheduler:
         num_computed_tokens: int,
         include_layers: bool = False,
     ) -> int:
+        if self.cache_coordinator is not None:
+            return self._get_coordinated_hit_tokens(request, token_len, include_layers=include_layers)
         num_blocks = token_len // self._block_size
         # In layerwise mode, always query from block 0 because the remote
         # pool stores per-layer data that may not match local prefix cache.
@@ -397,6 +401,43 @@ class KVPoolScheduler:
             keys.extend(draft_keys.make_hit_check_keys(block_hash_hex))
         return keys
 
+    def _get_coordinated_hit_tokens(self, request, token_len, *, include_layers=False, use_protocol=False):
+        """Intersect complete windows across every physical rank/layer key."""
+        coordinator = self.cache_coordinator
+        assert coordinator is not None
+        aligned_len = cdiv(token_len, self.lcm_block_size) * self.lcm_block_size
+        masks = coordinator.lookup_mask(aligned_len)
+        rank_hits = {}
+        for group_id in sorted(self.cacheable_group_ids):
+            hashes = get_block_hashes(request.block_hashes, self.grouped_block_size[group_id], self.hash_block_size)
+            selected = [h for i, h in enumerate(hashes) if masks[group_id] is None or masks[group_id][i]]
+            if use_protocol:
+                keys_by_block = [self._make_layerwise_hit_check_keys(group_id, block_hash_to_str(h)) for h in selected]
+            else:
+                keys_by_block = self._generate_store_query_keys(
+                    selected, include_layers=include_layers, kv_cache_group_id=group_id
+                )
+            keys = [key for variants in keys_by_block for key in variants]
+            if use_protocol:
+                states = self._query_layerwise_key_states(keys_by_block)
+            else:
+                states = self.store_scheduler.batch_is_exist(keys) if keys else []
+            if len(states) != len(keys):
+                raise RuntimeError(f"KV pool key-state count mismatch: expected={len(keys)}, actual={len(states)}")
+            variant_count = len(keys_by_block[0]) if keys_by_block else 1
+            group_hits = [set() for _ in range(variant_count)]
+            offset = 0
+            for block_hash, variants in zip(selected, keys_by_block, strict=True):
+                if len(variants) != variant_count:
+                    raise RuntimeError("KV pool rank shard count changed")
+                for rank, value in enumerate(states[offset : offset + variant_count]):
+                    if value == 1:
+                        group_hits[rank].add(block_hash)
+                offset += variant_count
+            rank_hits[group_id] = group_hits
+        candidates = coordinator.restorable_prefixes(request.block_hashes, token_len, rank_hits)
+        return candidates[-1] if candidates else 0
+
     def _get_layerwise_hit_tokens(
         self,
         request: "Request",
@@ -408,8 +449,8 @@ class KVPoolScheduler:
             return self._lookup_layerwise_with_coordinator(request, token_len)
         return self._lookup_layerwise_contiguous(request, token_len, num_computed_tokens)
 
-    def _query_layerwise_block_hits(self, keys_by_block: list[list[str]]) -> list[bool]:
-        """Probe backend readability and fold physical keys into block hits."""
+    def _query_layerwise_key_states(self, keys_by_block: list[list[str]]) -> list[bool]:
+        """Probe physical key readability with bounded backend batches."""
         all_keys = [key for block_keys in keys_by_block for key in block_keys]
         if not all_keys:
             return []
@@ -428,6 +469,10 @@ class KVPoolScheduler:
                 raise RuntimeError("Layerwise readability probe returned invalid results")
             readable.extend(batch_readable)
 
+        return readable
+
+    def _query_layerwise_block_hits(self, keys_by_block: list[list[str]]) -> list[bool]:
+        readable = self._query_layerwise_key_states(keys_by_block)
         block_hits = []
         offset = 0
         for block_keys in keys_by_block:
@@ -435,43 +480,8 @@ class KVPoolScheduler:
             offset += len(block_keys)
         return block_hits
 
-    def _lookup_layerwise_with_coordinator(
-        self,
-        request: "Request",
-        token_len: int,
-    ) -> int:
-        """Reachability-aware hit check for hybrid models.
-
-        Only the blocks the KV cache managers consider reachable (sliding-
-        window / compressor-state tails) are queried for reachability-limited
-        groups — those groups are stored sparsely by the layerwise save path —
-        and the hit length is derived by the coordinator lookup shared with
-        the non-layerwise path, so it matches the store-side mask semantics.
-        """
-        coordinator = self.cache_coordinator
-        assert coordinator is not None
-
-        def query_group_hits(
-            group_id: int,
-            group_block_hashes: Sequence[BlockHash | str],
-            lookup_mask: Sequence[bool] | None,
-        ) -> list[BlockHash]:
-            keys_by_block: list[list[str]] = []
-            allowed_hashes: list[BlockHash] = []
-            for block_idx, block_hash in enumerate(group_block_hashes):
-                if lookup_mask is not None and not (block_idx < len(lookup_mask) and lookup_mask[block_idx]):
-                    continue
-                keys_by_block.append(self._make_layerwise_hit_check_keys(group_id, block_hash_to_str(block_hash)))
-                allowed_hashes.append(block_hash)
-            block_hits = self._query_layerwise_block_hits(keys_by_block)
-            return [block_hash for block_hash, hit in zip(allowed_hashes, block_hits) if hit]
-
-        return coordinator.find_reachable_hit_tokens(
-            request.block_hashes,
-            token_len,
-            query_group_hits,
-            log_context=f"hit_check: req={request.request_id}",
-        )
+    def _lookup_layerwise_with_coordinator(self, request, token_len):
+        return self._get_coordinated_hit_tokens(request, token_len, use_protocol=True)
 
     def _lookup_layerwise_contiguous(
         self,
@@ -617,19 +627,24 @@ class KVPoolScheduler:
             return 0, False
 
         prompt_token_len = len(request.prompt_token_ids)
+        restore_limit = prompt_token_len
+        if self.cache_coordinator is not None:
+            restore_limit = self._floor_to_cache_transfer_granularity(max(0, prompt_token_len - 1))
+            if restore_limit < self.cache_transfer_granularity:
+                return 0, False
         if self.use_block_key_layerwise:
-            token_len = self._floor_to_cache_transfer_granularity(prompt_token_len)
+            token_len = self._floor_to_cache_transfer_granularity(restore_limit)
             if token_len < self.cache_transfer_granularity:
                 return 0, False
             num_external_hit_tokens = self._get_block_key_layerwise_hit_tokens(request, token_len, num_computed_tokens)
         elif self.use_layerwise_transfer:
-            token_len = prompt_token_len
+            token_len = restore_limit
             num_external_hit_tokens = self._get_layerwise_hit_tokens(request, token_len, num_computed_tokens)
         else:
             if self._discard_partial_chunks:
-                token_len = self._floor_to_cache_transfer_granularity(prompt_token_len)
+                token_len = self._floor_to_cache_transfer_granularity(restore_limit)
             else:
-                token_len = prompt_token_len
+                token_len = restore_limit
 
             if token_len < self.cache_transfer_granularity:
                 return 0, False
@@ -654,7 +669,7 @@ class KVPoolScheduler:
             return 0, False
 
         store_skip_tokens = num_external_hit_tokens
-        if self.use_eagle:
+        if self.cache_coordinator is None and self.use_eagle:
             # Keep the draft model's recomputation zone intact: the
             # generation-point hidden states must be freshly computed, and the
             # local prefix-cache path already drops its trailing block
@@ -675,7 +690,10 @@ class KVPoolScheduler:
                     num_computed_tokens,
                     num_external_hit_tokens - self.lcm_block_size,
                 )
-        if num_external_hit_tokens == request.num_tokens:
+        if self.cache_coordinator is not None:
+            if num_external_hit_tokens > token_len or num_external_hit_tokens % self.cache_transfer_granularity:
+                raise RuntimeError("KV pool returned an unverified restore boundary")
+        elif num_external_hit_tokens == request.num_tokens:
             num_external_hit_tokens -= 1
         if len(self.cacheable_group_ids) != len(self.original_block_size):
             # Private compressor state is rebuilt locally. Recompute the last

@@ -2,9 +2,10 @@ ARG BASE_IMAGE=quay.io/ascend/vllm-ascend:nightly-main@sha256:3f68d538d356244f0a
 FROM ${BASE_IMAGE}
 ARG BASE_IMAGE
 ARG SOURCE_COMMIT
-ARG VLLM_COMMIT=db9527a46873454610df6dbedf79a36d6bf1a7f6
+ARG VLLM_COMMIT=4cd1027fc214169d835a45502805fab0cbda9749
 LABEL qc.vllm.commit=${VLLM_COMMIT} qc.base.image=${BASE_IMAGE}
-LABEL org.opencontainers.image.revision=${SOURCE_COMMIT} qc.source.branch=qc-ascend-dsv41-vllm-update
+LABEL qc.patch.vllm.origin=e100dddfd91e99d4ac90c28be82cdf4f73346c65 qc.patch.ascend.origin=6ac6e501614f85e5d7731c1ffd9d1f8db855e211
+LABEL org.opencontainers.image.revision=${SOURCE_COMMIT} qc.source.branch=qc-ascend-dsv41
 RUN apt-get update && apt-get install -y --no-install-recommends libjemalloc2=5.2.1-4ubuntu1 && \
     echo '6fa9db2a963459985457776a1301e94a53a006bea58776cbf9168f021156c70c  /lib/aarch64-linux-gnu/libjemalloc.so.2' | sha256sum -c - && \
     rm -rf /var/lib/apt/lists/*

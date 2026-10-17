@@ -394,20 +394,7 @@ class TestAscendStoreCoordinator(unittest.TestCase):
             coord.store_mask(2048, num_prompt_tokens=2048),
             ([True, True, True, True],),
         )
-        cached_mask = [True, True, False, False]
-        with patch.object(
-            coord,
-            "find_longest_cache_hit",
-            return_value=((cached_mask,), 1024),
-        ):
-            self.assertEqual(
-                coord.load_mask(_hashes(16), 2048),
-                (cached_mask,),
-            )
-
-
-class TestFindReachableHitTokens(unittest.TestCase):
-    """The shared driver behind the scheduler/worker coordinator lookups."""
+        self.assertEqual(coord.load_mask(_hashes(16), 2048), ([True] * 4,))
 
     def test_passes_mask_allowed_hashes_to_query_callback(self):
         coord = AscendStoreCoordinator(
@@ -452,14 +439,12 @@ class TestFindReachableHitTokens(unittest.TestCase):
             self.assertIsNone(lookup_mask)
             return list(group_block_hashes[:3])
 
-        with patch.object(coord, "find_longest_cache_hit", wraps=coord.find_longest_cache_hit) as derive:
-            hit = coord.find_reachable_hit_tokens(block_hashes, 384, query_group_hits)
+        hit = coord.find_reachable_hit_tokens(block_hashes, 384, query_group_hits)
 
         # Only whole hash blocks within token_len are queried (384 // 128 = 3).
         self.assertEqual(received, [_hashes(3)])
-        self.assertEqual(hit, 384)
-        derive.assert_called_once()
-        self.assertFalse(derive.call_args.kwargs["apply_eagle"])
+        # Restore boundaries must be aligned even when the hash granularity is finer.
+        self.assertEqual(hit, 256)
 
     def test_no_hits_returns_zero_without_deriving(self):
         with patch(
@@ -479,6 +464,91 @@ class TestFindReachableHitTokens(unittest.TestCase):
 
         self.assertEqual(hit, 0)
         derive.assert_not_called()
+
+    def test_external_eagle_load_covers_distinct_target_and_draft_groups(self):
+        spec = _sliding_spec(128, 128)
+        coord = AscendStoreCoordinator(
+            [
+                KVCacheGroupSpec(["target"], spec),
+                KVCacheGroupSpec(["draft"], replace(spec, head_size=2), is_eagle_group=True),
+            ],
+            scheduler_block_size=128,
+            hash_block_size=128,
+            group_block_sizes=[128, 128],
+            group_cache_families=["swa", "swa"],
+            use_eagle=True,
+        )
+        self.assertEqual(coord.load_mask(_hashes(4), 512), ([False, False, True, True], [False, False, True, True]))
+
+    def test_external_eagle_missing_tail_falls_back_to_complete_checkpoint(self):
+        coord = AscendStoreCoordinator(
+            [KVCacheGroupSpec(["draft"], _sliding_spec(128, 128), is_eagle_group=True)],
+            scheduler_block_size=128,
+            hash_block_size=128,
+            group_block_sizes=[128],
+            group_cache_families=["swa"],
+            use_eagle=True,
+        )
+        hashes = _hashes(6)
+        # A complete older pair and an isolated latest block. The isolated
+        # block cannot be restored as a reusable EAGLE checkpoint.
+        existing = {hashes[1], hashes[2], hashes[5]}
+        hit = coord.find_reachable_hit_tokens(hashes, 768, lambda group_id, group_hashes, mask: existing)
+        self.assertEqual(hit, 384)
+
+    def test_restore_intersects_sparse_windows_across_groups_and_ranks(self):
+        spec = _sliding_spec(128, 128)
+        coord = AscendStoreCoordinator(
+            [
+                KVCacheGroupSpec(["full"], _full_spec(128)),
+                KVCacheGroupSpec(["target"], spec),
+                KVCacheGroupSpec(["draft"], replace(spec, head_size=2), is_eagle_group=True),
+            ],
+            scheduler_block_size=128,
+            hash_block_size=128,
+            group_block_sizes=[128] * 3,
+            group_cache_families=["c1", "swa", "swa"],
+            use_eagle=True,
+        )
+        hashes = _hashes(6)
+        a = {hashes[i] for i in [0, 1, 4, 5]}
+        b = {hashes[i] for i in [0, 1, 3, 4]}
+        hits = {0: [hashes, hashes], 1: [a, b], 2: [hashes, hashes]}
+        # Per-rank maxima are 768 and 640. Their minimum, 640, is invalid
+        # on the first rank. The latest common complete window ends at 256.
+        self.assertEqual(coord.restorable_prefixes(hashes, 768, hits), [128, 256])
+        for mask in coord.load_mask(hashes, 256):
+            self.assertEqual(mask, [True, True])
+        hits[2] = [set()]
+        self.assertEqual(coord.restorable_prefixes(hashes, 768, hits), [])
+
+    def test_restore_load_and_retention_share_coarse_alignment_window(self):
+        spec = _sliding_spec(128, 128)
+        coord = AscendStoreCoordinator(
+            [
+                KVCacheGroupSpec(["full"], _full_spec(256)),
+                KVCacheGroupSpec(["target"], spec),
+                KVCacheGroupSpec(["draft"], replace(spec, head_size=2), is_eagle_group=True),
+            ],
+            scheduler_block_size=256,
+            hash_block_size=128,
+            group_block_sizes=[256, 128, 128],
+            group_cache_families=["c4", "default", "default"],
+            use_eagle=True,
+            retention_interval=0,
+        )
+        hashes = _hashes(8)
+        tail = set(hashes[5:8])
+        full_hashes = get_block_hashes(hashes, 256, 128)
+        hits = {0: [full_hashes], 1: [tail], 2: [tail]}
+        self.assertEqual(coord.restorable_prefixes(hashes, 1024, hits), [1024])
+        masks = coord.load_mask(hashes, 1024)
+        stored = coord.store_mask(1024, num_prompt_tokens=1025)
+        self.assertEqual(masks[1], [False] * 5 + [True] * 3)
+        for group in [1, 2]:
+            self.assertTrue(all(not needed or kept for needed, kept in zip(masks[group], stored[group])))
+        hits[1] = [tail - {hashes[5]}]
+        self.assertEqual(coord.restorable_prefixes(hashes, 1024, hits), [])
 
 
 if __name__ == "__main__":
