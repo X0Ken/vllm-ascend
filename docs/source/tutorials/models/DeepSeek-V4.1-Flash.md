@@ -921,10 +921,19 @@ the SWA window.
 `Dockerfile.qc-dsv41` builds the QC image for one eight-card 910B3 (A2)
 node with TP8/DP1/EP8 and
 `chiro2001/DeepSeek-V4.1-Flash-w4a8-Ascend`. The build pins the tested
-`nightly-main` digest and the vLLM 0.31.0 source revision. Provide a clean
-vLLM `4cd1027fc214169d835a45502805fab0cbda9749` source tree (the QC v0.31 port of external SWA restore history) as
-`vllm-source/` in the build context. The installer applies the QC core
-patches and builds the Rust parser, Ascend operators and Joint operator.
+`nightly-main` digest and upstream vLLM 0.31.0 source revision
+`db9527a46873454610df6dbedf79a36d6bf1a7f6`. The Dockerfile downloads that
+upstream archive and verifies its SHA256; the build context is this Ascend
+repository alone, with no separate QC vLLM checkout or branch required.
+The installer applies the prefill barrier, repetition defaults and external
+SWA restore history patches from `vllm_ascend/patch/platform/`, then builds
+the Rust parser, Ascend operators and Joint operator.
+
+`v41_external_swa_restore.patch` carries the v0.31 adaptation of vLLM
+`e100dddfd91e99d4ac90c28be82cdf4f73346c65`, including its regression tests.
+Together with the other core patches it reproduces the core sources used by
+the tested P9 image (previously assembled from QC vLLM `4cd1027fc2`).
+Maintain future QC changes and their tests in this Ascend repository.
 
 ```shell
 docker build -f Dockerfile.qc-dsv41 \
