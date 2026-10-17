@@ -189,3 +189,7 @@ P10 has no new CED-PD or DSpark-with-DCP deployment recipe. The source's
 withdrawn layernorm/quantization fusion and rejected numerical shortcuts are
 not enabled. Historical source timings are not P10 performance results;
 run device correctness and service-level measurements before rollout.
+
+For slow or offline builders, `VLLM_SOURCE_URL` may point to a local HTTP
+mirror of the pinned upstream archive. The build still verifies
+`VLLM_SOURCE_SHA256` before extraction; mirroring never changes the vLLM revision.
