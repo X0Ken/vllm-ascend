@@ -9,6 +9,14 @@
 # -----------------------------------------------------------------------------------------------------------
 add_op_to_compiled_list()
 
+option(ENABLE_GMM1_SINGLE_SEGMENT "Enable the A8W4 single-workspace pipeline" OFF)
+if(ENABLE_GMM1_SINGLE_SEGMENT)
+    add_ops_compile_options(
+        OP_NAME GroupedMatmulSwigluQuantV2
+        OPTIONS -DVLLM_ASCEND_GMM1_SINGLE_SEGMENT=1
+    )
+endif()
+
 if (BUILD_OPEN_PROJECT)
     target_sources(op_host_aclnnExc PRIVATE
         grouped_matmul_swiglu_quant_v2_def.cpp

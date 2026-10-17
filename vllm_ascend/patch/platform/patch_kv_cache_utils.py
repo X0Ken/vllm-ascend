@@ -23,6 +23,7 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_kind,
 )
 
+from vllm_ascend.ascend_config import validate_additional_config_bool
 from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
 from vllm_ascend.models.deepseek_v41.cache_config import (
     get_deepseek_v41_kv_cache_config,
@@ -402,7 +403,13 @@ def _ascend_get_packed_kv_cache_groups(
 ) -> list[KVCacheGroupSpec] | None:
     """Preserve Ascend's DSV4 grouping on the live packed-group hook."""
     if is_deepseek_v41_cache(kv_cache_spec):
-        grouped_specs = group_cache_specs(kv_cache_spec)
+        # Scheduler-side grouping also runs before the worker config singleton
+        # exists. Validate the same typed switch directly from this config.
+        additional = vllm_config.additional_config or {}
+        repack = validate_additional_config_bool(
+            additional.get("enable_dsv41_kv_repack", False), "enable_dsv41_kv_repack"
+        )
+        grouped_specs = group_cache_specs(kv_cache_spec, repack=repack)
         groups = make_cache_groups(grouped_specs)
     else:
         grouped_specs = group_and_unify_kv_cache_specs(kv_cache_spec)

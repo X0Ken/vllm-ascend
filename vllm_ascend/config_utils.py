@@ -48,3 +48,15 @@ def config(
         return dataclass(config_cls, config=merged_config, **kwargs)  # type: ignore[return-value]
 
     return decorator if cls is None else decorator(cls)
+
+
+def dsv41_admission_config(vllm_config):
+    """Read the phase gate without requiring a worker-side config singleton."""
+    additional = vllm_config.additional_config or {}
+    from pydantic import TypeAdapter
+
+    enabled = TypeAdapter(bool).validate_python(additional.get("enable_dsv41_admission_gate", False))
+    maximum = additional.get("dsv41_gate_max_prefills", 1)
+    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 1:
+        raise ValueError("dsv41_gate_max_prefills must be a positive integer")
+    return enabled, maximum

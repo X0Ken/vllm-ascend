@@ -27,6 +27,7 @@ import torch
 import torch_npu
 from vllm.config import get_current_vllm_config
 from vllm.distributed.parallel_state import get_ep_group
+from vllm.forward_context import get_forward_context
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import get_mc2_tokens_capacity
@@ -54,6 +55,39 @@ from vllm_ascend.utils import should_skip_allreduce_across_dp_group
 
 EXPERT_TOKEN_NUMS_TYPE_CUMSUM = 0
 EXPERT_TOKEN_NUMS_TYPE_COUNT = 1
+
+
+class ContiguousExpertRange:
+    """Validate a static expert map once, before graph capture.
+
+    Cache by tensor identity and version so an eager EPLB update invalidates
+    the proof. Dynamic EPLB callers must keep the indexed path.
+    """
+
+    def __init__(self):
+        self.expert_map = None
+        self.key = None
+        self.bounds = None
+
+    def mask(self, expert_map, ids, first, last, *, capturing=False):
+        version = None if expert_map.is_inference() else expert_map._version
+        key = (version, first, last, ids.dtype, ids.device)
+        if self.expert_map is not expert_map or self.key != key:
+            if capturing:
+                return expert_map[ids] != -1
+            host_map = expert_map.detach().cpu()
+            expected = torch.full_like(host_map, -1)
+            if 0 <= first <= last <= host_map.numel():
+                expected[first:last] = torch.arange(last - first, dtype=host_map.dtype)
+                valid = torch.equal(host_map, expected)
+            else:
+                valid = False
+            self.expert_map, self.key = expert_map, key
+            self.bounds = (ids.new_tensor(first), ids.new_tensor(last)) if valid else None
+        if self.bounds is None:
+            return expert_map[ids] != -1
+        lower, upper = self.bounds
+        return (ids >= lower) & (ids < upper)
 
 
 def _get_expert_token_nums_type(token_dispatch_input: MoETokenDispatchInput) -> int:
@@ -341,6 +375,7 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
         self.num_experts_local = (
             num_experts_local.item() if torch.is_tensor(num_experts_local) else int(num_experts_local)
         )
+        self._expert_range = ContiguousExpertRange()
 
     def token_dispatch(
         self,
@@ -391,10 +426,24 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
         if expert_map is not None:
             global_num_experts = len(expert_map) + global_redundant_expert_num
-            mask = expert_map[topk_ids] != -1
-            topk_weights = topk_weights * mask
             first_expert_idx = get_ep_group().rank_in_group * self.num_experts_local
             last_expert_idx = first_expert_idx + self.num_experts_local
+            config = get_current_vllm_config()
+            if (
+                getattr(get_ascend_config(), "enable_dsv41_moe_mask_range", False) is True
+                and not config.parallel_config.enable_eplb
+                and global_redundant_expert_num == 0
+            ):
+                mask = self._expert_range.mask(
+                    expert_map,
+                    topk_ids,
+                    first_expert_idx,
+                    last_expert_idx,
+                    capturing=getattr(get_forward_context(), "capturing", False),
+                )
+            else:
+                mask = expert_map[topk_ids] != -1
+            topk_weights = topk_weights * mask
         else:
             first_expert_idx = 0
             last_expert_idx = self.num_experts_local

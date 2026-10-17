@@ -142,3 +142,50 @@ the real Compressor entry against stubs that reject unwanted template
 instantiations, including any computation for EMPTY_X. It does not measure CANN build time
 or execute NPU kernels. Rebuild the operator package before the numerical
 regressions; retained key counts alone do not establish a wall-clock speedup.
+
+## P10 single-node optimization controls
+
+The QC release `p10` ports the applicable single-instance paths from
+[chiro2001/deepseek-v4.1-flash-ascend910B at 889a6a9](https://github.com/chiro2001/deepseek-v4.1-flash-ascend910B/tree/889a6a92797d94ee2c7f6fc59a89bc9a7156b261).
+The target retains its native device-side Engram hash, registered host tables,
+DSpark query graphs, asynchronous metadata and shared-cache recovery.
+The old flat-file Engram implementation and its CPU JIT are not installed over
+these native implementations.
+
+All new device-dependent controls are optional `--additional-config` fields:
+
+| Field | Default | Behavior |
+| --- | --- | --- |
+| `enable_dsv41_moe_allgather` | `false` | Select AllGather for V4.1 MoE; preserve LoRA's AllToAll requirement. |
+| `enable_dsv41_moe_mask_range` | `false` | Validate static contiguous expert maps before capture, then compare integer tensor bounds; retain indexed masks for EPLB or noncontiguous maps. |
+| `enable_dsv41_o_proj_2d` | `false` | Use 2D matrix multiplication for a single local BF16 projection group; preserve grouped/FP8 fallbacks. |
+| `enable_dsv41_qli_no_candidate` | `false` | Use unfiltered QLI mode 3 on the INT8 cache path, without passing candidate IDs. Requires a new model-quality evaluation. |
+| `enable_dsv41_engram_wkv_tp` | `false` | Shard the Engram output projection through ColumnParallelLinear and gather outputs; gather token rows before projection under SP, then restore the local window. Preserve framework checkpoint and quantization loaders. |
+| `enable_dsv41_kv_repack` | `false` | Relocate index planes into unused source-slot space; retain logical cache groups and transport the physical layout through padded specs. |
+| `enable_dsv41_admission_gate` | `false` | Separate prefill and decode scheduler outputs; back off to decode when prefill cannot allocate. |
+| `dsv41_gate_max_prefills` | `1` | Positive integer limiting requests in a prefill-only output. |
+
+RoPE now selects rows directly into persistent output buffers. KV allocation
+also caps every physical slot at its 32-bit byte-address limit and rejects
+memory-oversubscribing or unsafe block overrides. The cap follows profiling;
+it does not pin an A3-specific memory budget on A2 hardware.
+Repacking does not change `max_num_batched_tokens` automatically. Keep the P9
+8192-token baseline for comparisons; test 2048 separately as a capacity/TTFT
+tradeoff. The source project's 4.01M-token capacity is an A3 result, not an A2
+capacity guarantee.
+
+The source-level GMM1 single-workspace pipeline is available behind the CMake
+option `ENABLE_GMM1_SINGLE_SEGMENT=ON` (default `OFF`). It retains both
+producer/consumer barriers, uses the original multi-segment path otherwise,
+and requires rebuilding and qualifying the native kernel for the target CANN
+and SoC. The old A3 binary is not bundled into an A2 image.
+
+The QC build applies the frontend compatibility patch before rebuilding Rust.
+Python and Rust renderers both accept empty V4.1 developer messages and escape
+caller-supplied turn-boundary tokens while preserving generated image/tool
+markers. Text/image Responses aliases remain supplied by the paired vLLM.
+
+P10 has no new CED-PD or DSpark-with-DCP deployment recipe. The source's
+withdrawn layernorm/quantization fusion and rejected numerical shortcuts are
+not enabled. Historical source timings are not P10 performance results;
+run device correctness and service-level measurements before rollout.

@@ -1970,3 +1970,119 @@ def test_the_swa_cache_carries_the_replay_flag_into_its_spec(monkeypatch):
     assert spec.bounded_replay
     assert not spec.prefix_cacheable
     assert spec.prefix_replay_tokens == REPLAY_WINDOW
+
+
+def test_repacked_slots_preserve_index_and_kv_planes_after_worker_transport():
+    from vllm_ascend.models.deepseek_v41.cache_config import plan_cache_slots
+
+    legacy = make_cache_config(3, draft_layers=3)
+    specs = {n: s for g in legacy.kv_cache_groups for n, s in g.kv_cache_spec.kv_cache_specs.items()}
+    grouped = group_cache_specs(specs, repack=True)
+    groups = make_cache_groups(grouped)
+    worker_specs = {n: s for g in groups for n, s in g.kv_cache_spec.kv_cache_specs.items()}
+    slots = plan_cache_slots(worker_specs)
+    assert [s.page_size for s in slots] == [131072] * 4
+    assert get_deepseek_v41_pool_bytes_per_block(groups) == 524288
+    assert plan_cache_slots(specs, repack=True) == slots
+    config = get_deepseek_v41_kv_cache_config(
+        SimpleNamespace(
+            cache_config=SimpleNamespace(num_gpu_blocks_override=None, prefix_cache_retention_interval=None)
+        ),
+        groups,
+        3 * 524288,
+    )
+    backings, caches = allocate_cache_views(config)
+    assert len(backings) == 4
+    source = "model.layers.20.self_attn"
+    kv = caches[source + ".long_kv_cache"]
+    index, scale = caches[source + ".indexer.k_cache"]
+    kv.fill_(7)
+    index.fill_(11)
+    scale.fill_(13)
+    assert (kv == 7).all() and (index == 11).all() and (scale == 13).all()
+    assert kv.untyped_storage().data_ptr() != index.untyped_storage().data_ptr()
+    assert kv.stride(0) * kv.element_size() == 131072
+    assert index.stride(0) * index.element_size() == 131072
+    # Adjacent physical blocks must remain independent after relocation.
+    index[1].fill_(17)
+    assert (index[0] == 11).all() and (index[2] == 11).all()
+    assert (scale == 13).all()
+
+
+@pytest.mark.parametrize("extra_blocks", [0, 1, 10000])
+def test_kv_byte_address_limit_caps_profiled_memory(extra_blocks):
+    base = make_cache_config(2, draft_layers=3)
+    stride = max(t.block_stride for t in base.kv_cache_tensors)
+    limit = (1 << 32) // stride
+    runtime = SimpleNamespace(
+        cache_config=SimpleNamespace(num_gpu_blocks_override=None, prefix_cache_retention_interval=None)
+    )
+    config = get_deepseek_v41_kv_cache_config(
+        runtime,
+        base.kv_cache_groups,
+        (limit + extra_blocks) * get_deepseek_v41_pool_bytes_per_block(base.kv_cache_groups),
+    )
+    assert config.num_blocks == limit
+    assert all(t.size <= 1 << 32 for t in config.kv_cache_tensors)
+    runtime.cache_config.num_gpu_blocks_override = limit + 1
+    with pytest.raises(ValueError, match="32-bit"):
+        get_deepseek_v41_kv_cache_config(runtime, base.kv_cache_groups, 1 << 40)
+
+
+def test_kv_memory_shortage_and_unsafe_override_fail_before_allocation():
+    base = make_cache_config(2)
+    runtime = SimpleNamespace(
+        cache_config=SimpleNamespace(num_gpu_blocks_override=None, prefix_cache_retention_interval=None)
+    )
+    with pytest.raises(ValueError):
+        get_deepseek_v41_kv_cache_config(runtime, base.kv_cache_groups, 0)
+    runtime.cache_config.num_gpu_blocks_override = 3
+    with pytest.raises(ValueError):
+        get_deepseek_v41_kv_cache_config(
+            runtime, base.kv_cache_groups, 2 * get_deepseek_v41_pool_bytes_per_block(base.kv_cache_groups)
+        )
+
+
+@pytest.mark.parametrize("source,consumer", [(True, False), (False, True), (False, False)])
+@pytest.mark.parametrize("disabled", [False, True])
+def test_qli_no_candidate_uses_full_search_without_passing_stale_candidates(monkeypatch, source, consumer, disabled):
+    from vllm_ascend.models.deepseek_v41 import indexer as module
+
+    indexer = module.DeepseekV41Indexer.__new__(module.DeepseekV41Indexer)
+    torch.nn.Module.__init__(indexer)
+    indexer.packed_cache_ops = None
+    indexer.no_candidate = disabled
+    indexer.index_topk = 2
+    indexer.compress_ratio = 1
+    metadata = SimpleNamespace(
+        max_cache_seq_len=8,
+        query_start_loc=torch.tensor([0, 1]),
+        cache_seq_lens=torch.tensor([8]),
+        cmp_residual=None,
+        max_query_len=1,
+        qli_metadata=torch.zeros(1),
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+    )
+    selected = torch.tensor([[[0, 1]]], dtype=torch.int32)
+    candidates = torch.full((1, 1, 64), 37, dtype=torch.int32)
+    native = Mock(return_value=(selected, None, candidates))
+    monkeypatch.setattr(torch.ops._C_ascend, "npu_quant_lightning_indexer_v3", native, raising=False)
+    monkeypatch.setattr(module, "wait_for_device_metadata", lambda *_: None)
+    monkeypatch.setattr(module, "prepare_indexer_indices", lambda values, *_a, **_kw: values)
+    indexer.select_projected(
+        torch.zeros((1, 2, 4)),
+        torch.ones((1, 2)),
+        torch.zeros(1, dtype=torch.long),
+        (torch.zeros((1, 8, 1, 4), dtype=torch.int8), torch.ones((1, 8, 1, 1))),
+        metadata,
+        is_candidate_source=source,
+        uses_candidate_filter=consumer,
+        candidate_topk_blocks=64,
+        candidate_block_size=8,
+        candidates=candidates,
+        quantized_query=torch.zeros((1, 2, 4), dtype=torch.int8),
+        query_scale=torch.ones((1, 2)),
+    )
+    kwargs = native.call_args.kwargs
+    assert kwargs["candidate_mode"] == (3 if disabled else 1 if source else 2 if consumer else 3)
+    assert kwargs["candidate_topk_index"] is (candidates if consumer and not disabled else None)

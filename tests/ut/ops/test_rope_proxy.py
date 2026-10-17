@@ -329,3 +329,29 @@ def test_dspark_turboquant_context_cache_uses_rotated_basis(monkeypatch, use_tq,
         assert write_args[0] is cache
         assert write_args[1] is shared_kv
         torch.testing.assert_close(write_args[2], slot_pairs)
+
+
+@pytest.mark.parametrize("positions", [[], [0], [7, 0, 7, 2]])
+@pytest.mark.parametrize("draft_index", [None, 1, 2])
+def test_index_select_rope_keeps_graph_storage_and_replays_positions(monkeypatch, positions, draft_index):
+    state = rope_dsv4.RopeGlobalState()
+    monkeypatch.setattr(rope_dsv4, "_ROPE_STATE", state)
+    table = torch.arange(32, dtype=torch.float32).reshape(8, 1, 1, 4)
+    state.full_rope_cache["config"] = (table, -table)
+    state.registry_summary["config"] = {"default"}
+    state.layer_info["layer"] = ("config", ["default"])
+    if draft_index is None:
+        buffers = (torch.empty(8, 1, 1, 4), torch.empty(8, 1, 1, 4))
+        state.runtime_buffer["config"] = {"default": buffers}
+        expected_ptr = buffers[0].data_ptr()
+    else:
+        buffers = ([torch.empty(8, 1, 1, 4) for _ in range(2)], [torch.empty(8, 1, 1, 4) for _ in range(2)])
+        state.spec_runtime_buffer["config"] = {"default": buffers}
+        expected_ptr = buffers[0][draft_index - 1].data_ptr()
+    for pos in (positions, list(reversed(positions))):
+        ids = torch.tensor(pos, dtype=torch.int64)
+        cos, sin = rope_dsv4.get_cos_and_sin_dsa(ids, use_cache=True, draft_index=draft_index)
+        assert torch.equal(cos["layer"], table[ids])
+        assert torch.equal(sin["layer"], -table[ids])
+        if pos:
+            assert cos["layer"].data_ptr() == expected_ptr

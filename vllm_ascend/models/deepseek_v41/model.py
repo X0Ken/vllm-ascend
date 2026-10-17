@@ -1622,6 +1622,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                     lookup,
                     active_mask,
                     self.engram_rotation if self.engram_rotated else None,
+                    sequence_parallel=use_sequence_parallel,
                 )
             hidden_states, pre_mix = layer(positions, hidden_states, pre_mix, None, input_ids=input_ids)
         assert last_layer is not None, "Hyper-connection collapse requires at least one decoder layer"

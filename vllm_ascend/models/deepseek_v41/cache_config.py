@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Framework-side V4.1 layer-outermost cache placement and allocation."""
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import torch
 from vllm.config import VllmConfig
+from vllm.logger import logger
+from vllm.v1.core.kv_cache_utils import may_override_num_blocks
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     KVCacheConfig,
@@ -40,6 +42,20 @@ STATE_RING_ROWS = 32
 MLA_HEAD_DIM = 512
 INDEX_HEAD_DIM = 128
 INDEX_FOLD_ROWS = 8
+KV_ADDRESS_SPACE_BYTES = 1 << 32
+
+
+@dataclass(frozen=True)
+class CachePlacement:
+    name: str
+    offset: int
+    page_size: int
+
+
+@dataclass(frozen=True)
+class CacheSlot:
+    page_size: int
+    placements: tuple[CachePlacement, ...]
 
 
 def uses_a5_packed_cache() -> bool:
@@ -196,26 +212,86 @@ def get_layer_tuples(specs):
     return page_sizes, layer_tuples
 
 
-def group_cache_specs(specs):
+def plan_cache_slots(specs, *, repack=None):
+    """Place index planes in unused source-slot space without changing groups.
+
+    Padded aliases encode the physical slot stride. A stride smaller than
+    the original KV+index tuple identifies a repacked group after transport
+    to a worker; no process-local configuration or side table is required.
+    Folded A5 index resources retain their existing ABI.
+    """
+    page_sizes, tuples = get_layer_tuples(specs)
+    if all(len(names) == 1 for names in tuples):
+        return tuple(CacheSlot(size, (CachePlacement(names[0], 0, size),)) for size, names in zip(page_sizes, tuples))
+    plans = []
+    for size, names in zip(page_sizes, tuples):
+        kv_name, index_name, *aliases = names
+        folded_name = index_name + "_folded"
+        folded = folded_name in aliases
+        if folded:
+            aliases.remove(folded_name)
+        kv_size = specs[kv_name].unpadded_page_size_bytes
+        index_size = specs[index_name].unpadded_page_size_bytes
+        folded_size = specs[folded_name].unpadded_page_size_bytes if folded else 0
+        alias_size = max((specs[name].unpadded_page_size_bytes for name in aliases), default=0)
+        plans.append((kv_name, index_name, aliases, kv_size, index_size, folded_name, folded_size, alias_size))
+    if repack is None:
+        repack = any(
+            specs[name].page_size_padded is not None and specs[name].page_size_padded < kv_size + index_size
+            for _, _, aliases, kv_size, index_size, _, _, _ in plans
+            for name in aliases
+        )
+    used = [plan[3] + plan[4] + plan[6] for plan in plans]
+    moved = {}
+    receivers = {}
+    if repack and not any(plan[6] for plan in plans):
+        for i, (_, _, aliases, kv_size, index_size, _, _, alias_size) in enumerate(plans):
+            if not aliases or i in receivers or kv_size + index_size <= max(kv_size, alias_size):
+                continue
+            for j, size in enumerate(page_sizes):
+                if j == i or j in moved or j in receivers:
+                    continue
+                if size - used[j] >= index_size:
+                    moved[i] = (j, used[j])
+                    receivers[j] = i
+                    used[j] += index_size
+                    break
+    slots = []
+    for i, (kv_name, index_name, aliases, kv_size, index_size, folded_name, folded_size, alias_size) in enumerate(
+        plans
+    ):
+        size = max(kv_size, alias_size) if i in moved else page_sizes[i]
+        placements = [CachePlacement(kv_name, 0, kv_size)]
+        if i not in moved:
+            # The padding after a resident index can hold a relocated index;
+            # its logical payload size does not change.
+            index_page = index_size if i in receivers or folded_size else size - kv_size
+            placements.append(CachePlacement(index_name, kv_size, index_page))
+        if folded_size:
+            placements.append(CachePlacement(folded_name, kv_size + index_size, size - kv_size - index_size))
+        placements.extend(CachePlacement(name, 0, size) for name in aliases)
+        if i in receivers:
+            source = receivers[i]
+            placements.append(CachePlacement(plans[source][1], moved[source][1], plans[source][4]))
+        if any(p.offset < 0 or p.offset + p.page_size > size for p in placements):
+            raise ValueError("DeepSeek V4.1 cache plane exceeds its physical slot")
+        slots.append(CacheSlot(size, tuple(placements)))
+    names = [p.name for slot in slots for p in slot.placements]
+    if len(names) != len(set(names)) or set(names) != set(specs):
+        raise ValueError("DeepSeek V4.1 slot placement must cover every resource exactly once")
+    return tuple(slots)
+
+
+def group_cache_specs(specs, *, repack=False):
     """Merge full-context resources and pad layer tuples without mutating inputs."""
     if specs and all(isinstance(spec, AscendSlidingWindowMLASpec) for spec in specs.values()):
         return [UniformTypeKVCacheSpecs.from_specs({name: spec}) for name, spec in specs.items()]
-    page_sizes, layer_tuples = get_layer_tuples(specs)
-    padded = {}
-    for page_size, layer_tuple in zip(page_sizes, layer_tuples):
-        kv_name, index_name, *rest = layer_tuple
-        folded_name = index_name + "_folded"
-        has_folded = folded_name in rest
-        aliases = rest[1:] if has_folded else rest
-        kv_bytes = specs[kv_name].unpadded_page_size_bytes
-        index_bytes = specs[index_name].unpadded_page_size_bytes
-        padded[kv_name] = replace(specs[kv_name], page_size_padded=kv_bytes)
-        padded[index_name] = replace(
-            specs[index_name], page_size_padded=index_bytes if has_folded else page_size - kv_bytes
-        )
-        if has_folded:
-            padded[folded_name] = replace(specs[folded_name], page_size_padded=page_size - kv_bytes - index_bytes)
-        padded.update((name, replace(specs[name], page_size_padded=page_size)) for name in aliases)
+    _, layer_tuples = get_layer_tuples(specs)
+    padded = {
+        placement.name: replace(specs[placement.name], page_size_padded=placement.page_size)
+        for slot in plan_cache_slots(specs, repack=repack)
+        for placement in slot.placements
+    }
 
     mla_names = [name for name, spec in padded.items() if isinstance(spec, AscendMLAAttentionSpec)]
     state_names = [name for name, spec in padded.items() if isinstance(spec, CircularBufferSpec)]
@@ -264,8 +340,15 @@ def _specs_from_groups(groups):
 
 
 def get_deepseek_v41_pool_bytes_per_block(groups):
-    page_sizes, _ = get_layer_tuples(_specs_from_groups(groups))
-    return sum(page_sizes)
+    return sum(slot.page_size for slot in plan_cache_slots(_specs_from_groups(groups)))
+
+
+def get_deepseek_v41_cache_offsets(groups):
+    return {
+        placement.name: placement.offset
+        for slot in plan_cache_slots(_specs_from_groups(groups))
+        for placement in slot.placements
+    }
 
 
 def get_deepseek_v41_kv_cache_config(
@@ -274,11 +357,27 @@ def get_deepseek_v41_kv_cache_config(
     available_memory: int,
 ) -> KVCacheConfig:
     """Allocate independent layer slots backed by one global block-ID pool."""
-    page_sizes, layer_tuples = get_layer_tuples(_specs_from_groups(groups))
-    capacity = max(available_memory // sum(page_sizes), 0)
+    slots = plan_cache_slots(_specs_from_groups(groups))
+    if not slots or any(slot.page_size <= 0 for slot in slots):
+        raise ValueError("DeepSeek V4.1 requires non-empty positive cache slots")
+    capacity = max(available_memory // sum(slot.page_size for slot in slots), 0)
+    # Some device kernels form byte offsets in 32 bits. Bound the end of
+    # every page, not just its starting address, and never pin a memory size.
+    safe_blocks = min(KV_ADDRESS_SPACE_BYTES // slot.page_size for slot in slots)
+    capacity = min(capacity, safe_blocks)
     num_blocks = may_override_num_blocks(vllm_config, capacity)
+    if num_blocks < 2 or num_blocks > capacity:
+        raise ValueError("DeepSeek V4.1 block override exceeds available memory or the 32-bit address limit")
+    logger.info(
+        "DeepSeek V4.1 KV slots: strides=%s, safe blocks=%d, allocated blocks=%d",
+        [s.page_size for s in slots],
+        safe_blocks,
+        num_blocks,
+    )
     tensors: list[KVCacheTensor] = []
-    for page_size, layer_names in zip(page_sizes, layer_tuples):
+    for slot in slots:
+        page_size = slot.page_size
+        layer_names = [p.name for p in slot.placements]
         size = num_blocks * page_size
         tensors.append(
             KVCacheTensor(

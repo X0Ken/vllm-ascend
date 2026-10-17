@@ -6,6 +6,8 @@ import types
 import unittest
 from unittest.mock import Mock
 
+from vllm_ascend.config_utils import dsv41_admission_config
+
 SOURCE = pathlib.Path(__file__).resolve().parents[4] / "vllm_ascend/patch/worker/v41_prefill_policy.py"
 spec = importlib.util.spec_from_file_location("v41_prefill_policy", SOURCE)
 policy = importlib.util.module_from_spec(spec)
@@ -77,3 +79,22 @@ class PrefillPolicyTest(unittest.TestCase):
                 policy.backfill_structured_drafts(engine, output)
                 engine.model_executor.take_draft_token_ids.assert_not_called()
                 engine.scheduler.update_draft_token_ids_in_output.assert_not_called()
+
+
+class AdmissionConfigTest(unittest.TestCase):
+    def test_disabled_does_not_require_a_worker_singleton(self):
+        self.assertEqual(dsv41_admission_config(types.SimpleNamespace(additional_config={})), (False, 1))
+
+    def test_enabled_and_positive_batch_limit(self):
+        runtime = types.SimpleNamespace(
+            additional_config={"enable_dsv41_admission_gate": True, "dsv41_gate_max_prefills": 8}
+        )
+        self.assertEqual(dsv41_admission_config(runtime), (True, 8))
+
+    def test_invalid_batch_limits_are_rejected(self):
+        for maximum in (0, -1, True, 1.5, "8"):
+            runtime = types.SimpleNamespace(
+                additional_config={"enable_dsv41_admission_gate": True, "dsv41_gate_max_prefills": maximum}
+            )
+            with self.subTest(maximum=maximum), self.assertRaises(ValueError):
+                dsv41_admission_config(runtime)

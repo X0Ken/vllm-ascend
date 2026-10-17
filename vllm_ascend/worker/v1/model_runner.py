@@ -178,6 +178,7 @@ from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
 from vllm_ascend.model_executor.offloader import create_offloader
 from vllm_ascend.models.deepseek_v41.cache_config import (
+    get_deepseek_v41_cache_offsets,
     is_deepseek_v41_cache,
 )
 from vllm_ascend.models.glm5next.cache_views import view_glm5_next_cache
@@ -5874,7 +5875,9 @@ class NPUModelRunner(GPUModelRunner):
         layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
         uses_padded_page_layout = requires_padded_page_layout(layer_kv_cache_spec.values())
         layer_tuple_strides = {}
+        layer_tuple_offsets = {}
         if is_deepseek_v41_cache(layer_kv_cache_spec):
+            layer_tuple_offsets = get_deepseek_v41_cache_offsets(kv_cache_config.kv_cache_groups)
             layer_tuple_strides = {
                 name: descriptor.block_stride
                 for descriptor in kv_cache_config.kv_cache_tensors
@@ -5911,7 +5914,7 @@ class NPUModelRunner(GPUModelRunner):
 
                 if layer_name in layer_tuple_strides:
                     block_stride = layer_tuple_strides[layer_name]
-                    initial_offset = 0
+                    initial_offset = layer_tuple_offsets[layer_name]
                     kv_cache_shape = attn_backend.get_kv_cache_shape(
                         kv_cache_config.num_blocks,
                         get_storage_block_size(current_kv_cache_spec),
@@ -5925,9 +5928,6 @@ class NPUModelRunner(GPUModelRunner):
                         and current_kv_cache_spec.scale_dim
                     )
                     if is_index:
-                        source_name = layer_name.removesuffix(".indexer.k_cache") + ".long_kv_cache"
-                        source_spec = layer_kv_cache_spec[source_name]
-                        initial_offset = source_spec.unpadded_page_size_bytes
                         kv_cache_shape_list.append(
                             attn_backend.get_kv_cache_shape(
                                 kv_cache_config.num_blocks,

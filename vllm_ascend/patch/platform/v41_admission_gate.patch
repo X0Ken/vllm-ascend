@@ -1,0 +1,241 @@
+diff --git a/tests/v1/core/test_scheduler.py b/tests/v1/core/test_scheduler.py
+index 91c93ed68f..472ee0eb64 100644
+--- a/tests/v1/core/test_scheduler.py
++++ b/tests/v1/core/test_scheduler.py
+@@ -7226,3 +7226,49 @@ def test_diffusion_read_deferral_keeps_a_longer_pp_wait():
+     # Deferring this step alone would ask for 6. The PP wait to 7 stands.
+     assert "read" not in scheduler.schedule().num_scheduled_tokens
+     assert read.next_decode_eligible_step == 7
++
++
++@pytest.mark.parametrize("maximum", [1, 2])
++def test_dsv41_admission_gate_separates_existing_decode_from_new_prefills(maximum):
++    scheduler = create_scheduler(max_num_batched_tokens=256)
++    scheduler.admission_gate_enabled = True
++    scheduler._gate_max_prefill = maximum
++    (decode,) = create_requests(1, num_tokens=8, req_ids=["decode"])
++    scheduler.add_request(decode)
++    output = scheduler.schedule()
++    scheduler.update_from_output(
++        output,
++        ModelRunnerOutput(
++            req_ids=["decode"],
++            req_id_to_index={"decode": 0},
++            sampled_token_ids=[[0]],
++            logprobs=None,
++            prompt_logprobs_dict={},
++            pooler_output=[],
++        ),
++    )
++    for request in create_requests(3, num_tokens=8, req_ids=["p0", "p1", "p2"]):
++        scheduler.add_request(request)
++    output = scheduler.schedule()
++    assert "decode" not in output.num_scheduled_tokens
++    assert len(output.num_scheduled_tokens) == maximum
++    # Forced decode-only steps must keep the waiting prefills queued.
++    waiting_ids = {request.request_id for request in scheduler.waiting}
++    scheduler._gate_force_decode_steps = 1
++    output = scheduler.schedule()
++    assert "decode" in output.num_scheduled_tokens
++    assert waiting_ids.isdisjoint(output.num_scheduled_tokens)
++
++
++def test_dsv41_admission_gate_retries_decode_when_prefill_cannot_allocate(monkeypatch):
++    scheduler = create_scheduler(max_num_batched_tokens=256)
++    scheduler.admission_gate_enabled = True
++    for request in create_requests(1, num_tokens=8):
++        scheduler.add_request(request)
++    monkeypatch.setattr(
++        scheduler.kv_cache_manager, "allocate_slots", lambda *_a, **_kw: None
++    )
++    output = scheduler.schedule()
++    assert output.total_num_scheduled_tokens == 0
++    assert scheduler._gate_force_decode_steps == 2
++    assert len(scheduler.waiting) == 1
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 8b188de138..01d8c2cdaf 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -90,6 +90,13 @@ class Scheduler(SchedulerInterface):
+     ) -> None:
+         self.vllm_config = vllm_config
+         self.scheduler_config = vllm_config.scheduler_config
++        from vllm_ascend.config_utils import dsv41_admission_config
++
++        self.admission_gate_enabled, self._gate_max_prefill = dsv41_admission_config(
++            vllm_config
++        )
++        self._gate_force_decode_steps = 0
++        self._gate_prefill_fail_streak = 0
+         self.cache_config = vllm_config.cache_config
+         self.lora_config = vllm_config.lora_config
+         self.model_uses_mrope = vllm_config.model_config.uses_mrope
+@@ -411,6 +418,42 @@ class Scheduler(SchedulerInterface):
+         # async KV loads). Their remaining-block reservation gates async loads.
+         self._inflight_prefills: set[Request] = set()
+ 
++    def _gate_is_prefill_request(
++        self, request: Request, num_computed_tokens: int | None = None
++    ) -> bool:
++        """Classify actual prompt work, excluding output placeholders."""
++        computed = (
++            request.num_computed_tokens
++            if num_computed_tokens is None
++            else num_computed_tokens
++        )
++        return computed < request.num_prompt_tokens
++
++    def _gate_has_prefill_work(self) -> bool:
++        """Whether any request could be scheduled as prefill work this step.
++
++        A running prefill chunk always counts (it already holds blocks). A
++        waiting request only counts if there is room in the running batch and
++        the request is not currently blocked on an external dependency.
++        """
++        if any(self._gate_is_prefill_request(req) for req in self.running):
++            return True
++        num_running = len(self.running) + self.num_waiting_for_streaming_input
++        if num_running >= self.max_num_active_reqs:
++            return False
++        for queue in (self.kv_holding_waiting, self.waiting):
++            for request in queue:
++                if self._is_blocked_waiting_status(request.status):
++                    continue
++                if (
++                    request.num_stale_output_tokens > 0
++                    and not request.drop_stale_output
++                ):
++                    continue
++                if self._gate_is_prefill_request(request):
++                    return True
++        return False
++
+     def _mamba_block_aligned_split(
+         self,
+         request: Request,
+@@ -625,6 +668,17 @@ class Scheduler(SchedulerInterface):
+                 long_prefill_token_threshold, input_budget // num_eligible_reqs
+             )
+ 
++        gate_enabled = self.admission_gate_enabled
++        gate_prefill_step = False
++        gate_prefill_done = False
++        gate_prefill_admitted = 0
++        gate_async_admission = False
++        if gate_enabled:
++            if self._gate_force_decode_steps > 0:
++                self._gate_force_decode_steps -= 1
++            elif token_budget > 0 and not defer_prefills:
++                gate_prefill_step = self._gate_has_prefill_work()
++
+         # First, schedule the RUNNING requests.
+         req_index = 0
+         while req_index < len(self.running) and token_budget > 0:
+@@ -671,6 +725,19 @@ class Scheduler(SchedulerInterface):
+                 req_index += 1
+                 continue
+ 
++            if gate_enabled:
++                if gate_prefill_step:
++                    # Prefill-only step: keep bounded prompt work and no
++                    # decode tokens. Deferred decodes stay in self.running.
++                    if not self._gate_is_prefill_request(request):
++                        req_index += 1
++                        continue
++                elif self._gate_is_prefill_request(request):
++                    # Decode-only step: in-flight prefill chunks wait for the
++                    # next prefill-only step.
++                    req_index += 1
++                    continue
++
+             num_new_tokens = (
+                 request.num_tokens_with_spec
+                 + request.num_output_placeholders
+@@ -859,6 +926,13 @@ class Scheduler(SchedulerInterface):
+                     if self.ec_connector is not None:
+                         self.ec_connector.update_state_after_alloc(request, i)
+ 
++            if gate_prefill_step:
++                # Bound the number of prefill requests in this output.
++                gate_prefill_admitted += 1
++                if gate_prefill_admitted >= self._gate_max_prefill or token_budget <= 0:
++                    gate_prefill_done = True
++                    break
++
+         # Record the LoRAs in scheduled_running_reqs
+         scheduled_loras: set[int] = set()
+         if self.lora_config:
+@@ -921,6 +995,9 @@ class Scheduler(SchedulerInterface):
+                     skip_request(request_queue)
+                     continue
+ 
++                if gate_enabled and gate_prefill_done:
++                    break
++
+                 num_external_computed_tokens = 0
+                 load_kv_async = False
+                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
+@@ -1171,6 +1248,14 @@ class Scheduler(SchedulerInterface):
+                         # The request cannot be scheduled.
+                         break
+ 
++                if gate_enabled and not load_kv_async:
++                    request_is_prefill = self._gate_is_prefill_request(
++                        request, num_computed_tokens
++                    )
++                    if request_is_prefill != gate_prefill_step:
++                        skip_request(request_queue)
++                        continue
++
+                 # During async KV load, no forward pass is run yet.
+                 # Allocate speculative lookahead slots later to avoid
+                 # mismatching local and remote block counts.
+@@ -1285,6 +1370,10 @@ class Scheduler(SchedulerInterface):
+                             )
+                         )
+                     skip_request(request_queue)
++                    if gate_prefill_step:
++                        gate_async_admission = True
++                        gate_prefill_done = True
++                        break
+                     continue
+ 
+                 request = request_queue.pop_request()
+@@ -1338,6 +1427,12 @@ class Scheduler(SchedulerInterface):
+                         if self.ec_connector is not None:
+                             self.ec_connector.update_state_after_alloc(request, i)
+ 
++                if gate_prefill_step:
++                    gate_prefill_admitted += 1
++                    if gate_prefill_admitted >= self._gate_max_prefill:
++                        gate_prefill_done = True
++                        break
++
+             # re-queue requests skipped in this pass ahead of older skipped items.
+             if step_skipped_kv_holding:
+                 self.kv_holding_waiting.prepend_requests(step_skipped_kv_holding)
+@@ -1356,6 +1451,24 @@ class Scheduler(SchedulerInterface):
+ 
+         assert token_budget >= 0
+         assert input_budget >= 0
++        if gate_enabled:
++            kinds = {
++                self._gate_is_prefill_request(self.requests[req_id])
++                for req_id in num_scheduled_tokens
++            }
++            if len(kinds) > 1 or (kinds and gate_prefill_step not in kinds):
++                raise RuntimeError(
++                    "DeepSeek V4.1 admission gate produced a mixed batch"
++                )
++            if gate_prefill_step and total_num_scheduled_tokens:
++                self._gate_prefill_fail_streak = 0
++            elif gate_prefill_step and not gate_async_admission:
++                # Let decode holders release KV when prefill cannot allocate.
++                self._gate_prefill_fail_streak += 1
++                self._gate_force_decode_steps = min(
++                    2 ** min(self._gate_prefill_fail_streak, 3), 8
++                )
++
+         assert len(self.running) <= self.max_num_running_reqs
+         # Since some requests in the RUNNING queue may not be scheduled in
+         # this step, the total number of scheduled requests can be smaller than

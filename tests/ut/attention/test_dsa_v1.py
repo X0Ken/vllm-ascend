@@ -2872,6 +2872,7 @@ def test_pcp_local_o_projection_adds_static_quant_bias_once(tp_size, reduce_resu
 def test_o_proj_capacity_tracks_decode_graph_not_profile_budget(tp_size, decode_capacity, scheduler_capacity):
     impl = AscendDSAImpl.__new__(AscendDSAImpl)
     impl.n_local_groups = tp_size
+    impl.use_o_proj_2d = False
     impl.support_fp8_attention = False
     impl.wo_a = SimpleNamespace(weight=torch.ones(1, 2, 2))
     impl.wo_b = lambda x: x
@@ -3119,6 +3120,7 @@ def test_o_proj_profile_runs_only_decode_capacity(profile_tokens, capacity):
 def test_a5_fp8_o_proj_keeps_otp_collectives(tp_size, num_tokens):
     impl = _make_impl()
     impl.n_local_groups = tp_size
+    impl.use_o_proj_2d = False
     impl.support_fp8_attention = True
     impl.wo_a = SimpleNamespace(
         weight=torch.ones(1, 2, 2),
@@ -3335,3 +3337,13 @@ def test_sparse_flash_forward_requires_draft_metadata(is_draft):
         assert kwargs["ori_win_left"] == kwargs["ori_win_right"] == -1
     else:
         assert "ori_topk_length" not in kwargs
+@pytest.mark.parametrize("tokens", [0, 1, 6, 32])
+def test_single_group_o_projection_2d_preserves_grouped_values(tokens):
+    impl = _make_impl()
+    impl.n_local_groups = 1
+    impl.support_fp8_attention = False
+    impl.wo_a = SimpleNamespace(weight=torch.randn(1, 4, 3))
+    x = torch.randn(tokens, 1, 4)
+    expected = torch.bmm(x.transpose(0, 1), impl.wo_a.weight).transpose(0, 1)
+    impl.use_o_proj_2d = True
+    torch.testing.assert_close(impl._wo_a_bmm(x), expected)

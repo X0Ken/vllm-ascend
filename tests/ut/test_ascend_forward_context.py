@@ -665,3 +665,14 @@ def test_extra_ctx_env_true_uses_additional_kwargs(monkeypatch):
     assert afc._EXTRA_CTX.capturing is False
     assert forward_context.capturing is True
     assert forward_context.additional_kwargs["capturing"] is False
+@pytest.mark.parametrize("lora", [False, True])
+def test_dsv41_allgather_override_preserves_lora_requirement(monkeypatch, lora):
+    monkeypatch.setattr(afc, "get_ascend_config", lambda: SimpleNamespace(enable_dsv41_moe_allgather=True))
+    monkeypatch.setattr(afc, "is_moe_model", lambda _: True)
+    monkeypatch.setattr(afc, "get_mc2_tokens_capacity", lambda: 128)
+    monkeypatch.setattr(afc, "get_ep_group", lambda: SimpleNamespace(world_size=8))
+    runtime = _make_vllm_config()
+    runtime.model_config.hf_text_config.model_type = "deepseek_v41"
+    runtime.lora_config = object() if lora else None
+    expected = MoECommType.ALLTOALL if lora else MoECommType.ALLGATHER
+    assert afc.select_moe_comm_method(6, runtime) is expected
