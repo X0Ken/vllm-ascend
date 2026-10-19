@@ -428,10 +428,9 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             global_num_experts = len(expert_map) + global_redundant_expert_num
             first_expert_idx = get_ep_group().rank_in_group * self.num_experts_local
             last_expert_idx = first_expert_idx + self.num_experts_local
-            config = get_current_vllm_config()
             if (
                 getattr(get_ascend_config(), "enable_dsv41_moe_mask_range", False) is True
-                and not config.parallel_config.enable_eplb
+                and not get_current_vllm_config().parallel_config.enable_eplb
                 and global_redundant_expert_num == 0
             ):
                 mask = self._expert_range.mask(

@@ -524,6 +524,41 @@ class TestTokenDispatcherWithMC2(TestBase):
         self.assertTrue(output.combine_metadata.quant.dispatch_with_quant)
 
 
+@pytest.mark.parametrize("ascend_config", [SimpleNamespace(), SimpleNamespace(enable_dsv41_moe_mask_range=False)])
+def test_allgather_expert_map_without_current_vllm_config(ascend_config):
+    # MRV2 profiling may dispatch without an ambient vLLM config. The default
+    # expert-map path must not read config needed only by the opt-in mask.
+    dispatcher = TokenDispatcherWithAllGather(top_k=2, num_experts=4, num_local_experts=2)
+    hidden_states = torch.randn(2, 4)
+    token_dispatch_input = build_token_dispatch_input_fixture(
+        hidden_states=hidden_states,
+        topk_weights=torch.tensor([[0.2, 0.8], [0.7, 0.3]]),
+        topk_ids=torch.tensor([[0, 2], [3, 1]]),
+        expert_map=torch.tensor([-1, -1, 0, 1]),
+    )
+    with (
+        patch(
+            "vllm_ascend.ops.fused_moe.token_dispatcher.get_current_vllm_config",
+            side_effect=AssertionError("Current vLLM config is not set."),
+        ) as mock_config,
+        patch("vllm_ascend.ops.fused_moe.token_dispatcher.get_ascend_config", return_value=ascend_config),
+        patch(
+            "vllm_ascend.ops.fused_moe.token_dispatcher.get_ep_group",
+            return_value=SimpleNamespace(rank_in_group=1),
+        ),
+        patch(
+            "vllm_ascend.ops.fused_moe.token_dispatcher.DeviceOperator.npu_moe_init_routing",
+            return_value=(hidden_states, torch.arange(4), torch.tensor([1, 1]), None),
+        ) as mock_init_routing,
+    ):
+        output = dispatcher.token_dispatch(token_dispatch_input)
+
+    mock_config.assert_not_called()
+    torch.testing.assert_close(output.combine_metadata.topk_weights, torch.tensor([[0.0, 0.8], [0.7, 0.0]]))
+    assert mock_init_routing.call_args.kwargs["active_expert_range"] == [2, 4]
+    assert mock_init_routing.call_args.kwargs["expert_num"] == 4
+
+
 def test_allgather_token_dispatch_quant_mode_without_dynamic_scale():
     dispatcher = TokenDispatcherWithAllGather(top_k=2, num_experts=128)
     hidden_states = torch.randn(3, 128)
