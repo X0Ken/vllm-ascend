@@ -32,6 +32,7 @@ for patch_name in (
     "v41_external_swa_restore.patch",
     "v41_frontend_compat.patch",
     "v41_admission_gate.patch",
+    "v41_opt3.patch",
 ):
     subprocess.run(
         [
