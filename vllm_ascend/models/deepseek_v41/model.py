@@ -988,7 +988,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         self.hc_mult = config.hc_mult
         spec_config = vllm_config.speculative_config
         needs_mtp_hidden_states = spec_config is not None and (
-            spec_config.use_eagle() or spec_config.uses_draft_model()
+            (spec_config.use_eagle() or spec_config.uses_draft_model()) and spec_config.method != "dspark"
         )
         self._mtp_hidden_buffer = (
             torch.empty(

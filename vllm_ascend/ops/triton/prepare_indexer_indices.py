@@ -135,7 +135,7 @@ def prepare_indexer_indices(
         SORT_KEY_SHIFT=1 << 23,
         NEGATIVE_KEY_BASE=0x81800000 - (1 << 32),
         WRITE_LENGTHS=write_lengths,
-        multibuffer=False,
+        multibuffer=True,
         unit_flag=False,
     )
     if lengths_output is not None and not write_lengths:

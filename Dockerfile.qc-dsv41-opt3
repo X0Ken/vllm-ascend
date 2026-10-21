@@ -1,0 +1,11 @@
+# Reuse the qualified P10 ABI and native operators; update Python source only.
+ARG BASE_IMAGE=vllm-ascend-qc-dsv41:p10-20261018
+FROM ${BASE_IMAGE}
+ARG SOURCE_COMMIT
+LABEL org.opencontainers.image.revision=${SOURCE_COMMIT} \
+      qc.source.branch=qc-ascend-dsv41 qc.release=p11-opt3 \
+      qc.runtime.base=sha256:540ae89d91dc719c5382a19b84c407e1c0283700e6ca951b541fd136fd37c37c
+RUN python3 -c 'import hashlib,json,pathlib; r=pathlib.Path("/vllm-workspace/vllm-ascend"); pathlib.Path("/opt/qc-opt3-native-base.json").write_text(json.dumps({str(p.relative_to(r)):hashlib.sha256(p.read_bytes()).hexdigest() for p in (r/"csrc").rglob("*") if p.is_file() and p.suffix in (".cpp",".h",".hpp",".cmake") and not any(x in p.parts for x in ("build","build_out","output","third_party"))}))'
+COPY . /vllm-workspace/vllm-ascend/
+WORKDIR /vllm-workspace/vllm-ascend
+RUN python3 tools/qc_dsv41/update_opt3.py
