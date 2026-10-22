@@ -33,6 +33,7 @@ for patch_name in (
     "v41_frontend_compat.patch",
     "v41_admission_gate.patch",
     "v41_opt3.patch",
+    "v41_terminal_consumer.patch",
 ):
     subprocess.run(
         [

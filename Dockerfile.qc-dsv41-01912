@@ -1,0 +1,10 @@
+# Retain the qualified P10 native/Rust ABI and the pre-merge opt3 runtime.
+ARG BASE_IMAGE=vllm-ascend-qc-dsv41:before-01912-20261022
+FROM ${BASE_IMAGE}
+ARG SOURCE_COMMIT
+LABEL org.opencontainers.image.revision=${SOURCE_COMMIT} \
+      qc.source.branch=qc-ascend-dsv41 qc.release=p12-01912 \
+      qc.runtime.base=sha256:540ae89d91dc719c5382a19b84c407e1c0283700e6ca951b541fd136fd37c37c
+COPY . /vllm-workspace/vllm-ascend/
+WORKDIR /vllm-workspace/vllm-ascend
+RUN python3 tools/qc_dsv41/update_01912.py
