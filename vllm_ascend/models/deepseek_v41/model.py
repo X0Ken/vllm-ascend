@@ -67,6 +67,11 @@ from vllm_ascend.models.common.ops.sequence_parallel import (
     sp_reduce_scatter,
     sp_shard,
 )
+from vllm_ascend.models.deepseek_v41.consumer_compaction_runtime import (
+    prepare_terminal_consumer,
+    restore_terminal_consumer,
+    run_terminal_moe,
+)
 from vllm_ascend.ops.dsa import AscendDeepseekSparseAttention, DSAModules
 from vllm_ascend.ops.rope_dsv4 import ComplexExpRotaryEmbedding
 from vllm_ascend.ops.triton.mul_add import muls_add_triton
@@ -824,6 +829,9 @@ class DeepseekV41DecoderLayer(nn.Module):
             prefix=f"{prefix}.mlp",
             is_draft_layer=is_draft_layer,
         )
+        self.compact_mlp_name = f"{prefix}.terminal_compact_mlp"
+        if not is_draft_layer and self.layer_idx == config.num_hidden_layers - 1:
+            vllm_config.compilation_config.static_forward_context[self.compact_mlp_name] = self.mlp
         self.input_layernorm = RMSNorm(config.hidden_size, eps=self.norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=self.norm_eps)
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
@@ -892,6 +900,7 @@ class DeepseekV41DecoderLayer(nn.Module):
         pre_mix,
         llama_4_scaling=None,
         input_ids=None,
+        consumer_output_indices=None,
     ):
         use_sequence_parallel = getattr(self, "use_sequence_parallel", False)
         residual = hidden_states
@@ -923,17 +932,41 @@ class DeepseekV41DecoderLayer(nn.Module):
             self.hc_eps,
             self.post_attention_layernorm.variance_epsilon,
         )
-        x = self.mlp(
-            x,
-            input_ids=input_ids,
-            hidden_states_fp32=x_fp32,
-            already_sequence_parallel=use_sequence_parallel,
-        )
+        if consumer_output_indices is not None:
+            x, residual, ffn_post, ffn_comb, ffn_pre = run_terminal_moe(
+                x,
+                residual,
+                ffn_post,
+                ffn_comb,
+                ffn_pre,
+                x_fp32,
+                input_ids,
+                consumer_output_indices,
+                self.compact_mlp_name,
+            )
+        else:
+            x = self.mlp(
+                x,
+                input_ids=input_ids,
+                hidden_states_fp32=x_fp32,
+                already_sequence_parallel=use_sequence_parallel,
+            )
         hidden_states = self.hc_post(x, residual, ffn_post, ffn_comb)
         return hidden_states, ffn_pre
 
 
-@support_torch_compile(dynamic_arg_dims={"input_ids": 0, "positions": 0, "intermediate_tensors": 0, "inputs_embeds": 0})
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+        "consumer_output_indices": 0,
+        "consumer_tail_indices": 0,
+        "consumer_tail_query_start_loc": 0,
+        "consumer_compact_output_indices": 0,
+    }
+)
 class DeepseekV41Model(nn.Module, EagleModelMixin):
     """V4.1 backbone with delayed HC collapse and shared attention state."""
 
@@ -1528,6 +1561,10 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         engram_graph_events=False,
         lookback_token_ids=None,
         engram_mask_ready_event=None,
+        consumer_output_indices=None,
+        consumer_tail_indices=None,
+        consumer_tail_query_start_loc=None,
+        consumer_compact_output_indices=None,
     ):
         use_sequence_parallel = getattr(self, "use_sequence_parallel", False)
         hidden_states = inputs_embeds if inputs_embeds is not None else self.embed_input_ids(input_ids)
@@ -1563,8 +1600,12 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             input_ids = sp_shard(input_ids)
             token_mask = sp_shard(token_mask)
         hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+        if consumer_output_indices is not None:
+            if self._mtp_hidden_buffer is not None or use_sequence_parallel or not self.aux_hidden_state_layers:
+                raise RuntimeError("Terminal consumer compaction requires the DSpark aux-only, non-SP contract")
         pre_mix = hidden_states.new_zeros(hidden_states.shape[0], self.hc_mult, dtype=torch.float32)
         pre_mix[:, 0] = 1.0
+        original_num_output_rows = positions.shape[0]
         last_layer = None
         aux_hidden_states = []
         for layer in self.layers:
@@ -1604,7 +1645,31 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                     self.engram_rotation if self.engram_rotated else None,
                     sequence_parallel=use_sequence_parallel,
                 )
-            hidden_states, pre_mix = layer(positions, hidden_states, pre_mix, None, input_ids=input_ids)
+            is_terminal = layer.layer_idx == self.config.num_hidden_layers - 1
+            if is_terminal and consumer_tail_indices is not None:
+                hidden_states, pre_mix, positions = prepare_terminal_consumer(
+                    hidden_states,
+                    pre_mix,
+                    positions,
+                    consumer_tail_indices,
+                    consumer_tail_query_start_loc,
+                    self.config.sliding_window,
+                    layer.self_attn.v41_layer_name,
+                )
+                if input_ids is not None:
+                    input_ids = input_ids.index_select(0, consumer_tail_indices.long())
+            hidden_states, pre_mix = layer(
+                positions,
+                hidden_states,
+                pre_mix,
+                None,
+                input_ids=input_ids,
+                consumer_output_indices=(
+                    (consumer_compact_output_indices if consumer_tail_indices is not None else consumer_output_indices)
+                    if is_terminal
+                    else None
+                ),
+            )
         assert last_layer is not None, "Hyper-connection collapse requires at least one decoder layer"
         # MTP needs full HC states
         if self._mtp_hidden_buffer is not None:
@@ -1618,12 +1683,18 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         if use_sequence_parallel and self._mtp_hidden_buffer is None:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
         hidden_states = self.norm(hidden_states)
+        if consumer_output_indices is not None:
+            hidden_states = restore_terminal_consumer(hidden_states)
+            complete_output = hidden_states.new_zeros((original_num_output_rows, hidden_states.shape[-1]))
+            complete_output.index_copy_(0, consumer_output_indices.long(), hidden_states)
+            hidden_states = complete_output
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
 
 
 class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, SupportsPP, SupportsLoRA, SupportsEagle3):
+    supports_consumer_ffn_compaction = False
     packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
     model_cls = DeepseekV41Model
 
@@ -1639,6 +1710,11 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
         self.requires_uncompiled_fallback = DeviceOperator.get_dsv41_packed_cache_ops() is not None
 
         self.model = self.model_cls(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
+        from vllm_ascend.models.deepseek_v41.consumer_compaction import supports_terminal_consumer
+
+        self.supports_consumer_ffn_compaction = supports_terminal_consumer(
+            getattr(self.model.layers[-1], "self_attn", None)
+        )
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
@@ -1722,6 +1798,10 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
         engram_mask_ready_event=None,
         engram_query_start_loc=None,
         engram_valid_token_count=None,
+        consumer_output_indices=None,
+        consumer_tail_indices=None,
+        consumer_tail_query_start_loc=None,
+        consumer_compact_output_indices=None,
     ):
         if engram_query_start_loc is not None:
             with self.model.captured_engram_inputs(
@@ -1733,6 +1813,10 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
                     intermediate_tensors,
                     inputs_embeds,
                     lookback_token_ids=lookback_token_ids,
+                    consumer_output_indices=consumer_output_indices,
+                    consumer_tail_indices=consumer_tail_indices,
+                    consumer_tail_query_start_loc=consumer_tail_query_start_loc,
+                    consumer_compact_output_indices=consumer_compact_output_indices,
                     **graph_inputs,
                 )
         return self.model(
@@ -1746,6 +1830,10 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
             engram_graph_events=engram_graph_events,
             lookback_token_ids=lookback_token_ids,
             engram_mask_ready_event=engram_mask_ready_event,
+            consumer_output_indices=consumer_output_indices,
+            consumer_tail_indices=consumer_tail_indices,
+            consumer_tail_query_start_loc=consumer_tail_query_start_loc,
+            consumer_compact_output_indices=consumer_compact_output_indices,
         )
 
     @property

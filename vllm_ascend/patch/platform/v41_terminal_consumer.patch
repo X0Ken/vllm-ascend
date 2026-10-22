@@ -1,0 +1,61 @@
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1941,6 +1941,57 @@
+             model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
+             del intermediate_tensors
+-
++
++        parallel = self.vllm_config.parallel_config
++        if (
++            getattr(getattr(self.model, "language_model", self.model), "supports_consumer_ffn_compaction", False)
++            and not dummy_run
++            and not is_profile
++            and self.lora_config is None
++            and ubatch_state is None
++            and batch_desc.cg_mode == CUDAGraphMode.NONE
++            and input_batch.has_prefill
++            and np.all(input_batch.is_prefilling_np)
++            and input_batch.num_tokens > 256
++            and 0 < input_batch.logits_indices.numel() < input_batch.num_tokens // 2
++            and parallel.tensor_parallel_size == 8
++            and parallel.enable_expert_parallel
++            and parallel.data_parallel_size == parallel.pipeline_parallel_size == 1
++            and parallel.prefill_context_parallel_size == parallel.decode_context_parallel_size == 1
++            and not parallel.use_sequence_parallel_moe
++            and self.use_aux_hidden_state_outputs
++            and self.prompt_logprobs_worker is not None
++            and not self.prompt_logprobs_worker.uses_prompt_logprobs.any()
++            and not getattr(self.prompt_logprobs_worker, "token_id_scores", {})
++        ):
++            if not getattr(self, "_consumer_inputs_logged", False):
++                logger.info(
++                    "Terminal consumer inputs attached to model: output_rows=%d", input_batch.logits_indices.numel()
++                )
++                self._consumer_inputs_logged = True
++            model_inputs["consumer_output_indices"] = input_batch.logits_indices
++            # The guard-free compiled backbone was captured with optional
++            # consumer tensors set to None. New tensors do not select a new
++            # specialization there; use its raw forward for this NONE-only
++            # Prefill path while retaining the normal decode graph contract.
++            skip_compiled = True
++            if input_batch.logits_indices.numel() == input_batch.num_reqs:
++                from vllm_ascend.models.deepseek_v41.consumer_compaction import terminal_suffix_layout
++
++                window = int(self.model_config.hf_text_config.sliding_window)
++                layout = terminal_suffix_layout(
++                    input_batch.query_start_loc_np[: input_batch.num_reqs + 1].tolist(),
++                    window,
++                )
++                if layout is not None:
++                    indices, starts, outputs = layout
++                    model_inputs["consumer_tail_indices"] = torch.tensor(indices, device=self.device, dtype=torch.int64)
++                    model_inputs["consumer_tail_query_start_loc"] = torch.tensor(
++                        starts, device=self.device, dtype=torch.int32
++                    )
++                    model_inputs["consumer_compact_output_indices"] = torch.tensor(
++                        outputs, device=self.device, dtype=torch.int64
++                    )
++
+         # Update the EPLB meta.
+         ubatch_slices = ubatch_state.slices if ubatch_state is not None else None
+         self.eplb.prepare_forward(

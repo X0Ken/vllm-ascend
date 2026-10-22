@@ -440,9 +440,16 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
                     last_expert_idx,
                     capturing=getattr(get_forward_context(), "capturing", False),
                 )
+                topk_weights = topk_weights * mask
             else:
-                mask = expert_map[topk_ids] != -1
-            topk_weights = topk_weights * mask
+                from vllm_ascend.ops.triton.moe_dispatch_mask import mask_expert_weights
+
+                topk_weights = mask_expert_weights(topk_weights, topk_ids, expert_map)
+                if not getattr(self, "_dispatch_mask_fusion_seen", False):
+                    from vllm.logger import logger
+
+                    logger.info("MoE AllGather dispatch mask fusion active; quantization and GMM layout unchanged")
+                    self._dispatch_mask_fusion_seen = True
         else:
             first_expert_idx = 0
             last_expert_idx = self.num_experts_local

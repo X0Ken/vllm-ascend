@@ -193,6 +193,7 @@ class AscendDSAV41Metadata(AttentionMetadata):
     c2_metadata_group_id: int | None = None
     global_metadata: "AscendDSAV41Metadata | None" = None
     cp_token_range: tuple[int, int, int, int] | None = None
+    consumer_query_rows: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -621,6 +622,8 @@ class AscendDSAV41Impl:
             return None
         shared = attn.shared_state
         if not self.role.is_index_source:
+            if metadata.swa.consumer_query_rows is not None:
+                return shared.topk_indices.index_select(0, metadata.swa.consumer_query_rows.long())
             return shared.topk_indices[: hidden_states.shape[0]]
 
         context = get_forward_context().no_compile_layers
@@ -701,10 +704,11 @@ class AscendDSAV41Impl:
 
         operator_metadata = metadata.attention if has_compressed else metadata.swa
         op_metadata = operator_metadata.smla_metadata
-        wait_for_device_metadata(
-            DeviceMetadataStage.ATTENTION,
-            id(op_metadata),
-        )
+        if metadata.swa.consumer_query_rows is None:
+            wait_for_device_metadata(
+                DeviceMetadataStage.ATTENTION,
+                id(op_metadata),
+            )
         output, _ = torch.ops._C_ascend.npu_sparse_flash_mla(
             q,
             ori_kv=attn.dsa_attn.swa_cache_layer.kv_cache[0],
