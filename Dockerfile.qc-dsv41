@@ -8,11 +8,13 @@ ARG VLLM_SOURCE_SHA256=e20baf18e40f88446f745999379db04c8f88c173dc7afde5dc6b869c0
 LABEL qc.vllm.commit=${VLLM_COMMIT} qc.base.image=${BASE_IMAGE}
 LABEL qc.patch.vllm.origin=e100dddfd91e99d4ac90c28be82cdf4f73346c65 qc.patch.ascend.origin=6ac6e501614f85e5d7731c1ffd9d1f8db855e211
 LABEL org.opencontainers.image.revision=${SOURCE_COMMIT} qc.source.branch=qc-ascend-dsv41
-LABEL qc.release=p10
+LABEL qc.release=p13-main-rebase
 RUN apt-get update && apt-get install -y --no-install-recommends libjemalloc2=5.2.1-4ubuntu1 && \
     echo '6fa9db2a963459985457776a1301e94a53a006bea58776cbf9168f021156c70c  /lib/aarch64-linux-gnu/libjemalloc.so.2' | sha256sum -c - && \
     rm -rf /var/lib/apt/lists/*
 RUN python3 -c 'import hashlib,json,pathlib; r=pathlib.Path("/vllm-workspace/vllm-ascend"); pathlib.Path("/opt/qc-native-base.json").write_text(json.dumps({str(p.relative_to(r)):hashlib.sha256(p.read_bytes()).hexdigest() for p in (r/"csrc").rglob("*") if p.is_file() and p.suffix in (".cpp",".h",".hpp",".cmake") and not any(x in p.parts for x in ("build","build_out","output","third_party"))}))'
+RUN mv /vllm-workspace/vllm-ascend/csrc/third_party /opt/qc-cann-deps && \
+    rm -rf /vllm-workspace/vllm-ascend /opt/v41hcpostprenorm
 ADD ${VLLM_SOURCE_URL} /tmp/qc-vllm-source.tar.gz
 RUN echo "${VLLM_SOURCE_SHA256}  /tmp/qc-vllm-source.tar.gz" | sha256sum -c - && \
     rm -rf /vllm-workspace/vllm && mkdir -p /vllm-workspace/vllm && \
@@ -20,8 +22,9 @@ RUN echo "${VLLM_SOURCE_SHA256}  /tmp/qc-vllm-source.tar.gz" | sha256sum -c - &&
     rm /tmp/qc-vllm-source.tar.gz
 COPY . /vllm-workspace/vllm-ascend/
 WORKDIR /vllm-workspace/vllm-ascend
+RUN rm -rf csrc/third_party && mv /opt/qc-cann-deps csrc/third_party
 RUN rm -rf /vllm-workspace/vllm/.git /vllm-workspace/vllm-ascend/.git
-RUN bash -c 'source /usr/local/Ascend/ascend-toolkit/set_env.sh && VLLM_TARGET_DEVICE=empty VLLM_VERSION_OVERRIDE=0.31.0 python3 -m pip install --no-deps --no-build-isolation -e /vllm-workspace/vllm && python3 -m pip install "fastapi[standard]>=0.133.0,<0.137.0" "starlette>=1.0.1,<2" xgrammar==0.2.7 oss-harmony && python3 tools/qc_dsv41/install.py'
+RUN bash -c 'source /usr/local/Ascend/ascend-toolkit/set_env.sh && VLLM_TARGET_DEVICE=empty VLLM_VERSION_OVERRIDE=0.31.0 python3 -m pip install --no-deps --no-build-isolation -e /vllm-workspace/vllm && python3 -m pip install "fastapi[standard]>=0.133.0,<0.137.0" "starlette>=1.0.1,<2" transformers==5.19.0 xgrammar==0.2.7 oss-harmony && python3 tools/qc_dsv41/install.py'
 ENV ASCEND_CUSTOM_OPP_PATH=/opt/v41hcpostprenorm/installed/vendors/v41hcpostprenorm_transformer:/vllm-workspace/vllm-ascend/vllm_ascend/_cann_ops_custom/vendors/custom_transformer \
     LD_PRELOAD=/lib/aarch64-linux-gnu/libjemalloc.so.2 \
     VLLM_ASCEND_TP_BF16_ALLREDUCE_FP32=1 \

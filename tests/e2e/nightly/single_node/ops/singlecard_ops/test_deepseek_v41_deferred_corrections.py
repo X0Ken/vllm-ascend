@@ -10,8 +10,8 @@ import torch_npu  # noqa: F401
 from vllm.config import CUDAGraphMode
 
 from vllm_ascend.attention.dsa_v41 import AscendDSAV41MetadataBuilder
-from vllm_ascend.spec_decode.utils import update_num_computed_tokens_for_batch_change
-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.worker.spec_decode_utils import update_num_computed_tokens_for_batch_change
+from vllm_ascend.worker.v1.model_runner import NPUModelRunner
 
 
 @pytest.mark.parametrize("batch", [1, 4, 8])

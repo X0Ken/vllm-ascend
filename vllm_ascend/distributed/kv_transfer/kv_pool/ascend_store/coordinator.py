@@ -435,9 +435,7 @@ class AscendStoreCoordinator:
             hits = query_group_hits(group_id, group_block_hashes, lookup_masks[group_id])
             group_rank_hits[group_id] = [hits]
 
-        candidates = self.restorable_prefixes(
-            block_hashes, token_len, group_rank_hits, hbm_hit_tokens=hbm_hit_tokens
-        )
+        candidates = self.restorable_prefixes(block_hashes, token_len, group_rank_hits, hbm_hit_tokens=hbm_hit_tokens)
         hit_length = candidates[-1] if candidates else 0
         logger.debug("%s: token_len=%d hit_tokens=%d", log_context, token_len, hit_length)
         return hit_length

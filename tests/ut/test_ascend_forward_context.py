@@ -665,6 +665,8 @@ def test_extra_ctx_env_true_uses_additional_kwargs(monkeypatch):
     assert afc._EXTRA_CTX.capturing is False
     assert forward_context.capturing is True
     assert forward_context.additional_kwargs["capturing"] is False
+
+
 @pytest.mark.parametrize("lora", [False, True])
 def test_dsv41_allgather_override_preserves_lora_requirement(monkeypatch, lora):
     monkeypatch.setattr(afc, "get_ascend_config", lambda: SimpleNamespace(enable_dsv41_moe_allgather=True))

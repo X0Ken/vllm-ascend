@@ -3077,7 +3077,6 @@ class NPUModelRunner(GPUModelRunner):
                     req_ids=req_ids_output_copy,
                     req_id_to_index=req_id_to_index_output_copy,
                     sampled_token_ids=valid_sampled_token_ids,
-                    spec_token_ids=output_spec_token_ids,
                     logprobs=logprobs_lists,
                     prompt_logprobs_dict=prompt_logprobs_dict,
                     kv_connector_output=kv_connector_output,

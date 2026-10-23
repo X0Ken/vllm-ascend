@@ -1,7 +1,5 @@
 import importlib
 import math
-import time
-from collections.abc import Sequence
 from typing import Any
 
 import vllm.envs as envs

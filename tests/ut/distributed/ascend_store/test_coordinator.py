@@ -204,6 +204,29 @@ class TestAscendStoreCoordinator(unittest.TestCase):
                     expected,
                 )
 
+    def test_restore_window_combines_hbm_with_every_external_rank(self):
+        hashes = _hashes(6)
+        coord = AscendStoreCoordinator(
+            [KVCacheGroupSpec(["full"], _full_spec(128)), KVCacheGroupSpec(["swa"], _sliding_spec(128, 256))],
+            scheduler_block_size=128,
+            hash_block_size=128,
+            group_block_sizes=[128, 128],
+            group_cache_families=["c1", "c1"],
+        )
+        # Upstream skips querying complete local blocks. External shards must
+        # still supply every row of the remaining shared restore window.
+        hits = {0: [hashes[2:], hashes[2:]], 1: [hashes[2:], hashes[2:]]}
+        self.assertEqual(
+            coord.restorable_prefixes(hashes, 768, hits, hbm_hit_tokens=256), [128, 256, 384, 512, 640, 768]
+        )
+        hits[0][1] = hashes[3:]
+        self.assertEqual(coord.restorable_prefixes(hashes, 768, hits, hbm_hit_tokens=256), [128, 256])
+        # A partially computed block cannot replace a missing external block.
+        self.assertEqual(coord.restorable_prefixes(hashes, 768, hits, hbm_hit_tokens=383), [128, 256])
+        self.assertEqual(
+            coord.restorable_prefixes(hashes, 768, hits, hbm_hit_tokens=384), [128, 256, 384, 512, 640, 768]
+        )
+
     def test_store_mask_uses_manager_reachability(self):
         coord = AscendStoreCoordinator(
             [KVCacheGroupSpec(["layer.0"], _sliding_spec(block_size=128, sliding_window=256))],

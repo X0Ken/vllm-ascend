@@ -1201,7 +1201,7 @@ class TestInitializeAttnBackend(_DSparkProposerTestBase):
 @pytest.mark.parametrize("target_uniform", [True, False])
 def test_v41_full_graph_pads_queries_and_trims_output(monkeypatch, target_uniform):
     """A live row in a larger target bucket must replay a complete K5 block."""
-    import vllm_ascend.spec_decode.llm_base_proposer as module
+    import vllm_ascend.worker.v1.spec_decode.llm_base_proposer as module
 
     p = AscendSpecDecodeBaseProposer.__new__(AscendSpecDecodeBaseProposer)
     p.method, p.hidden_size, p.num_query_per_req = "dspark", 4, 5

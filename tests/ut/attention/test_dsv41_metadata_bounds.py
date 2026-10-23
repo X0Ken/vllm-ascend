@@ -9,8 +9,8 @@ import torch
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState, AscendCommonAttentionMetadata
 from vllm_ascend.attention.dsa_v41 import AscendDSAV41MetadataBuilder
-from vllm_ascend.spec_decode import llm_base_proposer
-from vllm_ascend.spec_decode.llm_base_proposer import AscendSpecDecodeBaseProposer
+from vllm_ascend.worker.v1.spec_decode import llm_base_proposer
+from vllm_ascend.worker.v1.spec_decode.llm_base_proposer import AscendSpecDecodeBaseProposer
 
 
 @pytest.mark.parametrize("extra", [0, 1, 5, 128])

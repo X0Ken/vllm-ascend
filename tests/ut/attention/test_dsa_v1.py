@@ -3337,6 +3337,8 @@ def test_sparse_flash_forward_requires_draft_metadata(is_draft):
         assert kwargs["ori_win_left"] == kwargs["ori_win_right"] == -1
     else:
         assert "ori_topk_length" not in kwargs
+
+
 @pytest.mark.parametrize("tokens", [0, 1, 6, 32])
 def test_single_group_o_projection_2d_preserves_grouped_values(tokens):
     impl = _make_impl()
