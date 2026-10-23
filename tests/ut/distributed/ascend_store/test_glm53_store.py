@@ -155,7 +155,7 @@ class TestGLM53Store(unittest.TestCase):
                 self.assertEqual(worker.cacheable_group_ids, [0, 2, 3, 4])
                 self.assertEqual(scheduler.kv_cache_group_ids, [0, 1, 2, 3, 4])
                 self.assertEqual(worker.cache_transfer_granularity, 512)
-                for prompt_len, hit, expected in ((512, 512, 0), (1024, 1024, 512), (1025, 1024, 1024)):
+                for prompt_len, hit, expected in ((512, 0, 0), (1024, 512, 512), (1025, 1024, 1024)):
                     scheduler.client = MagicMock()
                     scheduler.client.closed = False
                     scheduler.client.lookup.return_value = hit
@@ -163,6 +163,12 @@ class TestGLM53Store(unittest.TestCase):
                         request_id="hit", prompt_token_ids=[1] * prompt_len, num_tokens=prompt_len, block_hashes=[]
                     )
                     self.assertEqual(scheduler.get_num_new_matched_tokens(request, 0), (expected, False))
+                scheduler.client.lookup.return_value = 1024
+                request = SimpleNamespace(
+                    request_id="unverified", prompt_token_ids=[1] * 1024, num_tokens=1024, block_hashes=[]
+                )
+                with self.assertRaisesRegex(RuntimeError, "unverified restore boundary"):
+                    scheduler.get_num_new_matched_tokens(request, 0)
                 self.doCleanups()
 
     def test_nonlayerwise_round_trip_keeps_each_tp_state_and_private_tail(self):

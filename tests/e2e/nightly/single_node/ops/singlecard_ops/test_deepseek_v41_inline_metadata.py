@@ -8,8 +8,8 @@ import torch
 import torch_npu  # noqa: F401
 
 from vllm_ascend.attention.dsa_v41 import AscendDSAV41MetadataBuilder
-from vllm_ascend.worker import model_runner_v1 as module
 from vllm_ascend.worker.device_metadata import DeviceMetadataStage
+from vllm_ascend.worker.v1 import model_runner as module
 
 
 @pytest.mark.parametrize("batch", [1, 8, 32])

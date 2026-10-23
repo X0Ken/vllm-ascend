@@ -281,8 +281,8 @@ class TestMooncakeHybrid(unittest.TestCase):
             self.assertEqual(scheduler.get_num_new_matched_tokens(request, 0), (32, False))
             load = scheduler.load_specs[request.request_id]
             self.assertEqual(load.kvpool_cached_tokens, 32)
-            self.assertEqual(load.kvpool_store_skip_tokens, 64)
-        # The full hit is a write-skip extent, not the recurrent resume point.
+            self.assertEqual(load.kvpool_store_skip_tokens, 32)
+        # Only a verified complete restore window may skip subsequent writes.
         worker.use_eagle = False
         request = ReqMeta(
             "load",
@@ -444,6 +444,9 @@ class TestMooncakeHybrid(unittest.TestCase):
         scheduler.put_step = 1
         scheduler.num_speculative_blocks_by_group = {}
         scheduler.grouped_block_size = [16, 32]
+        scheduler.lcm_block_size = 32
+        scheduler.hash_block_size = 16
+        scheduler.cacheable_group_ids = {0, 1}
         with patch.object(mooncake_layerwise, "hybrid_layout_id", return_value="layout"):
             scheduler.layerwise_keys = mooncake_layerwise.bind_layerwise_keys(
                 vllm_config=SimpleNamespace(
@@ -458,12 +461,14 @@ class TestMooncakeHybrid(unittest.TestCase):
         scheduler.store_scheduler = MagicMock()
         scheduler.cache_coordinator = MagicMock()
 
-        def lookup(hashes, length, query, **kwargs):
-            self.assertEqual(query(0, hashes, [False, True]), [b"h1"])
-            self.assertEqual(query(1, [b"h1"], None), [], "One missing head must make its group miss")
-            return 0
+        def lookup(hashes, length, rank_hits):
+            self.assertEqual(hashes, [b"h0", b"h1"])
+            self.assertEqual(length, 32)
+            self.assertEqual(rank_hits, {0: [{b"h1"}, {b"h1"}], 1: [{b"h1"}, set()]})
+            return []  # One missing head rejects the complete shared window.
 
-        scheduler.cache_coordinator.find_reachable_hit_tokens.side_effect = lookup
+        scheduler.cache_coordinator.lookup_mask.return_value = ([False, True], None)
+        scheduler.cache_coordinator.restorable_prefixes.side_effect = lookup
         scheduler.store_scheduler.batch_is_readable.side_effect = [[True, True], [True, False]]
         req = SimpleNamespace(request_id="r", block_hashes=[b"h0", b"h1"])
         self.assertEqual(scheduler._lookup_layerwise_with_coordinator(req, 32), 0)

@@ -84,7 +84,7 @@ def test_config_modules_do_not_load_vllm_config():
         "import vllm_ascend.ascend_config; "
         "assert 'vllm.config' not in sys.modules"
     )
-    subprocess.run([sys.executable, "-c", code], check=True)
+    subprocess.run([sys.executable, "-c", code], env=dict(os.environ, VLLM_PLUGINS=""), check=True)
 
 
 class TestRlConfig(TestBase):

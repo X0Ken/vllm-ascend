@@ -107,9 +107,16 @@ def mock_npu_rms_norm(monkeypatch):
         rstd = torch.rsqrt(x.float().square().mean(dim=-1, keepdim=True) + epsilon)
         return (x.float() * rstd).to(x.dtype) * gamma, rstd
 
+    from tests.deepseek_v41_slots import reference_slot_coordinates
+
+    monkeypatch.setattr(dsa_v41, "slot_coordinates", reference_slot_coordinates)
     monkeypatch.setattr(torch_npu, "npu_rms_norm", rms_norm)
     monkeypatch.setattr(torch.Tensor, "pin_memory", lambda self: self)
-    monkeypatch.setattr(dsa_v41, "get_ascend_config", lambda: SimpleNamespace(multistream_dsv4_dsa_overlap=True))
+    monkeypatch.setattr(
+        dsa_v41,
+        "get_ascend_config",
+        lambda: SimpleNamespace(multistream_dsv4_dsa_overlap=True, enable_dsv41_draft_graph=False),
+    )
     vllm_config = MagicMock()
     vllm_config.compilation_config.custom_ops = ["all"]
     vllm_config.quant_config = None
@@ -1056,7 +1063,8 @@ def test_batch_metadata_reuses_work_and_keeps_group_slots_separate(runtime, monk
         all_metadata = [metadata for group_results in results for metadata in group_results]
         assert counts.call_count == iteration + 1
         assert rope.call_count == iteration + 1
-        assert compressed_slots.call_count == iteration + 1
+        # Coordinates are fused; the former per-group tensor helper is unused.
+        assert compressed_slots.call_count == 0
         assert smla.call_count == 3 * (iteration + 1)
         assert qli.call_count == 2 * (iteration + 1)
         for metadata in all_metadata:

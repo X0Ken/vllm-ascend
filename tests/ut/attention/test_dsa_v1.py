@@ -2990,6 +2990,7 @@ def test_o_proj_buffers_shared_across_layers_in_one_model():
         impl.vllm_config = SimpleNamespace(
             scheduler_config=SimpleNamespace(max_num_batched_tokens=capacity, max_num_seqs=4)
         )
+        impl.use_o_proj_2d = False
         impl._oproj_buffer_pool = pool
         return impl
 
@@ -3056,6 +3057,7 @@ def test_o_proj_buffers_reserved_before_profile_and_shared_across_layers():
 
     def make_impl():
         impl = AscendDSAImpl.__new__(AscendDSAImpl)
+        impl.use_o_proj_2d = False
         impl._oproj_buffer_pool = pool
         impl.vllm_config = config
         impl.n_local_groups = 4

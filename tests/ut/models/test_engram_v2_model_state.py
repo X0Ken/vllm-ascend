@@ -71,7 +71,7 @@ def make_model():
     model._mtp_hidden_buffer = None
     model.decoder_replay_layers = None
     model.engram_rotation = torch.eye(32)
-    model.config = SimpleNamespace(engram_layer_ids=(1, 2), image_token_id=999)
+    model.config = SimpleNamespace(engram_layer_ids=(1, 2), image_token_id=999, num_hidden_layers=3)
     model.layers = [
         SimpleNamespace(engram=SimpleNamespace(embed_tokens=SimpleNamespace(n_hash_cols=4, dim=2))) for _ in range(3)
     ]
@@ -255,7 +255,7 @@ def test_forward_only_waits_external_events_on_full_runs(runtime, monkeypatch, m
     class Layer:
         def __init__(self, layer):
             self.layer_idx = layer
-            self.engram = lambda hidden, *args: hidden
+            self.engram = lambda hidden, *args, **kwargs: hidden
 
         def __call__(self, positions, hidden, pre_mix, *args, **kwargs):
             return hidden, pre_mix
@@ -600,7 +600,7 @@ def test_mask_wait_is_delayed_past_early_layer_compute(runtime):
     class Layer:
         def __init__(self, index):
             self.layer_idx = index
-            self.engram = (lambda hidden, *args: hidden) if index else None
+            self.engram = (lambda hidden, *args, **kwargs: hidden) if index else None
 
         def __call__(self, positions, hidden, pre_mix, *args, **kwargs):
             calls.append(("layer", self.layer_idx))

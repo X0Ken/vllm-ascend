@@ -132,6 +132,17 @@ if not _npu_available:
     sys.modules["mooncake.engine"] = mooncake_engine
     import torch
 
+    # CPU collection needs the Python wrapper and its fake tensor contract.
+    # The private binding's arithmetic is qualified separately on real NPUs.
+    _load_native_library = torch.ops.load_library
+
+    def _load_cpu_test_library(path):
+        if str(path) != "/opt/v41hcpostprenorm/native.so":
+            return _load_native_library(path)
+        return None
+
+    torch.ops.load_library = _load_cpu_test_library
+
     try:  # noqa: SIM105
         torch.utils.rename_privateuse1_backend("npu")
     except RuntimeError:
