@@ -80,3 +80,36 @@ def _group(names):
         kv_cache_group_id: int
 
     return Group(object(), names, 0)
+
+
+@pytest.mark.parametrize("binding", [lambda a, b: [(a, b)], lambda a, b: (([a],), [b])])
+def test_nested_v41_binding_zeroes_every_tensor_leaf(zeroer_factory, binding):
+    cls, parent = zeroer_factory
+    key = torch.ones(4, 1, 1, 8)
+    value = torch.ones(4, 1, 1, 4)
+    empty = torch.empty(4, 1, 1, 0)
+    context = {"nested": SimpleNamespace(kv_cache=binding(key, (empty, value)))}
+    zeroer = cls(torch.device("cpu"), [_group(["nested"])], [1], context, 4)
+    assert parent.call_count == 2
+    tensors = [call.kwargs["static_forward_context"]["nested"].kv_cache for call in parent.call_args_list]
+    assert tensors[0] is key and tensors[1] is value
+    zeroer.zero_block_ids([1, 3])
+    for delegate in zeroer._zeroers:
+        delegate.zero_block_ids.assert_called_once_with([1, 3])
+
+
+def test_nested_mxfp8_binding_preserves_checkpoint_scale(zeroer_factory):
+    cls, parent = zeroer_factory
+    parts = tuple(torch.full((4, 1, 1, 8), index + 1.0) for index in range(4))
+    zeroer = cls(
+        torch.device("cpu"),
+        [_group(["nested"])],
+        [1],
+        {"nested": SimpleNamespace(kv_cache=[parts])},
+        4,
+        cache_dtype="mxfp8",
+    )
+    assert len(zeroer._zeroers) == parent.call_count == 3
+    tensors = [call.kwargs["static_forward_context"]["nested"].kv_cache for call in parent.call_args_list]
+    assert all(actual is expected for actual, expected in zip(tensors, parts[:3]))
+    assert all(tensor is not parts[3] for tensor in tensors)

@@ -5,3 +5,7 @@ entries:
     text: Added opt-in DeepSeek V4.1 decode-first scheduling. Decode and DSpark workspace are allocated before prefills share the remaining batch capacity, and independent async decodes may pass an unresolved prefill barrier.
     model: deepseek-v4.1
     hardware: [A2]
+  - category: bugfix
+    text: Fixed MRV2 KV zeroing for nested DeepSeek V4.1 forward bindings while preserving empty-view handling and static MXFP8 value scales.
+    model: deepseek-v4.1
+    hardware: [A2]

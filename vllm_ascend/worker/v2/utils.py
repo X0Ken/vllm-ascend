@@ -21,6 +21,17 @@ from vllm_ascend.utils import super_kernel_scope, weak_ref_tensor, weak_ref_tens
 from vllm_ascend.worker.v2.attn_utils import ring_state_update_skipped
 
 
+def _zeroable_cache_components(cache, cache_dtype):
+    """Unwrap runner containers without treating static MXFP8 V scales as KV."""
+    if isinstance(cache, torch.Tensor):
+        return [cache]
+    if isinstance(cache, (tuple, list)):
+        # This may sit inside the V4.1 runner's outer [kv_cache] binding.
+        components = cache[:3] if cache_dtype == "mxfp8" and isinstance(cache, tuple) and len(cache) == 4 else cache
+        return [tensor for component in components for tensor in _zeroable_cache_components(component, cache_dtype)]
+    return []
+
+
 class AscendV2KVBlockZeroer(KVBlockZeroer):
     """Zero V2 caches whose forward-context binding is a tensor tuple/list.
 
@@ -55,9 +66,7 @@ class AscendV2KVBlockZeroer(KVBlockZeroer):
                 if layer_name in runner_only_attn_layers:
                     continue
                 kv_cache = static_forward_context[layer_name].kv_cache
-                if cache_dtype == "mxfp8" and isinstance(kv_cache, tuple) and len(kv_cache) == 4:
-                    kv_cache = kv_cache[:3]
-                layer_caches[layer_name] = kv_cache
+                layer_caches[layer_name] = _zeroable_cache_components(kv_cache, cache_dtype)
         component_count = 1
         for kv_cache in layer_caches.values():
             if isinstance(kv_cache, (tuple, list)):
