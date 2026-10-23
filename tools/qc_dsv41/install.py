@@ -34,6 +34,7 @@ for patch_name in (
     "v41_admission_gate.patch",
     "v41_opt3.patch",
     "v41_terminal_consumer.patch",
+    "v41_decode_first.patch",
 ):
     subprocess.run(
         [

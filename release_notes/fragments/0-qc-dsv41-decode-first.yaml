@@ -1,0 +1,7 @@
+# Downstream branch fragment; assign the upstream PR number when contributed.
+pr: 0
+entries:
+  - category: config
+    text: Added opt-in DeepSeek V4.1 decode-first scheduling. Decode and DSpark workspace are allocated before prefills share the remaining batch capacity, and independent async decodes may pass an unresolved prefill barrier.
+    model: deepseek-v4.1
+    hardware: [A2]

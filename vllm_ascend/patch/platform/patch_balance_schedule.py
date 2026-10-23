@@ -133,6 +133,8 @@ class BalanceScheduler(Scheduler):
                 long_max_wait_ms=short_request_first_config.long_max_wait_ms,
             )
         self._balance_enabled = _balance_scheduling_enabled(vllm_config)
+        if self._balance_enabled and getattr(self, "decode_first_enabled", False):
+            raise ValueError("decode-first scheduling requires DP balance scheduling to be disabled")
         # Injected by BalanceDPEngineCoreProc._has_global_unfinished_reqs
         # before the first gather. Only used on the enabled path (balance
         # requires DP > 1).
@@ -161,8 +163,20 @@ class BalanceScheduler(Scheduler):
         running_tensor = torch.tensor([len(self.running)], dtype=torch.int, device="cpu")
         dist.all_gather(self.balance_queue, running_tensor, group=self.dp_group)
 
-    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+    def schedule(
+        self,
+        throttle_prefills: bool = False,
+        *,
+        blocked_request_ids: frozenset[str] = frozenset(),
+        block_prefills: bool = False,
+    ) -> SchedulerOutput:
         if not self._balance_enabled:
+            if getattr(self, "decode_first_enabled", False):
+                return super().schedule(
+                    throttle_prefills,
+                    blocked_request_ids=blocked_request_ids,
+                    block_prefills=block_prefills,
+                )
             return super().schedule(throttle_prefills)
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:

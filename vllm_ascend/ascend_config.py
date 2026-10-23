@@ -582,6 +582,8 @@ class AscendConfig:
     enable_dsv41_qli_no_candidate: bool = False
     enable_dsv41_engram_wkv_tp: bool = False
     enable_dsv41_kv_repack: bool = False
+    # Opt-in D -> P scheduling: P shares all remaining capacity after D/DSpark.
+    enable_dsv41_decode_first: bool = False
     enable_dsv41_admission_gate: bool = False
     dsv41_gate_max_prefills: int = 1
     multistream_dsv4_dsa_overlap: bool = True

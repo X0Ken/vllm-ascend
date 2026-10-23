@@ -1678,3 +1678,14 @@
 #       Remove this patch when upstream provides a backend capability hook for
 #       enabling MoE sequence parallelism with DP=1.
 #
+#
+# ** File: platform/v41_decode_first.patch; worker/v41_decode_first.py **
+#   Targets: pinned vLLM 0.31 Scheduler.schedule and EngineCore batch queue.
+#   Why: request priority does not distinguish decode from prefill, and the
+#        existing global prefill barrier also stalls unrelated async decode.
+#   How: opt-in D -> P passes retain upstream allocation/DSpark accounting;
+#        P shares all remaining capacity. Pending prefill request IDs remain
+#        blocked until their model result is consumed; other D may proceed.
+#   Registration: tools/qc_dsv41/install.py applies the source patch at build.
+#   Future: contribute scheduler phase/dependency hooks upstream, then remove
+#           the downstream source patch and these dependency-light helpers.
