@@ -2,11 +2,14 @@
 """Exercise real upstream admission guards without an NPU or model weights."""
 
 import ast
+import importlib.util
 import os
+import sys
 import textwrap
 import unittest
 from pathlib import Path
 from types import SimpleNamespace as NS
+from unittest.mock import patch
 
 
 @unittest.skipUnless(os.getenv("VLLM_SOURCE_ROOT"), "requires patched pinned upstream source")
@@ -36,6 +39,8 @@ class TestTerminalConsumerAdmission(unittest.TestCase):
             lora=False,
             ubatch=False,
             ep=True,
+            prefix_cache=False,
+            connector=False,
         )
         fields.update(changes)
         parallel = NS(
@@ -49,11 +54,17 @@ class TestTerminalConsumerAdmission(unittest.TestCase):
         )
         worker = NS(
             model=NS(language_model=NS(supports_consumer_ffn_compaction=True)),
-            vllm_config=NS(parallel_config=parallel),
+            vllm_config=NS(
+                parallel_config=parallel,
+                cache_config=NS(enable_prefix_caching=fields["prefix_cache"]),
+                kv_transfer_config=object() if fields["connector"] else None,
+            ),
+            model_config=NS(hf_text_config=NS(sliding_window=128)),
             use_aux_hidden_state_outputs=fields["aux"],
             lora_config=object() if fields["lora"] else None,
             prompt_logprobs_worker=NS(uses_prompt_logprobs=NS(any=lambda: fields["scoring"])),
             _consumer_inputs_logged=True,
+            device="npu",
         )
         batch = NS(
             has_prefill=fields["prefill"],
@@ -62,6 +73,16 @@ class TestTerminalConsumerAdmission(unittest.TestCase):
             logits_indices=NS(numel=lambda: fields["outputs"]),
             num_reqs=2,
         )
+
+        class QueryStarts(list):
+            def tolist(self):
+                return list(self)
+
+            def __getitem__(self, item):
+                value = super().__getitem__(item)
+                return type(self)(value) if isinstance(item, slice) else value
+
+        batch.query_start_loc_np = QueryStarts([0, fields["tokens"] // 2, fields["tokens"]])
         scope = dict(
             self=worker,
             input_batch=batch,
@@ -73,8 +94,17 @@ class TestTerminalConsumerAdmission(unittest.TestCase):
             model_inputs={},
             skip_compiled=False,
             ubatch_state=object() if fields["ubatch"] else None,
+            torch=NS(tensor=lambda value, **kwargs: value, int64="int64", int32="int32"),
         )
-        exec(snippet, scope)
+        path = Path(__file__).resolve().parents[4] / "vllm_ascend/models/deepseek_v41/consumer_compaction.py"
+        spec = importlib.util.spec_from_file_location("terminal_consumer_test", path)
+        module = importlib.util.module_from_spec(spec)
+        with patch.dict(
+            sys.modules,
+            {spec.name: module, "vllm_ascend.models.deepseek_v41.consumer_compaction": module},
+        ):
+            spec.loader.exec_module(module)
+            exec(snippet, scope)
         return scope
 
     def test_eligible_prefill_selects_raw_forward_and_output_rows(self):
@@ -108,3 +138,17 @@ class TestTerminalConsumerAdmission(unittest.TestCase):
                 result = self.run_case(**changes)
                 self.assertEqual(result["model_inputs"], {})
                 self.assertFalse(result["skip_compiled"])
+
+    def test_prefix_and_connector_reuse_keep_all_attention_cache_writes(self):
+        for changes in (dict(prefix_cache=True), dict(connector=True), dict(prefix_cache=True, connector=True)):
+            with self.subTest(changes=changes):
+                result = self.run_case(outputs=2, **changes)
+                # FFN compaction is row-local and does not write cache pages.
+                self.assertIn("consumer_output_indices", result["model_inputs"])
+                self.assertNotIn("consumer_tail_indices", result["model_inputs"])
+                self.assertTrue(result["skip_compiled"])
+
+    def test_cache_free_prefill_can_still_trim_terminal_attention(self):
+        result = self.run_case(outputs=2)
+        self.assertIn("consumer_tail_indices", result["model_inputs"])
+        self.assertEqual(len(result["model_inputs"]["consumer_tail_indices"]), 256)

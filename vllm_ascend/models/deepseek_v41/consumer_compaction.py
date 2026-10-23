@@ -52,18 +52,21 @@ def plan_consumer_compaction(config, num_tokens, *, requires_full_hc, compact_me
     return ConsumerCompactionPlan(boundary, remaining, retained, num_tokens, not reason, reason)
 
 
-def terminal_suffix_layout(query_start_loc, window):
+def terminal_suffix_layout(query_start_loc, window, *, requires_reusable_cache=False):
     """Select a full local window from every prompt; short chunks fall back.
 
     A complete W-row suffix makes the requested last query independent of
-    discarded local KV. Earlier suffix queries are bounded to retained rows
-    and their outputs are not consumed by the terminal FFN.
+    discarded local KV. It does not initialize every cache row that a later
+    prefix hit can restore. Cacheable prefills must retain the full attention
+    write path, including when only a connector reuses the resulting blocks.
     """
     if window < 1 or len(query_start_loc) < 2 or query_start_loc[0] != 0:
         raise ValueError("Invalid query boundaries or window")
     lengths = [int(end) - int(start) for start, end in zip(query_start_loc, query_start_loc[1:])]
     if any(length <= 0 for length in lengths):
         raise ValueError("Every compacted prompt must have a nonempty query")
+    if requires_reusable_cache:
+        return None
     if min(lengths) < window or sum(lengths) <= window * len(lengths):
         return None
     indices = [row for end in query_start_loc[1:] for row in range(int(end) - window, int(end))]
