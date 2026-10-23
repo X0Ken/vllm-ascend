@@ -59,6 +59,24 @@ class ConsumerCompactionTests(unittest.TestCase):
 
 
 class TerminalSuffixTests(unittest.TestCase):
+    def test_reusable_prefix_needs_rows_before_the_current_output_window(self):
+        # A 1407-token prefill writes only [1279, 1407) when trimmed.
+        # Reusing its 1280-token prefix needs [1152, 1280), and a shorter
+        # sibling ending at 1281 still attends to the missing cached rows.
+        rows, _, _ = module.terminal_suffix_layout([0, 1407], 128)
+        reusable_window = set(range(1152, 1280))
+        self.assertFalse(reusable_window.issubset(rows))
+        self.assertEqual(len(reusable_window.difference(rows)), 127)
+        layout = module.terminal_suffix_layout([0, 1407], 128, requires_reusable_cache=True)
+        self.assertIsNone(layout)
+        # None leaves the original attention/cache writes over the full query.
+        self.assertTrue(reusable_window.issubset(range(1407)))
+
+    def test_reusable_cache_disables_suffixes_for_every_prompt_in_a_batch(self):
+        for starts in ([0, 1229], [0, 512, 1536], [0, 8192, 16461]):
+            with self.subTest(starts=starts):
+                self.assertIsNone(module.terminal_suffix_layout(starts, 128, requires_reusable_cache=True))
+
     def test_mixed_prompt_lengths_preserve_absolute_rows(self):
         rows, starts, outputs = module.terminal_suffix_layout([0, 512, 1536], 128)
         self.assertEqual(rows, list(range(384, 512)) + list(range(1408, 1536)))
