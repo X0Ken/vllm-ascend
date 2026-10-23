@@ -27,7 +27,7 @@ def _gather_lookback_kernel(
     pos = num_computed - 1 - offs
     valid = in_batch & (offs < DEPTH) & (pos >= 0)
     ids = tl.load(
-        all_token_ids_ptr + req_state_idx * all_token_ids_stride + pos,
+        all_token_ids_ptr + req_state_idx * all_token_ids_stride + tl.maximum(pos, 0),
         mask=valid,
         other=-1,
     )
