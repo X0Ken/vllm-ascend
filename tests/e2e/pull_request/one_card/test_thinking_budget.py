@@ -61,11 +61,12 @@ def _apply(
     logits: torch.Tensor,
     input_ids: list[int],
     local_pos: list[int],
+    local_pos_dtype: torch.dtype = torch.int32,
 ) -> torch.Tensor:
     idx_mapping = torch.tensor([3], dtype=torch.int32, device=DEVICE)
     expanded_idx_mapping = torch.tensor([3] * len(input_ids), dtype=torch.int32, device=DEVICE)
     input_ids_t = torch.tensor(input_ids, dtype=torch.int32, device=DEVICE)
-    local_pos_t = torch.tensor(local_pos, dtype=torch.int32, device=DEVICE)
+    local_pos_t = torch.tensor(local_pos, dtype=local_pos_dtype, device=DEVICE)
     # vLLM #56497 passes the step's batch layout to apply() via LogitsContext.
     # pos / seq_lens_upper_bound_np are required fields but unused by the
     # thinking-budget op.
@@ -82,7 +83,8 @@ def _apply(
     return logits.cpu()
 
 
-def test_v2_thinking_budget_forces_end_after_budget_reached():
+@pytest.mark.parametrize("local_pos_dtype", [torch.int32, torch.int64])
+def test_v2_thinking_budget_forces_end_after_budget_reached(local_pos_dtype):
     req_states = _make_req_states([1, START, 10, 11, 12], prompt_len=1)
     state = ThinkingBudgetState(req_states, MockReasoningConfig())
     state.add_request(3, SamplingParams(thinking_token_budget=3))
@@ -90,7 +92,7 @@ def test_v2_thinking_budget_forces_end_after_budget_reached():
 
     logits = torch.arange(VOCAB_SIZE, dtype=torch.float32, device=DEVICE).view(1, -1)
     expected = logits.cpu()
-    out = _apply(state, logits, input_ids=[12], local_pos=[0])
+    out = _apply(state, logits, input_ids=[12], local_pos=[0], local_pos_dtype=local_pos_dtype)
 
     expected[0, END] = 1.0e9
     torch.testing.assert_close(out, expected)
@@ -121,27 +123,29 @@ def test_v2_thinking_budget_allows_tokens_before_budget():
     assert torch.all(out == 0)
 
 
-def test_v2_thinking_budget_continues_multi_token_end_marker():
+@pytest.mark.parametrize("local_pos_dtype", [torch.int32, torch.int64])
+def test_v2_thinking_budget_continues_multi_token_end_marker(local_pos_dtype):
     req_states = _make_req_states([1, START, 10, 11, 12], prompt_len=1)
     state = ThinkingBudgetState(req_states, MockMultiTokenEndReasoningConfig())
     state.add_request(3, SamplingParams(thinking_token_budget=3))
     state.apply_staged_writes()
 
     logits = torch.zeros((2, VOCAB_SIZE), device=DEVICE)
-    out = _apply(state, logits, input_ids=[12, END_A], local_pos=[0, 1])
+    out = _apply(state, logits, input_ids=[12, END_A], local_pos=[0, 1], local_pos_dtype=local_pos_dtype)
 
     assert out[0, END_A] == pytest.approx(1.0e9)
     assert out[1, END_B] == pytest.approx(1.0e9)
 
 
-def test_v2_thinking_budget_uses_distinct_forced_end_marker():
+@pytest.mark.parametrize("local_pos_dtype", [torch.int32, torch.int64])
+def test_v2_thinking_budget_uses_distinct_forced_end_marker(local_pos_dtype):
     req_states = _make_req_states([1, START, 10, 11, 12], prompt_len=1)
     state = ThinkingBudgetState(req_states, MockDistinctEndReasoningConfig())
     state.add_request(3, SamplingParams(thinking_token_budget=3))
     state.apply_staged_writes()
 
     logits = torch.zeros((2, VOCAB_SIZE), device=DEVICE)
-    out = _apply(state, logits, input_ids=[12, END_A], local_pos=[0, 1])
+    out = _apply(state, logits, input_ids=[12, END_A], local_pos=[0, 1], local_pos_dtype=local_pos_dtype)
 
     assert out[0, END_A] == pytest.approx(1.0e9)
     assert out[1, END_B] == pytest.approx(1.0e9)
@@ -225,14 +229,15 @@ def test_v2_thinking_budget_clamps_oversized_budget():
     assert torch.all(out == 0)
 
 
-def test_v2_thinking_budget_continues_end_prefix_from_prompt():
+@pytest.mark.parametrize("local_pos_dtype", [torch.int32, torch.int64])
+def test_v2_thinking_budget_continues_end_prefix_from_prompt(local_pos_dtype):
     req_states = _make_req_states([1, START, 10, 11, END_A], prompt_len=5)
     state = ThinkingBudgetState(req_states, MockMultiTokenEndReasoningConfig())
     state.add_request(3, SamplingParams(thinking_token_budget=3))
     state.apply_staged_writes()
 
     logits = torch.zeros((1, VOCAB_SIZE), device=DEVICE)
-    out = _apply(state, logits, input_ids=[END_A], local_pos=[0])
+    out = _apply(state, logits, input_ids=[END_A], local_pos=[0], local_pos_dtype=local_pos_dtype)
 
     assert out[0, END_B] == pytest.approx(1.0e9)
     assert out[0, END_A] == 0

@@ -1,38 +1,19 @@
---- a/vllm/v1/worker/gpu/sample/thinking_budget.py	2026-10-26 10:41:33.386271312 +0800
-+++ b/vllm/v1/worker/gpu/sample/thinking_budget.py	2026-10-26 10:41:33.406271776 +0800
-@@ -229,7 +229,7 @@
-                     )
-                     start_match = start_match & (actual == expected)
-                 if start_match:
+# Keep marker indices and the end-prefix bound int32 on Triton-Ascend.
+# Remove this QC build patch once the pinned upstream vLLM handles mixed-width positions.
+--- a/vllm/v1/worker/gpu/sample/thinking_budget.py
++++ b/vllm/v1/worker/gpu/sample/thinking_budget.py
+@@ -232 +232 @@
 -                    last_start = i
 +                    last_start = i.to(tl.int32)
- 
-             if i + NATURAL_END_LEN <= total_len:
-                 end_match = True
-@@ -240,7 +240,7 @@
-                     )
-                     end_match = end_match & (actual == expected)
-                 if end_match:
+@@ -243 +243 @@
 -                    last_end = i
 +                    last_end = i.to(tl.int32)
- 
-     tl.store(cached_last_start_ptr + req_state_idx, last_start)
-     tl.store(cached_last_end_ptr + req_state_idx, last_end)
-@@ -302,7 +302,7 @@
-             )
-             start_match = start_match & (actual == expected)
-         if start_match:
+@@ -305 +305 @@
 -            last_start = i
 +            last_start = i.to(tl.int32)
- 
-     end_lo = total_len - NATURAL_END_LEN + 1
-     if end_lo < 0:
-@@ -322,7 +322,7 @@
-             )
-             end_match = end_match & (actual == expected)
-         if end_match:
+@@ -325 +325 @@
 -            last_end = i
 +            last_end = i.to(tl.int32)
- 
-     if last_start < 0 or last_start <= last_end:
-         return
+@@ -342 +342 @@
+-        max_prefix_len = effective_len
++        max_prefix_len = effective_len.to(tl.int32)
