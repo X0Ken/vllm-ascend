@@ -106,7 +106,7 @@ def _update_committed_marker_cache_kernel_ascend(
                     actual = tl.load(all_token_ids_ptr + req_state_idx * all_token_ids_stride + i + j)
                     start_match = start_match & (actual == expected)
                 if start_match:
-                    last_start = i
+                    last_start = i.to(tl.int32)
 
             if i + NATURAL_END_LEN <= total_len:
                 end_match = True
@@ -115,7 +115,7 @@ def _update_committed_marker_cache_kernel_ascend(
                     actual = tl.load(all_token_ids_ptr + req_state_idx * all_token_ids_stride + i + j)
                     end_match = end_match & (actual == expected)
                 if end_match:
-                    last_end = i
+                    last_end = i.to(tl.int32)
 
     tl.store(cached_last_start_ptr + req_state_idx, last_start)
     tl.store(cached_last_end_ptr + req_state_idx, last_end)
