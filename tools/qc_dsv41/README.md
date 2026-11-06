@@ -40,3 +40,32 @@ request-dependency hooks upstream before dropping the downstream patch.
 CPU integration coverage is in `tests/ut/core/test_dsv41_decode_first.py` and
 `tests/ut/patch/worker/test_v41_prefill_policy.py`. Model execution, numerical
 qualification and workload timing still require Ascend hardware.
+
+## A2 performance candidates
+
+`VLLM_ASCEND_QLI_CANDIDATE_SKIP=1` enables QLI consumer mode 4 on qualified
+A2 profiles. It compacts scores and positions from the existing candidate
+blocks before sorting; candidate-source mode 1 and full-search mode 3 are
+unchanged. The default is `0`; valid values are `0` and `1`, and the variable
+contains no sensitive data. Other hardware profiles retain mode 2. This is
+separate from `enable_dsv41_qli_no_candidate`, which disables candidate
+filtering and therefore bypasses this optimization. Rebuild the native
+operators with the Python sources before enabling mode 4.
+
+The logical DSpark SWA builder can write directly into persistent indices and
+length outputs without changing their graph addresses. The CPU reference keeps
+its existing one-dimensional metadata-length contract. Engram lookups accept
+strided hash slices and fully write their outputs, including zeroes for invalid
+IDs, so they do not require a copy or an initial zero fill.
+
+For the pinned vLLM 0.31 core, `v41_staged_writes.patch` backports the admission
+flush policy from upstream vLLM PR 62748 and tracks dirty block counts. Sampler
+state still flushes after request and model state on admissions. Block counts
+remain dirty after a failed copy. Remove this source patch when the pinned core
+includes both guards; a model-runner override of the complete upstream method
+is unnecessary.
+
+The hardware benchmark records for 193 are maintained in the notes repository.
+Keep model, precision, parallelism, graph, cache and request parameters with
+reported results. Per-operator measurements do not imply the same percentage
+improvement in serving TPOT or throughput.

@@ -30,7 +30,11 @@ from vllm.v1.kv_cache_interface import CircularBufferSpec
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.deepseek_v41_slots import slot_coordinates
-from vllm_ascend.attention.dsa_v1 import build_dspark_swa_indices, dsv4_dsa_overlap_stream
+from vllm_ascend.attention.dsa_v1 import (
+    _aligned_dspark_index_width,
+    build_dspark_swa_indices,
+    dsv4_dsa_overlap_stream,
+)
 from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
     AscendSlidingWindowMLASpec,
@@ -1198,6 +1202,15 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                 ).view(num_reqs, blocks_per_req)
         noncausal = not bool(getattr(common, "causal", True))
         if noncausal and ori_sparse_indices is None:
+            if self._dspark_swa_indices is None:
+                width = _aligned_dspark_index_width(
+                    window_size, self.vllm_config.speculative_config.num_speculative_tokens
+                )
+                self._dspark_swa_indices = torch.empty(
+                    (self._max_tokens, 1, width), dtype=torch.int32, device=seq_lens.device
+                )
+                self._dspark_swa_lengths = torch.empty((self._max_tokens, 1), dtype=torch.int32, device=seq_lens.device)
+            assert self._dspark_swa_lengths is not None
             ori_sparse_indices, ori_topk_length = build_dspark_swa_indices(
                 common.block_table_tensor[:num_reqs],
                 self.vllm_config.speculative_config.num_speculative_tokens,
@@ -1206,22 +1219,15 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                 common.query_start_loc[: num_reqs + 1],
                 seq_lens,
                 num_actual_tokens,
+                index_width=self._dspark_swa_indices.shape[-1],
+                indices_output=self._dspark_swa_indices[:num_actual_tokens],
+                lengths_output=self._dspark_swa_lengths[:num_actual_tokens],
                 use_logical_indices=True,
             )
-            # Full draft graphs retain these addresses from capture. Rebuild
-            # the values in persistent buffers rather than returning temporary
-            # tensors whose capture-time contents never advance with decoding.
-            if self._dspark_swa_indices is None:
-                self._dspark_swa_indices = ori_sparse_indices.new_empty(
-                    (self._max_tokens, *ori_sparse_indices.shape[1:])
-                )
-                self._dspark_swa_lengths = ori_topk_length.new_empty((self._max_tokens, *ori_topk_length.shape[1:]))
-            indices_view = self._dspark_swa_indices[:num_actual_tokens]
-            assert self._dspark_swa_lengths is not None
-            lengths_view = self._dspark_swa_lengths[:num_actual_tokens]
-            indices_view.copy_(ori_sparse_indices)
-            lengths_view.copy_(ori_topk_length)
-            ori_sparse_indices, ori_topk_length = indices_view, lengths_view
+            if seq_lens.device.type != "npu":
+                # Preserve the eager CPU reference contract; the NPU logical
+                # kernel returns the SparseFlashMla [T, 1] length layout.
+                ori_topk_length = ori_topk_length.view(-1)
         if (
             not noncausal
             and ori_sparse_indices is None

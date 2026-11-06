@@ -1,0 +1,6 @@
+pr: 0
+entries:
+  - category: performance
+    text: Reduced DeepSeek V4.1 DSpark metadata allocations and copies, Engram lookup copies and initialization, and redundant vLLM 0.31 sampler and block-count transfers on Ascend.
+  - category: config
+    text: Added VLLM_ASCEND_QLI_CANDIDATE_SKIP to opt into candidate-score compact sorting on qualified Ascend A2 devices. The default is disabled.

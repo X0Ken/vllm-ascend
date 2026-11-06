@@ -339,8 +339,7 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
         """
         # The kernel walks ids as [token, columns] with a unit inner stride, and
         # `gathered` is a slice of a [tokens, layers, columns] buffer.
-        gathered = gathered.contiguous()
-        out = torch.zeros(
+        out = torch.empty(
             (gathered.shape[0], self.part_n_hash_cols, self.dim),
             dtype=torch.bfloat16,
             device=gathered.device,

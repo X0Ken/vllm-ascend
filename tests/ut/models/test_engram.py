@@ -455,3 +455,22 @@ def test_engram_wkv_tp_gathers_sequence_shards_before_output_columns(monkeypatch
     engram.wkv = lambda full: torch.nn.functional.linear(full, weights)
     actual = engram._project_rows(local, sequence_parallel=True)
     torch.testing.assert_close(actual, torch.nn.functional.linear(local, weights))
+
+
+def test_embed_gathered_handles_strided_ids_and_invalid_rows_without_priming():
+    table = embedding_mod.AscendParallelEngramEmbedding.__new__(embedding_mod.AscendParallelEngramEmbedding)
+    torch.nn.Module.__init__(table)
+    table.part_n_hash_cols = table.n_hash_cols = 2
+    table.dim = 4
+    table.dp_size = table.tp_size = 1
+    table.head_start = table.vocab_start_idx = 0
+    table.vocab_end_idx = 3
+    table._codes_uva = None
+    table.weight = torch.nn.Parameter(torch.arange(12).reshape(3, 4).bfloat16(), requires_grad=False)
+    table.weight_scale_inv = None
+    owner = torch.tensor([[[0, 0], [1, -1]], [[0, 0], [2, 3]]])
+    actual = table.embed_gathered(owner[:, 1], 2)
+    expected = torch.zeros(2, 2, 4, dtype=torch.bfloat16)
+    expected[0, 0] = table.weight[1]
+    expected[1, 0] = table.weight[2]
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

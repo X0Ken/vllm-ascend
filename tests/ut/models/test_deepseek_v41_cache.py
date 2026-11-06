@@ -2053,9 +2053,15 @@ def test_kv_memory_shortage_and_unsafe_override_fail_before_allocation():
 
 @pytest.mark.parametrize("source,consumer", [(True, False), (False, True), (False, False)])
 @pytest.mark.parametrize("disabled", [False, True])
-def test_qli_no_candidate_uses_full_search_without_passing_stale_candidates(monkeypatch, source, consumer, disabled):
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("supported", [False, True])
+def test_qli_no_candidate_uses_full_search_without_passing_stale_candidates(
+    monkeypatch, source, consumer, disabled, compact, supported
+):
     from vllm_ascend.models.deepseek_v41 import indexer as module
 
+    monkeypatch.setenv("VLLM_ASCEND_QLI_CANDIDATE_SKIP", "1" if compact else "0")
+    monkeypatch.setattr(module, "get_current_hardware_profile", lambda: SimpleNamespace(supports=lambda _: supported))
     indexer = module.DeepseekV41Indexer.__new__(module.DeepseekV41Indexer)
     torch.nn.Module.__init__(indexer)
     indexer.packed_cache_ops = None
@@ -2092,5 +2098,8 @@ def test_qli_no_candidate_uses_full_search_without_passing_stale_candidates(monk
         query_scale=torch.ones((1, 2)),
     )
     kwargs = native.call_args.kwargs
-    assert kwargs["candidate_mode"] == (3 if disabled else 1 if source else 2 if consumer else 3)
+    expected_mode = 3 if disabled else 1 if source else 2 if consumer else 3
+    if expected_mode == 2 and compact and supported:
+        expected_mode = 4
+    assert kwargs["candidate_mode"] == expected_mode
     assert kwargs["candidate_topk_index"] is (candidates if consumer and not disabled else None)

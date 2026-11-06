@@ -87,6 +87,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (safe for Ascend 910B/A3). Set to a positive value to override when
     # auto-detection is unavailable or for debugging UB overflow issues.
     "VLLM_ASCEND_ROPE_UB_SIZE_KB": lambda: int(os.getenv("VLLM_ASCEND_ROPE_UB_SIZE_KB") or 0),
+    # QLI consumer compact sorting on A2. Default 0; valid values 0 or 1.
+    # Preserves candidate filtering; not sensitive.
+    "VLLM_ASCEND_QLI_CANDIDATE_SKIP": lambda: _strict_binary_env("VLLM_ASCEND_QLI_CANDIDATE_SKIP"),
     # Promote BF16 tensor-parallel all-reduce to FP32 accumulation, then cast
     # back once. Opt-in for the fixed DeepSeek V4.1 910B3 accuracy profile.
     # Valid values: 0 (default) or 1. Not sensitive.

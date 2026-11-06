@@ -36,6 +36,7 @@ for patch_name in (
     "v41_terminal_consumer.patch",
     "v41_decode_first.patch",
     "v41_thinking_budget_types.patch",
+    "v41_staged_writes.patch",
 ):
     subprocess.run(
         [

@@ -1689,3 +1689,14 @@
 #   Registration: tools/qc_dsv41/install.py applies the source patch at build.
 #   Future: contribute scheduler phase/dependency hooks upstream, then remove
 #           the downstream source patch and these dependency-light helpers.
+
+# ** File: platform/v41_staged_writes.patch **
+#   Target: vLLM 0.31 GPUModelRunner.add_requests and BlockTables.
+#   Why: UVA fallback otherwise submits unchanged sampler and block counts
+#        to NPU on every decode step.
+#   How: Flush sampler state only for admissions; retain dirty block counts
+#        until their copy succeeds. No new synchronization is introduced.
+#   Related PR: vllm-project/vllm#62748, vllm-project/vllm-ascend#20135.
+#   Future Plan: Drop the source patch once the pinned core includes upstream
+#                admission and dirty-count guards. The upstream add_requests
+#                implementation has no hook to gate just its sampler flush.

@@ -8,12 +8,14 @@ from torch import nn
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.dsa_v41 import (
     DeepseekV41CacheLayer,
     scatter_cache_sk,
 )
 from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.models.deepseek_v41.cache_config import (
     make_folded_index_cache_spec,
     make_index_cache_spec,
@@ -27,6 +29,8 @@ from vllm_ascend.worker.device_metadata import (
     DeviceMetadataStage,
     wait_for_device_metadata,
 )
+
+QLI_CANDIDATE_COMPACT_MODE = 4
 
 
 class DeepseekV41Indexer(nn.Module):
@@ -279,6 +283,12 @@ class DeepseekV41Indexer(nn.Module):
             is_candidate_source = False
             uses_candidate_filter = False
         mode = 1 if is_candidate_source else 2 if uses_candidate_filter else 3
+        if (
+            mode == 2
+            and envs.VLLM_ASCEND_QLI_CANDIDATE_SKIP
+            and get_current_hardware_profile().supports(HardwareCapability.QLI_CANDIDATE_COMPACT_SORT)
+        ):
+            mode = QLI_CANDIDATE_COMPACT_MODE
         selected, _, candidate_out = torch.ops._C_ascend.npu_quant_lightning_indexer_v3(
             quantized_query,
             key,
