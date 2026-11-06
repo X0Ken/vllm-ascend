@@ -1700,3 +1700,10 @@
 #   Future Plan: Drop the source patch once the pinned core includes upstream
 #                admission and dirty-count guards. The upstream add_requests
 #                implementation has no hook to gate just its sampler flush.
+
+# ** File: platform/v41_draft_graph_config.patch **
+#   Target: pinned vLLM 0.31 DSpark DFlashSpeculator graph initialization.
+#   Why: target bucket tuning otherwise changes the draft capture policy too.
+#   How: use a validated optional draft-size list; preserve old defaults and
+#        independent compilation-config copies. No model-runner override.
+#   Future: remove when upstream provides per-speculator compilation config.

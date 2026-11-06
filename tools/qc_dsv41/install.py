@@ -37,6 +37,7 @@ for patch_name in (
     "v41_decode_first.patch",
     "v41_thinking_budget_types.patch",
     "v41_staged_writes.patch",
+    "v41_draft_graph_config.patch",
 ):
     subprocess.run(
         [

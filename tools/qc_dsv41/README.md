@@ -50,7 +50,10 @@ unchanged. The default is `0`; valid values are `0` and `1`, and the variable
 contains no sensitive data. Other hardware profiles retain mode 2. This is
 separate from `enable_dsv41_qli_no_candidate`, which disables candidate
 filtering and therefore bypasses this optimization. Rebuild the native
-operators with the Python sources before enabling mode 4.
+operators with the Python sources before enabling mode 4. Candidate lists must
+come from the mode-1 source with unique valid blocks; arbitrary empty or duplicate
+external lists are outside this compact consumer contract. The model skips the
+native selection path for an empty cache.
 
 The logical DSpark SWA builder can write directly into persistent indices and
 length outputs without changing their graph addresses. The CPU reference keeps
@@ -69,3 +72,41 @@ The hardware benchmark records for 193 are maintained in the notes repository.
 Keep model, precision, parallelism, graph, cache and request parameters with
 reported results. Per-operator measurements do not imply the same percentage
 improvement in serving TPOT or throughput.
+
+## Independent draft graphs and joint normalization policy
+
+`additional_config.dspark_draft_graph_capture_sizes` accepts a nonempty list
+of positive integer **draft token counts**. By default it is `null` and inherits
+raw target capture sizes, preserving the previous policy. Explicit values let
+operators tune target graph buckets without changing draft padding. The existing
+one-request and sixteen-request draft graphs remain included; the upstream graph
+manager still rounds and filters sizes using its query width and capacity.
+
+The scoped draft graph source patch is installed after the existing DSpark
+patch. Remove it when upstream provides independent per-speculator compilation
+configuration. Hardware evidence and known tradeoffs are recorded in the 193
+performance notes. A fixed 2048-token mixed prefill budget was tested and rejected
+because its streaming-gap tradeoff regressed C8/C16 whole-wave throughput; it is
+not included in this branch.
+
+The qualified A2 profile uses native Post+Pre+Norm for at most 40 rows. Larger
+batches use the existing exact Post, Pre and RMSNormCast chain. The full-row
+native prototype becomes slower at those shapes; fewer operator launches do
+not imply a faster graph. Other hardware profiles retain their previous
+192-row bound. Sinkhorn iterations, BF16 boundaries, residual outputs and FP32
+routing semantics are unchanged. No large-M prototype vendor is required.
+
+The 193 TP8/EP8, K5 validation added target token buckets 72 and 144 to
+`[6,12,18,24,30,36,42,48,96,192]`. Its independent draft configuration was:
+
+```json
+{
+  "dspark_draft_graph_capture_sizes": [6,12,18,24,30,36,42,48,60,96,120,160,192]
+}
+```
+
+The helper also includes draft token buckets 5 and 80. These are token counts,
+not request counts. This explicit profile improved the measured C12/C24 cycles;
+C16 median request TPOT regressed against P14 despite a faster steady cycle.
+Keep acceptance rate, TTFT and whole-wave throughput alongside cycle timings.
+The generic capture defaults are unchanged.

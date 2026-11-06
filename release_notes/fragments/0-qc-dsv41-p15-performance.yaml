@@ -1,0 +1,6 @@
+pr: 0
+entries:
+  - category: config
+    text: Added optional independent DSpark draft graph capture sizes for pinned DeepSeek V4.1 inference. The default inherits target capture sizes and preserves the existing behavior.
+  - category: performance
+    text: Tuned the qualified A2 DeepSeek V4.1 joint normalization fusion range to use the exact fallback above 40 rows, reducing medium-batch decode overhead.

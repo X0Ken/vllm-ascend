@@ -248,3 +248,9 @@ def test_unknown_device_type_is_rejected() -> None:
 def test_every_device_type_has_a_profile() -> None:
     for device_type in AscendDeviceType:
         assert get_hardware_profile(device_type)._device_type is device_type
+
+
+@pytest.mark.parametrize("device_type", list(AscendDeviceType))
+def test_joint_norm_fusion_range_is_qualified_per_profile(device_type):
+    profile = get_hardware_profile(device_type)
+    assert profile.dsv41_joint_norm_max_rows == (40 if device_type is AscendDeviceType.A2 else 192)

@@ -26,7 +26,7 @@ CAND_BLOCK_SIZE = 8
 SPARSE_COUNT = 512
 
 
-def build_params(batch_size, q_seq, seqused_k_list, cmp_residual_list, block_num):
+def build_params(batch_size, q_seq, seqused_k_list, cmp_residual_list, block_num, *, query_heads=64, compress_ratio=2):
     """33 元组参数 (normalize_qliv2_params 顺序), TND query + PA_BBND key + INT8."""
     cu_q = [0]
     for _ in range(batch_size):
@@ -37,7 +37,7 @@ def build_params(batch_size, q_seq, seqused_k_list, cmp_residual_list, block_num
         max(seqused_k_list),  # k_seq
         batch_size * q_seq,  # q_t_size (TND T)
         0,  # k_t_size (PA_BBND 不用)
-        64,  # q_head_num (metadata 校验要求 64)
+        query_heads,  # 64-head legacy coverage and 32-head V4.1 model shapes
         1,  # k_head_num (MLA 单 kv 头)
         128,  # head_dim
         128,  # block_size (K 物理块)
@@ -62,7 +62,7 @@ def build_params(batch_size, q_seq, seqused_k_list, cmp_residual_list, block_num
         (-2, 2),  # weights_datarange
         (0.5, 1.5),  # q_scale_datarange
         (0.5, 1.5),  # k_scale_datarange
-        2,  # cmp_ratio
+        compress_ratio,  # C2 sources and C1 candidate consumers
         0,  # return_value
         None,  # output_idx_offset
     )
@@ -180,6 +180,17 @@ def main():
     for i, (name, b, q, klist, res, bn) in enumerate(cases):
         params = build_params(b, q, klist, res, bn)
         ok &= run_case(name, params, seed=1024 + i)
+    for name, lengths in [("real_c1_b1", [8192]), ("real_c1_varlen", [19, 512, 32769, 81371])]:
+        params = build_params(
+            len(lengths),
+            6,
+            lengths,
+            [0] * len(lengths),
+            sum((length + 127) // 128 for length in lengths),
+            query_heads=32,
+            compress_ratio=1,
+        )
+        ok &= run_case(name, params, seed=20261106)
     print("EQUIV-RESULT:", "ALL-PASS" if ok else "FAILED")
     sys.exit(0 if ok else 1)
 

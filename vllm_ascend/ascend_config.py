@@ -584,6 +584,8 @@ class AscendConfig:
     enable_dsv41_kv_repack: bool = False
     # Opt-in D -> P scheduling: P shares all remaining capacity after D/DSpark.
     enable_dsv41_decode_first: bool = False
+    # Raw draft token capture sizes; None inherits target sizes as before.
+    dspark_draft_graph_capture_sizes: list[int] | None = None
     enable_dsv41_admission_gate: bool = False
     dsv41_gate_max_prefills: int = 1
     multistream_dsv4_dsa_overlap: bool = True
@@ -678,6 +680,15 @@ class AscendConfig:
     _sparse_li_c4_layer_ids: set[int] = dataclasses.field(default_factory=set, init=False, repr=False)
     _sparse_li_c4_layer_names: set[str] = dataclasses.field(default_factory=set, init=False, repr=False)
     _sparse_li_layer_filter_enabled: bool = dataclasses.field(default=False, init=False, repr=False)
+
+    @field_validator("dspark_draft_graph_capture_sizes", mode="before")
+    @classmethod
+    def _validate_draft_capture_sizes(cls, value):
+        if value is not None and (
+            not isinstance(value, list) or not value or any(type(size) is not int or size <= 0 for size in value)
+        ):
+            raise ValueError("dspark_draft_graph_capture_sizes must be a nonempty list of positive integers")
+        return value
 
     @field_validator("dsv41_gate_max_prefills", mode="before")
     @classmethod

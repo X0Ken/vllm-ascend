@@ -220,6 +220,12 @@ class WeightLayoutPolicy(Enum):
     FORCE_NZ = auto()
 
 
+DSV41_JOINT_NORM_DEFAULT_MAX_ROWS = 192
+# Qualified with the pinned CANN 9.1 / torch-npu 2.10 stack on 910B3.
+# Above this range the exact unfused path is faster than the full-row prototype.
+DSV41_JOINT_NORM_A2_MAX_ROWS = 40
+
+
 @dataclass(frozen=True, slots=True)
 class HardwareProfile:
     """Immutable semantic contracts registered for one SoC family.
@@ -242,6 +248,8 @@ class HardwareProfile:
     quantization_backend_family: QuantizationBackendFamily
     # Independent, additive contracts queried with ``supports``.
     capabilities: frozenset[HardwareCapability]
+    # Native Post+Pre+Norm fusion policy; larger batches retain the exact fallback.
+    dsv41_joint_norm_max_rows: int = DSV41_JOINT_NORM_DEFAULT_MAX_ROWS
 
     def supports(self, capability: HardwareCapability) -> bool:
         """Return whether the exact documented ``capability`` contract is available."""
@@ -287,6 +295,7 @@ _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyTyp
     {
         AscendDeviceType.A2: HardwareProfile(
             _device_type=AscendDeviceType.A2,
+            dsv41_joint_norm_max_rows=DSV41_JOINT_NORM_A2_MAX_ROWS,
             attention_backend_family=AttentionBackendFamily.STANDARD,
             cpu_binding_mode=CPUBindingMode.TOPO_AFFINITY,
             default_worker_cls=_DEFAULT_WORKER_CLS,

@@ -2,6 +2,8 @@
 
 import torch
 
+from vllm_ascend.device.hardware_profile import get_current_hardware_profile
+
 # This library is rebuilt against the selected nightly stack.
 torch.ops.load_library("/opt/v41hcpostprenorm/native.so")
 
@@ -25,7 +27,7 @@ def dispatch(
     eligible = (
         residual.ndim == 3
         and residual.shape[1:] == (4, 5120)
-        and 0 < residual.shape[0] <= 192
+        and 0 < residual.shape[0] <= get_current_hardware_profile().dsv41_joint_norm_max_rows
         and residual.dtype == torch.bfloat16
         and residual.is_contiguous()
         and iters == 20
