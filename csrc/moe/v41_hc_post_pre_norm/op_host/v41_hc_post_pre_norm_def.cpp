@@ -86,6 +86,7 @@ public:
 
         this->Attr("following_norm_eps").AttrType(OPTIONAL).Float(1e-6f);
         this->AICore().AddConfig("ascend910b");
+        this->AICore().AddConfig("ascend910_93");
 
     }
 };

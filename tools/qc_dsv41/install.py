@@ -17,7 +17,7 @@ print("Changed native base sources:", changed, flush=True)
 env = dict(
     os.environ,
     COMPILE_CUSTOM_KERNELS="1" if changed else "0",
-    SOC_VERSION="ascend910b1",
+    SOC_VERSION=os.environ.get("SOC_VERSION", "ascend910b1"),
     MAX_JOBS="12",
     CMAKE_BUILD_PARALLEL_LEVEL="12",
     SETUPTOOLS_SCM_PRETEND_VERSION="0.31.0.dev0",

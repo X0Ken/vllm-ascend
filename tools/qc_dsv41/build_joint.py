@@ -8,6 +8,9 @@ from pathlib import Path
 import torch_npu
 from torch.utils.cpp_extension import load
 
+soc_version = os.environ.get("SOC_VERSION", "ascend910b1")
+compute_unit = "ascend910_93" if soc_version.startswith("ascend910_93") else "ascend910b"
+
 repo = Path("/vllm-workspace/vllm-ascend")
 output = Path("/opt/v41hcpostprenorm")
 output.mkdir(exist_ok=True)
@@ -31,7 +34,7 @@ subprocess.run(
         "bash",
         "build.sh",
         "--pkg",
-        "--soc=ascend910b",
+        "--soc=" + compute_unit,
         "--ops=v41_hc_post_pre_norm",
         "--vendor_name=v41hcpostprenorm",
         "-j8",

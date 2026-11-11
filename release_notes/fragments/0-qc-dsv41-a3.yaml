@@ -1,0 +1,6 @@
+pr: 0
+entries:
+  - category: hardware
+    text: Added an A3 build recipe for the QC DeepSeek V4.1 runtime and enabled A3 compilation of its joint normalization operator.
+    model: deepseek-v4.1
+    hardware: [A3]
