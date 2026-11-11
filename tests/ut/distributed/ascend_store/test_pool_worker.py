@@ -1372,6 +1372,65 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         worker.kv_send_thread.add_save_batch.assert_called_once_with([req])
         worker.kv_send_thread.request_queue.join.assert_not_called()
         self.assertIs(worker._previous_save_batch, save_batch)
+        worker.kv_send_thread.wait_for_requests_saved.assert_not_called()
+
+    def test_producer_prefill_response_waits_for_final_publication(self):
+        worker = self._make_worker(extra_config={"producer_wait_for_save": True})
+        worker.kv_send_thread = MagicMock(spec=KVCacheStoreSendingThread)
+        entered, published, returned = threading.Event(), threading.Event(), threading.Event()
+        errors = []
+        worker.kv_send_thread.get_saved_offset.return_value = 16
+
+        def wait_for_publish(req_ids):
+            self.assertEqual(req_ids, {"final"})
+            entered.set()
+            if not published.wait(timeout=5):
+                raise RuntimeError("Publication was not released by the test")
+
+        worker.kv_send_thread.wait_for_requests_saved.side_effect = wait_for_publish
+        meta = AscendConnectorMetadata(set(), set())
+        meta.add_request(ReqMeta(req_id="partial", token_len_chunk=16, can_save=True, is_last_chunk=False))
+        meta.add_request(ReqMeta(req_id="final", token_len_chunk=16, can_save=True, is_last_chunk=True))
+
+        def prefill_step():
+            try:
+                worker.wait_for_save(meta)
+                returned.set()
+            except Exception as error:
+                errors.append(error)
+
+        module = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker"
+        with patch(f"{module}.torch.npu", create=True):
+            thread = threading.Thread(target=prefill_step)
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(timeout=5))
+                self.assertFalse(returned.is_set())
+            finally:
+                published.set()
+                thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(returned.is_set())
+
+    def test_producer_prefill_fence_rejects_failed_put(self):
+        worker = self._make_worker(extra_config={"producer_wait_for_save": True})
+        worker.kv_send_thread = MagicMock(spec=KVCacheStoreSendingThread)
+        worker.kv_send_thread.get_saved_offset.return_value = 0
+        meta = AscendConnectorMetadata(set(), set())
+        meta.add_request(ReqMeta(req_id="final", token_len_chunk=16, can_save=True, is_last_chunk=True))
+        module = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker"
+        with (
+            patch(f"{module}.torch.npu", create=True),
+            self.assertRaisesRegex(RuntimeError, "Prefill KV publication failed"),
+        ):
+            worker.wait_for_save(meta)
+
+    def test_producer_prefill_fence_rejects_other_modes(self):
+        with self.assertRaisesRegex(ValueError, "non-layerwise kv_producer"):
+            self._make_worker(kv_role="kv_consumer", extra_config={"producer_wait_for_save": True})
+        with self.assertRaisesRegex(ValueError, "non-layerwise kv_producer"):
+            self._make_worker(extra_config={"producer_wait_for_save": True}, use_layerwise=True)
 
     def test_wait_for_save_skip_non_save(self):
         worker = self._make_worker()

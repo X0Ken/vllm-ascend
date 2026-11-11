@@ -226,6 +226,9 @@ class KVPoolWorker:
         self.use_layerwise = use_layerwise
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.load_async = extra_config.get("load_async", False)
+        self.producer_wait_for_save = extra_config.get("producer_wait_for_save", False)
+        if self.producer_wait_for_save and (self.kv_role != "kv_producer" or use_layerwise):
+            raise ValueError("producer_wait_for_save requires a non-layerwise kv_producer")
         self._save_disabled = threading.Event()
         self._step_load_keys: set[str] = set()
         self._closed = False
@@ -3289,6 +3292,14 @@ class KVPoolWorker:
             return
 
         self._previous_save_batch = send_thread.add_save_batch(requests)
+        if self.producer_wait_for_save:
+            # A PD proxy may submit Decode immediately after the Prefill response.
+            # Fence only completed prefill requests, retaining chunk/compute overlap.
+            final_requests = [request for request in requests if request.is_last_chunk]
+            send_thread.wait_for_requests_saved({request.req_id for request in final_requests})
+            for request in final_requests:
+                if send_thread.get_saved_offset(request.req_id) < request.token_len_chunk:
+                    raise RuntimeError(f"Prefill KV publication failed for request {request.req_id}")
 
     def retrieve_layer(
         self,

@@ -1,0 +1,5 @@
+pr: 0
+entries:
+  - category: bugfix
+    text: Added an opt-in AscendStore producer publication fence so an immediate PD handoff cannot race asynchronous Prefill KV saves.
+    hardware: [A2, A3]

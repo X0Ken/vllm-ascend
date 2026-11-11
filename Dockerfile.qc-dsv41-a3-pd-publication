@@ -1,0 +1,6 @@
+# Python-only update of the validated native A3 runtime; no native rebuild.
+ARG BASE_IMAGE=local/dsv41-qc-a3:ebe36431d
+FROM ${BASE_IMAGE}
+ARG SOURCE_COMMIT
+LABEL org.opencontainers.image.revision=${SOURCE_COMMIT} qc.parent.source=ebe36431d00e0ea376b972ece26130d885e48d90
+COPY vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py /vllm-workspace/vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
