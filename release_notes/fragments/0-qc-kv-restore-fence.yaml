@@ -1,0 +1,5 @@
+pr: 0
+entries:
+  - category: bugfix
+    text: Ordered non-layerwise AscendStore restores after pending NPU page initialization to prevent reused KV pages from being cleared after DMA.
+    hardware: [A2, A3]

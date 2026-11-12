@@ -1266,6 +1266,54 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         self.assertEqual(stats.data["load_get_keys"], 1)
         self.assertEqual(len(stats.data["load_get_duration_seconds"]), 1)
 
+    def test_restore_waits_for_pending_page_zeroing(self):
+        module = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker"
+        for load_async in (False, True):
+            with self.subTest(load_async=load_async):
+                worker = self._make_worker(extra_config={"load_async": load_async})
+                worker.token_database.set_group_buffers({0: [1000]}, {0: [160]})
+                page = [99]
+                pending = [lambda page=page: page.__setitem__(0, 0)]
+
+                def finish_pending(pending=pending):
+                    while pending:
+                        pending.pop(0)()
+
+                def restore(*args, page=page):
+                    page[0] = 7
+                    return [0]
+
+                worker.m_store.get.side_effect = restore
+                worker.kv_recv_thread = MagicMock()
+                worker.kv_recv_thread.add_request.side_effect = restore
+                meta = AscendConnectorMetadata(set(), set())
+                meta.add_request(
+                    ReqMeta(
+                        req_id="restore",
+                        token_len_chunk=16,
+                        block_ids=[1],
+                        block_hashes=["h0"],
+                        load_spec=LoadSpec(0, 16, can_load=True, token_len=16),
+                    )
+                )
+                with patch(f"{module}.torch.npu.Event") as event:
+                    event.return_value.synchronize.side_effect = finish_pending
+                    worker.start_load_kv(meta)
+                # A queued clear arriving after DMA would erase the restored page.
+                finish_pending()
+                self.assertEqual(page, [7])
+
+    def test_no_restore_does_not_wait_for_device_work(self):
+        module = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker"
+        for spec in (None, LoadSpec(0, 0, can_load=False, token_len=16)):
+            with self.subTest(spec=spec), patch(f"{module}.torch.npu.Event") as event:
+                worker = self._make_worker()
+                meta = AscendConnectorMetadata(set(), set())
+                worker.start_load_kv(meta)
+                meta.add_request(ReqMeta(req_id="no-restore", token_len_chunk=16, load_spec=spec))
+                worker.start_load_kv(meta)
+                event.assert_not_called()
+
     @patch(
         "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.KVCacheStoreRecvingThread.start",
         autospec=True,

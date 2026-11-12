@@ -1386,6 +1386,13 @@ class KVPoolWorker:
         logger.debug("KV pool worker start_load_kv requests=%d", len(metadata.requests))
         if len(metadata.requests) == 0:
             return
+        if any(request.load_spec is not None and request.load_spec.can_load for request in metadata.requests):
+            # The runner may have queued zeroing for reassigned KV pages.
+            # Store DMA does not run on that stream: finish those writes before
+            # either the synchronous get or the receive thread restores pages.
+            boundary = torch.npu.Event()
+            boundary.record()
+            boundary.synchronize()
         for request in metadata.requests:
             load_spec = request.load_spec
             if load_spec is None or not load_spec.can_load:  # load =0
