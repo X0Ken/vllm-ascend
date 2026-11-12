@@ -231,3 +231,10 @@ launch parameters; they do not change batch size, HCCL environment or GPU
 utilization by themselves. Existing defaults remain unchanged. Both profiles
 require hardware correctness and performance qualification before deployment;
 source-project timings do not establish a speedup on the target stack.
+
+For exact benchmark reproduction, pin the deployed image and file hashes in the
+experiment evidence. The unified branch includes Scheme 1's packed-slot scalar
+rewrite for both JSON profiles. The isolated Scheme 2 measurement used the
+pre-scalar d909f9d77 image plus the MRV2 offset and mask-capture fixes; simply
+loading Scheme 2's JSON on the unified HEAD adds the scalar rewrite as well and
+is a combined-code configuration rather than that isolated measured image.

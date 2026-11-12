@@ -66,9 +66,7 @@ def _reference(slots, positions, qsl, num_reqs, num_actual_tokens, page, ratio, 
     neg = torch.tensor(-1, dtype=torch.int32, device=slots.device)
     pages = torch.where(valid, torch.div(phys, page, rounding_mode="floor"), neg)
     rows = torch.where(valid, phys.remainder(page), neg)
-    flat = torch.where(
-        valid, active, torch.tensor(-1, dtype=torch.int64, device=slots.device)
-    ).to(torch.int64)
+    flat = torch.where(valid, active, torch.tensor(-1, dtype=torch.int64, device=slots.device)).to(torch.int64)
     return pages, rows, flat
 
 
@@ -109,9 +107,9 @@ MATCHED_EAGER = [
     (128, 1, 0, torch.int32, None),
     (64, 2, 0, torch.int32, None),
     (64, 2, 1, torch.int32, None),
-    (96, 1, 0, torch.int32, None),    # non power-of-two page
-    (100, 1, 0, torch.int32, None),   # non power-of-two page
-    (96, 1, 0, torch.int64, None),    # 64-bit slots keep the wide-arithmetic path
+    (96, 1, 0, torch.int32, None),  # non power-of-two page
+    (100, 1, 0, torch.int32, None),  # non power-of-two page
+    (96, 1, 0, torch.int64, None),  # 64-bit slots keep the wide-arithmetic path
     (64, 2, 0, torch.int64, None),
 ]
 
@@ -145,9 +143,7 @@ def test_padded_tail_is_masked_for_ratio1(ratio, page):
     assert torch.all(rows[num_actual:] == -1)
     if ratio == 1:
         # ...and the eager chain would have written them, which is the trap.
-        eager_flat = _reference(
-            slots, positions, qsl, num_reqs, num_actual, page, ratio, 0
-        )[2]
+        eager_flat = _reference(slots, positions, qsl, num_reqs, num_actual, page, ratio, 0)[2]
         assert not torch.equal(eager_flat, flat)
 
 
@@ -178,14 +174,31 @@ def test_rejects_bad_page_size_and_ratio():
     flat = torch.empty((96,), dtype=torch.int64, device=DEVICE)
     with pytest.raises(ValueError):
         build_packed_cache_slot_mapping(
-            slots, positions, qsl, 96, 16, 96, 128, 3,
-            coordinates_output=coords, flat_output=flat,
+            slots,
+            positions,
+            qsl,
+            96,
+            16,
+            96,
+            128,
+            3,
+            coordinates_output=coords,
+            flat_output=flat,
         )
     with pytest.raises(ValueError):
         build_packed_cache_slot_mapping(
-            slots, positions, qsl, 96, 16, 96, 0, 1,
-            coordinates_output=coords, flat_output=flat,
+            slots,
+            positions,
+            qsl,
+            96,
+            16,
+            96,
+            0,
+            1,
+            coordinates_output=coords,
+            flat_output=flat,
         )
+
 
 @pytest.mark.parametrize("page", [64, 96])
 @pytest.mark.parametrize("ratio", [1, 2])
