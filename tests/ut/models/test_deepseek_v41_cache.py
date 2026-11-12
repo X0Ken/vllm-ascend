@@ -2103,3 +2103,47 @@ def test_qli_no_candidate_uses_full_search_without_passing_stale_candidates(
         expected_mode = 4
     assert kwargs["candidate_mode"] == expected_mode
     assert kwargs["candidate_topk_index"] is (candidates if consumer and not disabled else None)
+
+
+@pytest.mark.parametrize("repack", [False, True])
+def test_mrv2_uses_transported_slot_offsets_for_index_planes(runtime, monkeypatch, repack):
+    from vllm_ascend.models.deepseek_v41.cache_config import get_deepseek_v41_cache_offsets
+    from vllm_ascend.worker.v2 import attn_utils
+
+    legacy = make_cache_config(3, draft_layers=3)
+    specs = {n: s for g in legacy.kv_cache_groups for n, s in g.kv_cache_spec.kv_cache_specs.items()}
+    groups = make_cache_groups(group_cache_specs(specs, repack=repack))
+    config = get_deepseek_v41_kv_cache_config(
+        SimpleNamespace(
+            cache_config=SimpleNamespace(num_gpu_blocks_override=None, prefix_cache_retention_interval=None)
+        ),
+        groups,
+        3 * get_deepseek_v41_pool_bytes_per_block(groups),
+    )
+    layer_specs = attn_utils._get_layer_kv_cache_specs(config)
+    backings = {}
+    for descriptor in config.kv_cache_tensors:
+        backing = torch.zeros(descriptor.size, dtype=torch.int8)
+        backings.update(dict.fromkeys(descriptor.layers, backing))
+    names = [n for n, spec in layer_specs.items() if isinstance(spec, AscendMLAAttentionSpec)]
+    backend = SimpleNamespace(get_kv_cache_shape=lambda *shape: shape)
+    attn_groups = [
+        SimpleNamespace(kv_cache_group_id=i, kv_cache_spec=layer_specs[n], layer_names=[n], backend=backend)
+        for i, n in enumerate(names)
+    ]
+    monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: runtime)
+    monkeypatch.setattr(attn_utils, "_is_dsv4_model", lambda _: False)
+    views = attn_utils._reshape_kv_cache_v2(attn_groups, backings, "auto", [128] * len(names), {}, config)
+    offsets = get_deepseek_v41_cache_offsets(groups)
+    for name in names:
+        parts = views[name] if isinstance(views[name], tuple) else (views[name],)
+        assert parts[0].data_ptr() - backings[name].data_ptr() == offsets[name]
+    source = "model.layers.20.self_attn"
+    kv = views[source + ".long_kv_cache"]
+    index, scale = views[source + ".indexer.k_cache"]
+    kv.fill_(7)
+    index.fill_(11)
+    scale.fill_(13)
+    assert (kv == 7).all() and (index == 11).all() and (scale == 13).all()
+    index[1].fill_(17)
+    assert (index[0] == 11).all() and (index[2] == 11).all() and (scale == 13).all()

@@ -1,0 +1,37 @@
+{
+  "enable_dsa_cp": false,
+  "enable_cpu_binding": true,
+  "ascend_compilation_config": {
+    "enable_npugraph_ex": true,
+    "enable_static_kernel": true,
+    "enable_super_kernel": false
+  },
+  "multistream_overlap_shared_expert": true,
+  "enable_flashcomm1": false,
+  "enable_dsv41_draft_graph": true,
+  "enable_dsv41_async_metadata": false,
+  "enable_dsv41_prefill_draft_graph": true,
+  "enable_dsv41_inline_metadata": false,
+  "enable_dsv41_deferred_corrections": false,
+  "enable_dsv41_decode_first": true,
+  "enable_dsv41_admission_gate": false,
+  "enable_dsv41_engram_wkv_tp": true,
+  "dspark_draft_graph_capture_sizes": [
+    6,
+    12,
+    18,
+    24,
+    30,
+    36,
+    42,
+    48,
+    60,
+    96,
+    120,
+    160,
+    192
+  ],
+  "enable_dsv41_moe_mask_range": true,
+  "enable_dsv41_o_proj_2d": true,
+  "enable_dsv41_qli_no_candidate": true
+}

@@ -1,0 +1,8 @@
+pr: 0
+entries:
+  - category: performance
+    text: Optimized DeepSeek V4.1 packed-cache slot mapping with power-of-two shifts and masks and a 32-bit arithmetic path for int32 slot carriers. Int64 carriers and non-power-of-two pages retain their wide/division fallback, including graph padding masks.
+  - category: bugfix
+    text: Fixed MRV2 cache view offsets for DeepSeek V4.1 repacked index planes by using the transported physical slot plan, matching the V1 allocator and preventing out-of-bounds views at startup.
+  - category: bugfix
+    text: Made opt-in AllGather range masking independent of the ambient vLLM config during graph capture by carrying the model's EPLB policy into the dispatcher. Unknown callers retain the conservative indexed-mask path. Range validation uses the physical NPU capture status so unvalidated maps fall back without a host copy during compiler-internal captures.

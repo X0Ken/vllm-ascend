@@ -232,6 +232,7 @@ class AllGatherCommImpl(MoECommMethod):
             top_k=self.moe_config.experts_per_token,
             num_experts=self.moe_config.num_experts,
             num_local_experts=self.moe_config.num_local_experts,
+            enable_eplb=self.moe_config.moe_parallel_config.enable_eplb,
         )
 
     def _get_prepare_finalize(self):

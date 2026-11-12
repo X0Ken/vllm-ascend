@@ -524,11 +524,20 @@ class TestTokenDispatcherWithMC2(TestBase):
         self.assertTrue(output.combine_metadata.quant.dispatch_with_quant)
 
 
-@pytest.mark.parametrize("ascend_config", [SimpleNamespace(), SimpleNamespace(enable_dsv41_moe_mask_range=False)])
-def test_allgather_expert_map_without_current_vllm_config(ascend_config):
-    # MRV2 profiling may dispatch without an ambient vLLM config. The default
-    # expert-map path must not read config needed only by the opt-in mask.
-    dispatcher = TokenDispatcherWithAllGather(top_k=2, num_experts=4, num_local_experts=2)
+@pytest.mark.parametrize(
+    "ascend_config",
+    [
+        SimpleNamespace(),
+        SimpleNamespace(enable_dsv41_moe_mask_range=False),
+        SimpleNamespace(enable_dsv41_moe_mask_range=True),
+    ],
+)
+@pytest.mark.parametrize("enable_eplb", [False, True])
+@pytest.mark.parametrize("capturing", [False, True])
+def test_allgather_expert_map_without_current_vllm_config(ascend_config, enable_eplb, capturing):
+    # MRV2 can dispatch without an ambient vLLM config, including when the
+    # opt-in range mask is enabled or the compiler captures internally.
+    dispatcher = TokenDispatcherWithAllGather(top_k=2, num_experts=4, num_local_experts=2, enable_eplb=enable_eplb)
     hidden_states = torch.randn(2, 4)
     token_dispatch_input = build_token_dispatch_input_fixture(
         hidden_states=hidden_states,
@@ -543,6 +552,14 @@ def test_allgather_expert_map_without_current_vllm_config(ascend_config):
         ) as mock_config,
         patch("vllm_ascend.ops.fused_moe.token_dispatcher.get_ascend_config", return_value=ascend_config),
         patch(
+            "torch.npu.is_current_stream_capturing",
+            return_value=capturing,
+        ),
+        patch(
+            "vllm_ascend.ops.triton.moe_dispatch_mask.mask_expert_weights",
+            side_effect=lambda w, ids, table: w * (table[ids.long()] != -1),
+        ) as mask_fusion,
+        patch(
             "vllm_ascend.ops.fused_moe.token_dispatcher.get_ep_group",
             return_value=SimpleNamespace(rank_in_group=1),
         ),
@@ -551,9 +568,18 @@ def test_allgather_expert_map_without_current_vllm_config(ascend_config):
             return_value=(hidden_states, torch.arange(4), torch.tensor([1, 1]), None),
         ) as mock_init_routing,
     ):
-        output = dispatcher.token_dispatch(token_dispatch_input)
+        if capturing:
+            with patch.object(torch.Tensor, "cpu", side_effect=AssertionError("Host copy during capture")):
+                output = dispatcher.token_dispatch(token_dispatch_input)
+        else:
+            output = dispatcher.token_dispatch(token_dispatch_input)
 
     mock_config.assert_not_called()
+    if getattr(ascend_config, "enable_dsv41_moe_mask_range", False) and not enable_eplb:
+        mask_fusion.assert_not_called()
+        assert (dispatcher._expert_range.bounds is None) == capturing
+    else:
+        mask_fusion.assert_called_once()
     torch.testing.assert_close(output.combine_metadata.topk_weights, torch.tensor([[0.0, 0.8], [0.7, 0.0]]))
     assert mock_init_routing.call_args.kwargs["active_expert_range"] == [2, 4]
     assert mock_init_routing.call_args.kwargs["expert_num"] == 4

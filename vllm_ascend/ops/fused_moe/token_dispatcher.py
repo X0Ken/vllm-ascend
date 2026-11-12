@@ -27,7 +27,6 @@ import torch
 import torch_npu
 from vllm.config import get_current_vllm_config
 from vllm.distributed.parallel_state import get_ep_group
-from vllm.forward_context import get_forward_context
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import get_mc2_tokens_capacity
@@ -375,6 +374,9 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
         self.num_experts_local = (
             num_experts_local.item() if torch.is_tensor(num_experts_local) else int(num_experts_local)
         )
+        # Dispatch can execute from a compiled graph without an ambient config.
+        # Unknown callers conservatively retain indexed masks.
+        self.enable_eplb = kwargs.get("enable_eplb", True)
         self._expert_range = ContiguousExpertRange()
 
     def token_dispatch(
@@ -430,7 +432,7 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             last_expert_idx = first_expert_idx + self.num_experts_local
             if (
                 getattr(get_ascend_config(), "enable_dsv41_moe_mask_range", False) is True
-                and not get_current_vllm_config().parallel_config.enable_eplb
+                and not self.enable_eplb
                 and global_redundant_expert_num == 0
             ):
                 mask = self._expert_range.mask(
@@ -438,7 +440,7 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
                     topk_ids,
                     first_expert_idx,
                     last_expert_idx,
-                    capturing=getattr(get_forward_context(), "capturing", False),
+                    capturing=torch.npu.is_current_stream_capturing(),
                 )
                 topk_weights = topk_weights * mask
             else:

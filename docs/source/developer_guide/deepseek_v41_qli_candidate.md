@@ -193,3 +193,41 @@ run device correctness and service-level measurements before rollout.
 For slow or offline builders, `VLLM_SOURCE_URL` may point to a local HTTP
 mirror of the pinned upstream archive. The build still verifies
 `VLLM_SOURCE_SHA256` before extraction; mirroring never changes the vLLM revision.
+
+## A3 deployment profiles for fixed-wave comparisons
+
+The opt-in single-node TP8/DP2/EP16 profiles in
+`examples/deepseek_v41/a3_scheme1_additional.json` and
+`examples/deepseek_v41/a3_scheme2_additional.json` reuse the existing ports above.
+They are separate deployment configurations, not cumulative optimization levels.
+Keep the model, exact prompt IDs, output length, routing and measurement protocol
+fixed when comparing them.
+
+Scheme 1 follows [CJYLZS at 2ecdac2](https://github.com/CJYLZS/vllm-ascend-deepseek-v41-a2/tree/2ecdac22204c30fda9246606a78b1f6b3be4cbe0):
+MRV2, range masks, 2D output projection, unfiltered QLI and Engram WKV TP;
+FlashComm1 is disabled, batch budget is 4096 and memory utilization is 0.92.
+The latest packed-slot scalar optimization is ported with its NPU equivalence
+suite, extended to cover int64 slot IDs above INT32_MAX. It keeps the int64
+fallback and non-power-of-two page division. For the source's AIV mode, use
+`HCCL_OP_EXPANSION_MODE=AIV` without deterministic HCCL; verify its effective
+runtime setting. Do not mount an A2 PGO libpython into an A3 image with a
+different Python ABI.
+
+Scheme 2 follows [chiro2001 at ab88ff8](https://github.com/chiro2001/deepseek-v4.1-flash-ascend910B/tree/ab88ff84efa7970875f3f8cc38dfcb06c491b154):
+use the opt-in AllGather, range-mask, 2D output-projection, QLI, WKV-TP and
+KV-repack controls. Set the batch budget to 2048 and utilization to 0.92.
+The MRV2 allocator uses the transported slot offsets for relocated index planes,
+matching V1 rather than assuming every index follows its source KV plane.
+The admission gate permits up to eight prefills; decode-first is disabled
+because these two scheduler policies are mutually exclusive. The profile keeps
+MRV2, DSpark K5, static kernels and the baseline FlashComm1 setting. Range masking checks the physical NPU capture status, including compiler-internal
+captures, before any host-side map validation. The native
+device-side Engram and persistent RoPE row selection replace the source's old
+flat Engram/CPU JIT implementation. The source's withdrawn normalization-fusion
+package, CED-PD/DCP deployment and unqualified native GMM binary are not enabled.
+
+Pass these JSON objects through `--additional-config` alongside the matching
+launch parameters; they do not change batch size, HCCL environment or GPU
+utilization by themselves. Existing defaults remain unchanged. Both profiles
+require hardware correctness and performance qualification before deployment;
+source-project timings do not establish a speedup on the target stack.
