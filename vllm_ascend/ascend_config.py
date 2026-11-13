@@ -582,6 +582,10 @@ class AscendConfig:
     enable_dsv41_qli_no_candidate: bool = False
     enable_dsv41_engram_wkv_tp: bool = False
     enable_dsv41_kv_repack: bool = False
+    # Experimental CED roles: off (default), prefill, decode.
+    dsv41_ced_role: Literal["off", "prefill", "decode"] = "off"
+    # CPU-side replay diagnostics for correctness runs; keep off for benchmarks.
+    dsv41_ced_trace: bool = False
     # Opt-in D -> P scheduling: P shares all remaining capacity after D/DSpark.
     enable_dsv41_decode_first: bool = False
     # Raw draft token capture sizes; None inherits target sizes as before.

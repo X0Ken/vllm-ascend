@@ -414,6 +414,8 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # cacheable groups -- and only the shared prefix is there. ``None`` means
     # the same as all zeros; dummy/profiling/capture batches do not fill it.
     replay_start: torch.Tensor | None = None
+    # Experimental PD: this request received the exact P-side compressor state.
+    received_prefix_state: torch.Tensor | None = None
 
     # Global PCP view of the current target step and this cache group's index
     # into its per-group tensors. ``None`` when the step is not PCP-partitioned.
@@ -476,6 +478,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             copy_sfa_draft_index=self.copy_sfa_draft_index,
             offload_dummy=self.offload_dummy,
             replay_start=_slice_reqs(self.replay_start),
+            received_prefix_state=_slice_reqs(self.received_prefix_state),
             req_ids_tensor=_slice_reqs(self.req_ids_tensor),
             token_to_req=(self.token_to_req[:num_actual_tokens] if self.token_to_req is not None else None),
         )

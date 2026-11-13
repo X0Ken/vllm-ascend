@@ -22,12 +22,15 @@ from typing import Any
 import numpy as np
 import torch
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
+from vllm.logger import logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_ascend.models.deepseek_v41.ced import CED_REPLAY_TOKENS
 from vllm_ascend.models.deepseek_v41.decoder_replay_state import DecoderReplayInputs, DecoderReplayState
 from vllm_ascend.worker.v2.attn_utils import ring_state_update_skipped
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
@@ -89,6 +92,15 @@ class EngramModelState(AscendModelState):
     def __init__(self, vllm_config, model, encoder_cache, device):
         super().__init__(vllm_config, model, encoder_cache, device)
         self._replay_start_np = np.zeros(self.max_num_reqs, dtype=np.int32)
+        self._ced_receive_tracking = (getattr(vllm_config, "additional_config", None) or {}).get(
+            "dsv41_ced_role", "off"
+        ) == "decode"
+        self._received_prefix_state_np = np.zeros(self.max_num_reqs, dtype=np.bool_)
+        self._received_prefix_state = (
+            CpuGpuBuffer(self.max_num_reqs, dtype=torch.bool, device=device, pin_memory=False)
+            if self._ced_receive_tracking
+            else None
+        )
         # PCP represents each prefill's front/back chunks as separate local
         # requests. Only the gathered replay metadata uses that local layout.
         max_num_local_reqs = self.max_num_reqs
@@ -117,6 +129,11 @@ class EngramModelState(AscendModelState):
     def add_request(self, req_index: int, new_req_data) -> None:
         super().add_request(req_index, new_req_data)
         self._replay_start_np[req_index] = int(getattr(new_req_data, "replay_start", 0))
+        if getattr(self, "_ced_receive_tracking", False):
+            self._received_prefix_state_np[req_index] = False
+            if has_kv_transfer_group():
+                worker = get_kv_transfer_group().connector_worker
+                self._received_prefix_state_np[req_index] = worker.take_received_prefix_state(new_req_data.req_id)
         if self.decoder_replay_state is not None:
             params = new_req_data.sampling_params
             self.decoder_replay_state.keeps_rows[req_index] = params is not None and params.prompt_logprobs is not None
@@ -173,6 +190,28 @@ class EngramModelState(AscendModelState):
         self._replay_start.np[:num_reqs] = replay_np
         self._replay_start.copy_to_gpu(metadata_num_reqs)
         replay_start = self._replay_start.gpu[:metadata_num_reqs]
+        if (getattr(self.vllm_config, "additional_config", None) or {}).get("dsv41_ced_trace", False):
+            for index in range(num_reqs):
+                if not input_batch.is_prefilling_np[index]:
+                    continue
+                computed = int(input_batch.num_computed_tokens_np[index])
+                query = int(input_batch.query_start_loc_np[index + 1] - input_batch.query_start_loc_np[index])
+                start = int(replay_np[index])
+                replayed = (
+                    max(0, min(computed + query, start + CED_REPLAY_TOKENS) - max(computed, start)) if start > 0 else 0
+                )
+                received = bool(self._received_prefix_state_np[input_batch.idx_mapping_np[index]])
+                logger.info(
+                    "CED prefill role=%s request=%s computed=%d query=%d replay_start=%d replay_tokens=%d "
+                    "received_prefix_state=%s",
+                    (self.vllm_config.additional_config or {}).get("dsv41_ced_role", "off"),
+                    input_batch.req_ids[index],
+                    computed,
+                    query,
+                    start,
+                    replayed,
+                    received,
+                )
         pcp_context = None
         if self.pcp_manager is not None and not input_batch.is_dummy:
             pcp_context = self.pcp_manager.build_attention_context(input_batch, block_tables, slot_mappings)
@@ -220,7 +259,15 @@ class EngramModelState(AscendModelState):
         # even when every boundary is zero. Real replay steps still carry the
         # padded, graph-shaped buffer above.
         if model_specific_attn_metadata is None and replay_np.any():
-            model_specific_attn_metadata = ReplayAttnMetadata(replay_start)
+            received = None
+            if getattr(self, "_ced_receive_tracking", False):
+                self._received_prefix_state.np[:metadata_num_reqs].fill(False)
+                self._received_prefix_state.np[:num_reqs] = self._received_prefix_state_np[
+                    input_batch.idx_mapping_np[:num_reqs]
+                ]
+                self._received_prefix_state.copy_to_gpu(metadata_num_reqs)
+                received = self._received_prefix_state.gpu[:metadata_num_reqs]
+            model_specific_attn_metadata = ReplayAttnMetadata(replay_start, received)
         attn_metadata = super().prepare_attn(
             input_batch,
             cudagraph_mode,

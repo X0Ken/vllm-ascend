@@ -51,12 +51,16 @@ from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 class ReplayAttnMetadata(ModelSpecificAttnMetadata):
     """Pass V4.1 replay boundaries to the SWA metadata builder."""
 
-    def __init__(self, replay_start: torch.Tensor):
+    def __init__(self, replay_start: torch.Tensor, received_prefix_state: torch.Tensor | None = None):
         self.replay_start = replay_start
+        self.received_prefix_state = received_prefix_state
 
     def get_extra_common_attn_kwargs(self, cache_group_idx: int, num_reqs: int) -> dict[str, Any]:
         del cache_group_idx
-        return {"replay_start": self.replay_start[:num_reqs]}
+        result = {"replay_start": self.replay_start[:num_reqs]}
+        if self.received_prefix_state is not None:
+            result["received_prefix_state"] = self.received_prefix_state[:num_reqs]
+        return result
 
 
 if TYPE_CHECKING:
@@ -564,9 +568,11 @@ class AscendModelState(DefaultModelState):
             copy_sfa_restore_tails=restore_copy_sfa_tails,
             draft_layer_names=getattr(self, "_offload_draft_layer_names", None),
             common_metadata_callback=(
-                lambda group_id, common: self._decoder_replay_common_metadata.__setitem__(group_id, common)
-                if self.decoder_replay is not None
-                else None
+                lambda group_id, common: (
+                    self._decoder_replay_common_metadata.__setitem__(group_id, common)
+                    if self.decoder_replay is not None
+                    else None
+                )
             ),
         )
         self._prepare_decoder_replay(input_batch, cudagraph_mode, attn_groups, kv_cache_config)

@@ -89,6 +89,11 @@ class AscendDecoderReplayLayers:
 
 
 def make_decoder_replay(model: "DeepseekV41Model", config: VllmConfig) -> AscendDecoderReplayLayers | None:
+    if (getattr(config, "additional_config", None) or {}).get("dsv41_ced_role", "off") == "decode":
+        # CED P never built the upper decoder's SWA. Every target layer must
+        # execute the replay rows before any new prompt-tail queries can read
+        # them; trimming to the last window would discard those replay rows.
+        return None
     if not getattr(config.cache_config, "swa_bounded_replay", False):
         return None
     parallel = config.parallel_config

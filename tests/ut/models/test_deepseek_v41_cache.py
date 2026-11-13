@@ -249,6 +249,23 @@ def test_swa_only_reduced_backbone_uses_independent_cache_allocations(config, ru
         assert tensor.offset == tensor.layer_stride == 0
 
 
+@pytest.mark.parametrize("layer_count", [21, 22, 23, 39, 40])
+def test_pruned_backbone_groups_cover_every_cache_layer(runtime, layer_count):
+    specs = {
+        name: spec
+        for name, spec in collect_specs(runtime).items()
+        if int(name.split(".layers.")[1].split(".")[0]) < layer_count
+    }
+    groups = make_cache_groups(group_cache_specs(specs))
+    names = [name for group in groups for name in group.layer_names]
+    assert len(names) == len(set(names)) == len(specs)
+    assert set(names) == set(specs)
+    cache = get_deepseek_v41_kv_cache_config(runtime, groups, 1 << 26)
+    allocated = [name for tensor in cache.kv_cache_tensors for name in tensor.layers]
+    assert len(allocated) == len(set(allocated)) == len(specs)
+    assert set(allocated) == set(specs)
+
+
 def test_twelve_groups_share_four_layer_slots(config, runtime):
     original = collect_specs(runtime)
     uniform = group_cache_specs(original)

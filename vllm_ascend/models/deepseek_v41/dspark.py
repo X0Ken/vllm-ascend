@@ -94,7 +94,12 @@ class DeepseekV41DSparkSWACache(AscendDeepseekV41SWACache):
             sliding_window=spec.sliding_window,
             cache_dtype_str=spec.cache_dtype_str,
             model_version=spec.model_version,
-            bounded_replay=spec.bounded_replay,
+            # A CED P with SPEC=0 supplied no draft SWA. Keep these pages
+            # private until D has reconstructed them from replayed target states.
+            bounded_replay=(
+                spec.bounded_replay
+                or (getattr(vllm_config, "additional_config", None) or {}).get("dsv41_ced_role", "off") == "decode"
+            ),
         )
 
     def get_attn_backend(self):

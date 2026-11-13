@@ -12,6 +12,13 @@ from vllm_ascend.models.deepseek_v41 import decoder_replay_layers as replay_mod
 from vllm_ascend.models.deepseek_v41.model import DeepseekV41Model
 
 
+def test_ced_decoder_retains_all_replay_rows():
+    config = SimpleNamespace(additional_config={"dsv41_ced_role": "decode"})
+    # CED's producer never supplied the upper decoder's SWA. It must run
+    # the prefix replay rows as well as the new tail, irrespective of size.
+    assert replay_mod.make_decoder_replay(SimpleNamespace(), config) is None
+
+
 @pytest.mark.parametrize(("pcp_size", "prefix_caching"), [(1, True), (2, True), (2, False)])
 def test_decoder_replay_enabled_with_or_without_prefix_caching(pcp_size, prefix_caching):
     model = SimpleNamespace(

@@ -42,6 +42,12 @@ from vllm_ascend.core.kv_cache_interface import (
     get_storage_block_size,
 )
 from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.models.deepseek_v41.ced import (
+    CED_REPLAY_TOKENS,
+    received_replay_positions,
+    received_state_replay_skip,
+    replay_cache_origin,
+)
 from vllm_ascend.ops.rope_dsv4 import (
     get_cos_and_sin_dsa,
     get_full_cos_and_sin_dsa_for_layer,
@@ -1181,6 +1187,20 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
         ori_sparse_indices = kwargs.get("ori_sparse_indices")
         ori_topk_length = None
         replay_start = kwargs.get("replay_start")
+        if (
+            replay_start is None
+            and getattr(common, "replay_start", None) is not None
+            and getattr(get_ascend_config(), "dsv41_ced_role", "off") == "decode"
+        ):
+            # The encoder's replay needs the same physical SWA rebase as the
+            # upper decoder's compact replay. A mask alone leaves a long row
+            # of retired/null pages in the attention kernel's address range.
+            # Prepare ori geometry for *all* groups: compressed attention uses
+            # its global group's SMLA tiling metadata for both cache branches.
+            query_lens = common.query_start_loc[1 : num_reqs + 1] - common.query_start_loc[:num_reqs]
+            replay_start = replay_cache_origin(common.replay_start[:num_reqs], seq_lens, query_lens)
+            kwargs["replay_max_seq_len"] = int(common.max_query_len) + CED_REPLAY_TOKENS - 1
+            kwargs["replay_seq_lens"] = seq_lens
         replay_seq_lens = replay_block_table = replay_cache_blocks = replay_cache_offsets = None
         max_ori_seq_len = int(getattr(common, "max_seq_len", 0))
         if replay_start is not None:
@@ -1494,7 +1514,25 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                 used = torch.where(live, used, 0)
                 if skip_ring_update:
                     used = torch.zeros_like(used)
-                ring_meta[0].copy_((seq_lens - query_lens).clamp_min(0))
+                ring_start = (seq_lens - query_lens).clamp_min(0)
+                ced_replay_start = getattr(common, "replay_start", None)
+                received_prefix_state = getattr(common, "received_prefix_state", None)
+                preserve_received_state = (
+                    getattr(get_ascend_config(), "dsv41_ced_role", "off") == "decode"
+                    and ced_replay_start is not None
+                    and received_prefix_state is not None
+                )
+                if preserve_received_state:
+                    # P supplied the exact compressor state at the transfer
+                    # boundary. Replayed queries rebuild SWA, never that state.
+                    # Leading replay and the new prompt tail may share a batch.
+                    skipped = received_state_replay_skip(
+                        ced_replay_start[:num_reqs], seq_lens, query_lens, used, received_prefix_state[:num_reqs]
+                    )
+                    used = used - skipped
+                    starts = starts + skipped
+                    ring_start = ring_start + skipped
+                ring_meta[0].copy_(ring_start)
                 ring_meta[1].copy_(used)
                 ring_meta[2].copy_(starts)
                 ring_meta[3].copy_(starts)
@@ -1502,6 +1540,17 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                 valid_end = common.query_start_loc[num_actual_reqs].clamp_max(num_actual_tokens)
                 valid = torch.arange(num_input_tokens, device=input_positions.device) < valid_end
                 complete = (input_positions.remainder(2) == 1) & valid
+                if preserve_received_state:
+                    token_rows = torch.arange(num_input_tokens, device=input_positions.device)
+                    request_rows = torch.bucketize(token_rows, common.query_start_loc[1 : num_reqs + 1], right=True)
+                    token_replay_start = ced_replay_start[:num_reqs].index_select(
+                        0, request_rows.clamp_max(num_reqs - 1)
+                    )
+                    complete = complete & ~received_replay_positions(
+                        input_positions,
+                        token_replay_start,
+                        received_prefix_state[:num_reqs].index_select(0, request_rows.clamp_max(num_reqs - 1)),
+                    )
                 if skip_ring_update:
                     complete = torch.zeros_like(complete)
                 self._c2_complete_mask[:num_input_tokens].copy_(complete)

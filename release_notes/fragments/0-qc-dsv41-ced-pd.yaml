@@ -1,0 +1,8 @@
+pr: 0
+entries:
+  - category: feature
+    text: Added default-off experimental DeepSeek V4.1 CED producer and decoder roles with checked named-plane Mooncake KV transfers and replay diagnostics; the validated single-node A3 PD entrypoint defaults to CED with DSpark K5.
+    model: deepseek-v4.1
+    hardware: [A3]
+  - category: bugfix
+    text: Preserve all cache layers when grouping a reduced DeepSeek V4.1 backbone with unequal sliding-window columns.

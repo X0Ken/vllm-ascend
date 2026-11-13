@@ -53,6 +53,39 @@ class MockRequest:
 
 
 class TestHybridKVCacheRecvingThreadDispatch(unittest.TestCase):
+    def test_named_receive_waits_for_zeroing_and_fails_closed(self):
+        thread = object.__new__(KVCacheRecvingThread)
+        thread.use_hybrid = True
+        thread.named_cache_transfer = True
+        thread.named_transfer_failure = None
+        thread.task_tracker = MagicMock()
+        thread._mark_request_task_done = MagicMock(return_value=False)
+        thread._send_done_signal_to_free_remote_port = MagicMock()
+        thread._send_done_recv_signal = MagicMock()
+        thread.request_queue = MagicMock()
+        order = []
+        ready = MagicMock()
+        ready.synchronize.side_effect = lambda: order.append("zeroing_complete")
+        thread._transfer_kv_cache_all_groups = MagicMock(side_effect=lambda _: order.append("dma"))
+        metadata = {
+            "request_id": "D",
+            "remote_request_id": "P",
+            "remote_host": "192.0.2.1",
+            "remote_handshake_port": 30000,
+            "remote_port_send_num": {},
+            "all_task_done": True,
+            "cache_ready_event": ready,
+            "local_block_ids": [[1]],
+        }
+        thread._handle_request(metadata)
+        self.assertEqual(order, ["zeroing_complete", "dma"])
+        self.assertIsNone(thread.named_transfer_failure)
+        thread._transfer_kv_cache_all_groups.side_effect = RuntimeError("incomplete DMA")
+        with patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_hybrid_connector.logger.exception"):
+            thread._handle_request(metadata)
+        with self.assertRaisesRegex(RuntimeError, "refusing to use incomplete KV"):
+            thread.get_and_clear_finished_requests()
+
     def _make_thread(self):
         thread = object.__new__(KVCacheRecvingThread)
         thread.executor = ThreadPoolExecutor(max_workers=2)

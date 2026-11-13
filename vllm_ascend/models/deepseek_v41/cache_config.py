@@ -3,6 +3,7 @@
 """Framework-side V4.1 layer-outermost cache placement and allocation."""
 
 from dataclasses import dataclass, replace
+from itertools import zip_longest
 
 import torch
 from vllm.config import VllmConfig
@@ -310,7 +311,8 @@ def group_cache_specs(specs, *, repack=False):
         ]
         for layer_tuple in layer_tuples
     ]
-    for names in zip(*swa_columns):
+    for column in zip_longest(*swa_columns):
+        names = [name for name in column if name is not None]
         groups.append(UniformTypeKVCacheSpecs.from_specs({name: padded[name] for name in names}))
 
     draft_names = [

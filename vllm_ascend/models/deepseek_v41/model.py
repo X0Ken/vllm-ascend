@@ -87,6 +87,14 @@ from .cache_config import (
     make_mla_cache_spec,
     make_swa_cache_spec,
 )
+from .ced import (
+    CED_REPLAY_TOKENS,
+    CED_SOURCE_LAYER,
+    CED_TARGET_LAYERS,
+    CED_TRANSFER_MARKER,
+    get_ced_role,
+    is_producer_weight,
+)
 from .compressor import DeepseekV41Compressor
 from .decoder_replay_layers import make_decoder_replay
 from .engram import (
@@ -778,6 +786,21 @@ class DeepseekV41Attention(DeepseekV41SWAAttention):
         torch.ops.vllm.dsa_v41_forward(hidden_states, output, self.v41_layer_name)
         return output
 
+    def write_global_source_only(self, normalized_hidden_states):
+        """Use the native source writer, including its exact RoPE/cache ABI."""
+        if self.role.layer_idx != CED_SOURCE_LAYER or not self.role.is_kv_source or self.role.compress_ratio != 1:
+            raise ValueError("CED boundary must be the ratio-1 global source")
+        context = get_forward_context()
+        if context.attn_metadata is None:
+            return
+        metadata = self.v41_impl._get_layer_metadata(context.attn_metadata)
+        num_tokens = metadata.swa.num_actual_tokens
+        if num_tokens:
+            cos, sin = metadata.rope(self.rotary_emb.layername, num_tokens)
+            self.v41_impl._write_compressed_source(
+                self, normalized_hidden_states[:num_tokens], metadata.positions[:num_tokens], cos, sin, metadata
+            )
+
 
 class DeepseekV41DecoderLayer(nn.Module):
     """V4.1 block with the checkpoint's delayed mHC coefficient handoff."""
@@ -859,6 +882,19 @@ class DeepseekV41DecoderLayer(nn.Module):
             self.engram = AscendEngram(config, quant_config, f"{prefix}.engram")
         else:
             self.engram = None
+
+    def write_global_source_from_encoder(self, hidden_states, pre_mix):
+        x, _, _, _ = self.hc_pre(
+            hidden_states,
+            self.hc_attn_fn,
+            self.hc_attn_scale,
+            self.hc_attn_base,
+            pre_mix,
+        )
+        x = self.input_layernorm(x)
+        if self.use_sequence_parallel:
+            raise RuntimeError("CED producer source projection does not support sequence parallelism")
+        self.self_attn.write_global_source_only(x)
 
     def rms_norm_cast(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Normalize once and provide the exact FP32 routing input."""
@@ -980,6 +1016,21 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         config = normalize_deepseek_v41_config(vllm_config.model_config.hf_config)
         quant_config = vllm_config.quant_config
         self.config = config
+        self.ced_role = get_ced_role(vllm_config)
+        if self.ced_role != "off":
+            if DeviceOperator.get_dsv41_packed_cache_ops() is not None:
+                raise ValueError("Experimental CED currently supports the A3 BF16 cache ABI only")
+            topology = build_layer_plan(config)
+            if (
+                config.num_hidden_layers != CED_TARGET_LAYERS
+                or config.sliding_window != CED_REPLAY_TOKENS
+                or max(config.kv_source_layer_ids) != CED_SOURCE_LAYER
+                or topology.layer(CED_SOURCE_LAYER).compress_ratio != 1
+                or any(layer > CED_SOURCE_LAYER for layer in config.engram_layer_ids)
+            ):
+                raise ValueError("Unsupported DeepSeek V4.1 CED split topology")
+        if self.ced_role == "prefill" and vllm_config.parallel_config.use_sequence_parallel_moe:
+            raise ValueError("CED producer currently requires sequence parallelism disabled")
         self.has_engram = _engram_enabled_for_runtime(config, vllm_config)
         self.device = current_platform.device_type
         self.use_sequence_parallel_moe = vllm_config.parallel_config.use_sequence_parallel_moe
@@ -1010,7 +1061,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         else:
             self.embed_tokens = PPMissingLayer()
         self.start_layer, self.end_layer, self.layers = make_layers(
-            config.num_hidden_layers,
+            CED_SOURCE_LAYER + 1 if self.ced_role == "prefill" else config.num_hidden_layers,
             lambda prefix: self.decoder_layer_cls(vllm_config, prefix, topk_indices_buffer=topk_indices_buffer),
             prefix=f"{prefix}.layers",
         )
@@ -1622,6 +1673,9 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         last_layer = None
         aux_hidden_states = []
         for layer in self.layers:
+            if getattr(self, "ced_role", "off") == "prefill" and layer.layer_idx == CED_SOURCE_LAYER:
+                layer.write_global_source_from_encoder(hidden_states, pre_mix)
+                break
             if self.decoder_replay_layers is not None and layer.layer_idx == self.decoder_replay_start:
                 hidden_states, pre_mix, *late_aux = self.decoder_replay_layers(
                     hidden_states, pre_mix, positions, input_ids
@@ -1886,6 +1940,8 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if getattr(self.model, "ced_role", "off") == "prefill":
+            weights = ((name, tensor) for name, tensor in weights if is_producer_weight(name))
         if not self.model.has_engram:
             return self._load_model_weights((name, tensor) for name, tensor in weights if ".engram." not in name)
         loaded = self._load_model_weights((name, tensor) for name, tensor in weights if self._is_milestone_weight(name))
@@ -1919,6 +1975,13 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
+        if logits is not None and getattr(self.model, "ced_role", "off") == "prefill":
+            eos = self.config.eos_token_id
+            eos_ids = eos if isinstance(eos, (tuple, list)) else [eos]
+            if CED_TRANSFER_MARKER in eos_ids or logits.shape[-1] <= CED_TRANSFER_MARKER:
+                raise ValueError("CED internal transfer marker conflicts with the tokenizer")
+            logits.fill_(float("-inf"))
+            logits[..., CED_TRANSFER_MARKER] = 0
         return logits
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
