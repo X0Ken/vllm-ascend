@@ -11,13 +11,6 @@ def compact_terminal_moe(mlp, x, residual, post, comb, pre, x_fp32, input_ids, i
     broad YoCo layer compaction, but no consumer needs unrequested final FFN
     rows. The caller disables this path for prompt scoring and full HC output.
     """
-    import copy
-
-    from vllm.forward_context import get_forward_context, override_forward_context
-
-    from vllm_ascend.ascend_forward_context import MoECommType
-    from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
-
     if not getattr(mlp, "_terminal_compaction_seen", False):
         from vllm.logger import logger
 
@@ -27,33 +20,59 @@ def compact_terminal_moe(mlp, x, residual, post, comb, pre, x_fp32, input_ids, i
     selected = [tensor.index_select(0, indices) for tensor in (x, residual, post, comb, pre, x_fp32)]
     x, residual, post, comb, pre, x_fp32 = selected
     input_ids = input_ids.index_select(0, indices) if input_ids is not None else None
+    x = _small_terminal_mlp(mlp, x, x_fp32, input_ids, indices)
+    return x, residual, post, comb, pre
+
+
+def _small_terminal_mlp(
+    mlp, x, x_fp32, input_ids, indices, *, preserve_backend=False, shared_full=None, router_logits=None
+):
+    """Run compact routed experts within the target-owned communication context."""
+    import copy
+
+    from vllm.forward_context import get_forward_context, override_forward_context
+
+    from vllm_ascend.ascend_forward_context import MoECommType
+    from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
+
     outer = get_forward_context()
     inner = copy.copy(outer)
     inner.additional_kwargs = dict(outer.additional_kwargs)
-    count = indices.shape[0]
+    count = x.shape[0]
+    # Shared TP experts gather all SP shards before projecting. Their unpad
+    # length must describe the gathered sequence, not one rank's shard.
+    global_count = count * mlp.tp_size if mlp.is_sequence_parallel else count
     # Use the existing qualified small-batch AllGather implementation with the
     # target's expert layout; no communication state from the drafter is reused.
     owner = outer.additional_kwargs["moe_comm_method"].moe_config
-    comm = get_moe_comm_method(MoECommType.ALLGATHER, owner)
+    kind = outer.additional_kwargs["moe_comm_type"] if preserve_backend else MoECommType.ALLGATHER
+    comm = outer.additional_kwargs["moe_comm_method"] if preserve_backend else get_moe_comm_method(kind, owner)
     if comm is None:
         raise RuntimeError("Terminal compaction has no target-owned AllGather dispatcher")
     inner.additional_kwargs.update(
-        moe_comm_type=MoECommType.ALLGATHER,
+        moe_comm_type=kind,
         moe_comm_method=comm,
-        num_tokens=count,
-        max_tokens_across_dp=count,
-        max_tokens_across_pcp=count,
-        padded_num_tokens=count,
-        padded_length=count,
+        num_tokens=global_count,
+        max_tokens_across_dp=global_count,
+        max_tokens_across_pcp=global_count,
+        padded_num_tokens=global_count,
+        padded_length=global_count,
         num_tokens_across_dp=None,
         use_mega_moe=False,
     )
+    if shared_full is not None:
+        inner.additional_kwargs["v41_terminal_ffn_full"] = {
+            "input": shared_full,
+            "num_tokens": outer.additional_kwargs["num_tokens"],
+            "indices": indices,
+            "router_logits": router_logits,
+        }
     inner.is_padding = outer.is_padding.index_select(0, indices) if outer.is_padding is not None else None
     inner.skip_compiled = True
     with override_forward_context(inner):
-        x = mlp(x, input_ids=input_ids, hidden_states_fp32=x_fp32, already_sequence_parallel=False)
+        x = mlp(x, input_ids=input_ids, hidden_states_fp32=x_fp32, already_sequence_parallel=mlp.is_sequence_parallel)
     outer.moe_layer_index = inner.moe_layer_index
-    return x, residual, post, comb, pre
+    return x
 
 
 @torch.library.custom_op("v41_terminal_consumer::run", mutates_args=())
@@ -207,3 +226,101 @@ def restore_terminal_consumer(value: torch.Tensor) -> torch.Tensor:
 @restore_terminal_consumer.register_fake
 def _fake_restore_consumer(value):
     return torch.empty_like(value)
+
+
+@torch.library.custom_op("v41_terminal_consumer::ffn", mutates_args=())
+def run_terminal_ffn(
+    x: torch.Tensor,
+    x_fp32: torch.Tensor,
+    input_ids: torch.Tensor | None,
+    layer_name: str,
+    residual: torch.Tensor | None = None,
+    post: torch.Tensor | None = None,
+    comb: torch.Tensor | None = None,
+    pre: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Preserve all attention/KV/DSpark rows and prune only final FFN work."""
+    from vllm.forward_context import get_forward_context
+
+    mlp = get_forward_context().no_compile_layers[layer_name]
+    plan = getattr(mlp, "prefill_compaction_plan", None)
+    from vllm_ascend.ascend_forward_context import MoECommType
+
+    kind = get_forward_context().additional_kwargs.get("moe_comm_type")
+    if (
+        plan is None
+        or (mlp.is_sequence_parallel and kind == MoECommType.ALLGATHER)
+        or kind
+        not in (
+            MoECommType.ALLTOALL,
+            MoECommType.ALLGATHER,
+        )
+    ):
+        return mlp(
+            x, input_ids=input_ids, hidden_states_fp32=x_fp32, already_sequence_parallel=mlp.is_sequence_parallel
+        ).clone()
+    indices, real_count, verify, valid, used = plan
+    reference = None
+    if verify:
+        context = get_forward_context()
+        layer_index = context.moe_layer_index
+        reference_full = mlp(
+            x, input_ids=input_ids, hidden_states_fp32=x_fp32, already_sequence_parallel=mlp.is_sequence_parallel
+        )
+        reference_full = reference_full.clone()
+        reference = reference_full.index_select(0, indices)
+        # The oracle is an extra call, not an extra logical layer. Both runs
+        # must resolve the same target MoE weights through the layer cursor.
+        context.moe_layer_index = layer_index
+        replay_full = mlp(
+            x, input_ids=input_ids, hidden_states_fp32=x_fp32, already_sequence_parallel=mlp.is_sequence_parallel
+        )
+        replay_full = replay_full.clone()
+        replay = replay_full.index_select(0, indices)
+        context.moe_layer_index = layer_index
+    selected = x.index_select(0, indices)
+    fp32 = x_fp32.index_select(0, indices)
+    ids = input_ids.index_select(0, indices) if input_ids is not None else None
+    # Keep the original Router GEMM shape and shared TP reduction. Only the
+    # routed experts dispatch/GMM work changes row count.
+    runner = mlp.experts
+    router_input = runner._prepare_router_input(x, x_fp32)
+    full_router_logits = runner._apply_router_linear(router_input)
+    compact = _small_terminal_mlp(
+        mlp,
+        selected,
+        fp32,
+        ids,
+        indices,
+        preserve_backend=True,
+        shared_full=x,
+        router_logits=full_router_logits.index_select(0, indices),
+    )
+    stats = mlp.prefill_compaction_stats
+    stats["executed_steps"] += 1
+    if reference is not None:
+        # Explicit diagnostic mode only: device reads never enter performance waves.
+        self_error = torch.where(valid.unsqueeze(1), (reference.float() - replay.float()).abs(), 0).max().item()
+        stats["max_full_ffn_self_abs_difference"] = max(stats.get("max_full_ffn_self_abs_difference", 0.0), self_error)
+        error = (reference.float() - compact.float()).abs()
+        maximum = torch.where(valid.unsqueeze(1), error, 0).max().item()
+        stats["max_padding_ffn_abs_difference"] = max(
+            stats.get("max_padding_ffn_abs_difference", 0.0), error.max().item()
+        )
+        stats["verified_steps"] = stats.get("verified_steps", 0) + 1
+        stats["verified_rows"] = stats.get("verified_rows", 0) + indices.numel()
+        stats["verified_real_rows"] = stats.get("verified_real_rows", 0) + valid.sum().item()
+        stats["max_ffn_abs_difference"] = max(stats.get("max_ffn_abs_difference", 0.0), maximum)
+    result = torch.zeros_like(x)
+    # Padding may repeat row zero; only unique real rows are ever restored.
+    result.index_add_(0, indices, torch.where(valid.unsqueeze(1), compact, 0))
+    if verify and residual is not None:
+        mlp.prefill_compaction_oracle(
+            reference_full, result, indices, used, residual, post, comb, pre, control=replay_full
+        )
+    return result
+
+
+@run_terminal_ffn.register_fake
+def _fake_terminal_ffn(x, x_fp32, input_ids, layer_name, residual=None, post=None, comb=None, pre=None):
+    return torch.empty_like(x)

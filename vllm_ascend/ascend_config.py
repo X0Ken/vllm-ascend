@@ -582,6 +582,8 @@ class AscendConfig:
     enable_dsv41_qli_no_candidate: bool = False
     enable_dsv41_engram_wkv_tp: bool = False
     enable_dsv41_kv_repack: bool = False
+    # Exact terminal FFN row selection for non-PD TP8/DP2/EP16.
+    dsv41_prefill_compaction: Literal["off", "terminal"] = "off"
     # Experimental CED roles: off (default), prefill, decode.
     dsv41_ced_role: Literal["off", "prefill", "decode"] = "off"
     # CPU-side replay diagnostics for correctness runs; keep off for benchmarks.

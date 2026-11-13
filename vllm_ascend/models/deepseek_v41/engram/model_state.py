@@ -111,6 +111,11 @@ class EngramModelState(AscendModelState):
         self._replay_groups: tuple[int, torch.Tensor] | None = None
         layers = getattr(model, "decoder_replay_layers", None)
         self.decoder_replay_state = DecoderReplayState(vllm_config, layers, device) if layers is not None else None
+        self.prefill_compaction = None
+        if (vllm_config.additional_config or {}).get("dsv41_prefill_compaction", "off") == "terminal":
+            from vllm_ascend.models.deepseek_v41.prefill_compaction import TerminalPrefillCompaction
+
+            self.prefill_compaction = TerminalPrefillCompaction(self)
         depth = model.token_lookback_depth
         self.lookback_token_ids: torch.Tensor | None = None
         self._cg_mode: CUDAGraphMode | None = None
@@ -142,6 +147,8 @@ class EngramModelState(AscendModelState):
         # Engram owns its lookup buffers and events. Keep their retirement
         # beside the input preparation instead of exposing them to the runner.
         try:
+            if self.prefill_compaction is not None:
+                self.prefill_compaction.finish()
             self._engram_inputs = None
             self.model.retire_engram_lookups(reset_events=failed)
         finally:
@@ -162,6 +169,8 @@ class EngramModelState(AscendModelState):
         # prepare_inputs runs before any forward context, so the graph mode of
         # this step is only known here; engram overlap dispatch keys off it.
         self._cg_mode = cudagraph_mode
+        if self.prefill_compaction is not None:
+            self.prefill_compaction.prepare(input_batch, cudagraph_mode, for_capture)
         if self._replay_groups is None:
             from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
 

@@ -71,6 +71,7 @@ from vllm_ascend.models.common.ops.sequence_parallel import (
 from vllm_ascend.models.deepseek_v41.consumer_compaction_runtime import (
     prepare_terminal_consumer,
     restore_terminal_consumer,
+    run_terminal_ffn,
     run_terminal_moe,
 )
 from vllm_ascend.ops.dsa import AscendDeepseekSparseAttention, DSAModules
@@ -854,6 +855,11 @@ class DeepseekV41DecoderLayer(nn.Module):
             prefix=f"{prefix}.mlp",
             is_draft_layer=is_draft_layer,
         )
+        self.prefill_ffn_compaction = (
+            not is_draft_layer
+            and self.layer_idx == config.num_hidden_layers - 1
+            and (vllm_config.additional_config or {}).get("dsv41_prefill_compaction", "off") == "terminal"
+        )
         self.compact_mlp_name = f"{prefix}.terminal_compact_mlp"
         if not is_draft_layer and self.layer_idx == config.num_hidden_layers - 1:
             vllm_config.compilation_config.static_forward_context[self.compact_mlp_name] = self.mlp
@@ -982,6 +988,10 @@ class DeepseekV41DecoderLayer(nn.Module):
                 consumer_output_indices,
                 self.compact_mlp_name,
             )
+        elif self.prefill_ffn_compaction:
+            # Opaque full-shape operator keeps the compiled backbone intact;
+            # only its terminal FFN gathers the DP-coordinated output rows.
+            x = run_terminal_ffn(x, x_fp32, input_ids, self.compact_mlp_name, residual, ffn_post, ffn_comb, ffn_pre)
         else:
             x = self.mlp(
                 x,

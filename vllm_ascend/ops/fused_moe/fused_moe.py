@@ -24,6 +24,7 @@ from vllm.distributed import (
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig, FusedMoERouter
 from vllm.model_executor.layers.fused_moe.layer import MoERunner
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import _moe_forward_shared, _unpack
@@ -456,8 +457,13 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         # The milestones are consumed only by the shared-expert side stream,
         # which runs only when multistream overlap is enabled; skip the record
         # (notably slow host-side) when it is off.
+        terminal = (
+            get_forward_context().additional_kwargs.get("v41_terminal_ffn_full")
+            if getattr(self, "v41_terminal_compaction_owner", False) is True
+            else None
+        )
         if self.is_internal_router:
-            router_input = self._prepare_router_input(shared_hidden_states, router_logits)
+            router_input = self._prepare_router_input(shared_hidden_states, router_logits) if terminal is None else None
             # Release shared Vector/AIV preparation only after the router input
             # Cast. It then overlaps the Cube-heavy gate matmul instead of
             # competing with another Vector/AIV operation.
@@ -466,7 +472,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                 prepared_shared_input,
                 shared_input_ready,
             )
-            router_logits = self._apply_router_linear(router_input)
+            router_logits = self._apply_router_linear(router_input) if terminal is None else terminal["router_logits"]
             router_output_ready = maybe_record_event()
         else:
             shared_input_ready = maybe_record_event()
@@ -507,12 +513,18 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                     router_logits=router_logits,
                     input_ids=input_ids,
                 )
+            terminal = (
+                get_forward_context().additional_kwargs.get("v41_terminal_ffn_full")
+                if getattr(self, "v41_terminal_compaction_owner", False) is True
+                else None
+            )
+            shared_preparation_states = shared_hidden_states if terminal is None else terminal["input"]
             shared_input_is_gathered = self._can_overlap_sp_shared_with(self.routed_input_transform)
             defer_shared_output_wait = self._can_overlap_sp_shared_with(self.routed_output_transform)
             prepared_shared_input = (
-                PreparedSharedExpertInput(shared_hidden_states, is_gathered=True)
+                PreparedSharedExpertInput(shared_preparation_states, is_gathered=True)
                 if shared_input_is_gathered
-                else self.ascend_shared_experts.prepare_input_before_routed(shared_hidden_states)
+                else self.ascend_shared_experts.prepare_input_before_routed(shared_preparation_states)
             )
             router_logits, shared_input_ready, router_output_ready, submitted_gate_up = (
                 self._prepare_router_and_milestones(

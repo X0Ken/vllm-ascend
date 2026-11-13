@@ -1,0 +1,6 @@
+pr: 0
+entries:
+  - category: feature
+    text: Added default-off DP-coordinated terminal routed-expert row compaction for DeepSeek V4.1 non-PD TP8/DP2/EP16, preserving full Router/shared-expert shapes, attention, prefix-cache writes and DSpark auxiliary features.
+    model: deepseek-v4.1
+    hardware: [A3]

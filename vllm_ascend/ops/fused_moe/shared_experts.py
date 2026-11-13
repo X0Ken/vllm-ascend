@@ -23,6 +23,7 @@ import torch
 import torch.nn.functional as F
 import torch_npu
 from vllm.distributed import tensor_model_parallel_all_gather, tensor_model_parallel_reduce_scatter
+from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.activation import SituAndMul
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig, FusedMoEMethodBase
@@ -267,6 +268,13 @@ class AscendSharedExperts:
             shared_out = shared_out[:original_num_tokens]
         return shared_out
 
+    def _shared_num_tokens(self):
+        if getattr(self, "v41_terminal_compaction_owner", False) is True:
+            terminal = get_forward_context().additional_kwargs.get("v41_terminal_ffn_full")
+            if terminal is not None:
+                return terminal["num_tokens"]
+        return _EXTRA_CTX.num_tokens
+
     def _gather_sp_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Gather SP-sharded activations to the full sequence via TP all-gather + unpad.
 
@@ -276,7 +284,7 @@ class AscendSharedExperts:
         all-gather the shards back to [T_padded, H] and drop the padding rows.
         """
         gathered = tensor_model_parallel_all_gather(hidden_states, dim=0)
-        return gathered[: _EXTRA_CTX.num_tokens]
+        return gathered[: self._shared_num_tokens()]
 
     def _pad_and_reduce_scatter(self, shared_out: torch.Tensor) -> torch.Tensor:
         """Pad the full output to a TP multiple, then reduce-scatter to the SP shard.
@@ -395,7 +403,7 @@ class AscendSharedExperts:
             # An early gather keeps padding across the custom-op boundary so
             # tracing sees the explicit gathered dependency. The MLP consumes
             # only the original tokens.
-            hidden_states = hidden_states[: _EXTRA_CTX.num_tokens]
+            hidden_states = hidden_states[: self._shared_num_tokens()]
         return hidden_states, local_dp_metadata
 
     def prepare_for_router_overlap(
@@ -777,4 +785,10 @@ class AscendSharedExperts:
             shared_out = self._finalize_local_dp_output(shared_out, local_dp_metadata)
         elif mode is SharedExpertParallelMode.SEQUENCE_PARALLEL_ONLY and not self.multistream_overlap:
             shared_out = self._pad_and_reduce_scatter(shared_out)
+        if getattr(self, "v41_terminal_compaction_owner", False) is True:
+            terminal = get_forward_context().additional_kwargs.get("v41_terminal_ffn_full")
+            if terminal is not None:
+                # All original shared rows and TP collectives have completed;
+                # restore the compact routed layout only at the final boundary.
+                shared_out = shared_out.index_select(0, terminal["indices"])
         return shared_out
