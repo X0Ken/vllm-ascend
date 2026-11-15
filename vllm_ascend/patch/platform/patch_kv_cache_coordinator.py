@@ -35,6 +35,10 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
+from vllm_ascend.models.deepseek_v41.cache_config import (
+    get_deepseek_v41_ring_num_blocks,
+    is_ring_cache_group,
+)
 
 _orig_get_kv_cache_coordinator = vllm.v1.core.kv_cache_coordinator.get_kv_cache_coordinator
 
@@ -174,20 +178,51 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
 
         extra_mgr_kwargs: dict = {"scheduler_block_size": scheduler_block_size}
         extra_mgr_kwargs["needs_kv_cache_zeroing"] = kv_cache_config.needs_kv_cache_zeroing
-        self.single_type_managers = tuple(
-            get_manager_for_kv_cache_spec(
-                kv_cache_spec=_manager_spec(kv_cache_group.kv_cache_spec),
-                block_pool=self.block_pool,
-                enable_caching=enable_caching,
-                kv_cache_group_id=i,
-                dcp_world_size=dcp_world_size,
-                pcp_world_size=1,
-                max_in_flight_tokens=token_budget,
-                max_model_len=max_model_len,
-                **extra_mgr_kwargs,
+        # ring 摘出 block pool（VLLM_ASCEND_RING_OUT_OF_POOL）：V4.1 的 FP32
+        # compressor state ring 每请求只要 1 页，却把整个池的页地板抬到
+        # 131,072。gate 打开时给它一个只够 max_num_seqs+1 页的独立小池。
+        # 块自带 pool 回指，BlockPool.free_blocks 会把延迟释放的块送回各自
+        # 的池子（block_pool.py:789-807），所以两个池混在一个延迟释放队列里
+        # 是上游明确支持的。
+        self.ring_block_pool = None
+        ring_blocks = get_deepseek_v41_ring_num_blocks(kv_cache_config)
+        if ring_blocks > 0:
+            self.ring_block_pool = BlockPool(
+                num_gpu_blocks=ring_blocks,
+                enable_caching=False,
+                hash_block_size=hash_block_size,
+                enable_kv_cache_events=False,
             )
-            for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
-        )
+            logger.info(
+                "DeepSeek V4.1 ring block pool: %d blocks (independent of the %d-block KV pool)",
+                ring_blocks,
+                kv_cache_config.num_blocks,
+            )
+        managers = []
+        for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
+            group_block_pool = self.block_pool
+            group_kwargs = dict(extra_mgr_kwargs)
+            group_enable_caching = enable_caching
+            if self.ring_block_pool is not None and is_ring_cache_group(kv_cache_group):
+                # ring 不再与 attention 共页：再上报 block id 只会让 worker 去清
+                # 主池里同 id 的 attention 页（那是另一个物理页），必须关掉。
+                group_block_pool = self.ring_block_pool
+                group_enable_caching = False
+                group_kwargs["needs_kv_cache_zeroing"] = False
+            managers.append(
+                get_manager_for_kv_cache_spec(
+                    kv_cache_spec=_manager_spec(kv_cache_group.kv_cache_spec),
+                    block_pool=group_block_pool,
+                    enable_caching=group_enable_caching,
+                    kv_cache_group_id=i,
+                    dcp_world_size=dcp_world_size,
+                    pcp_world_size=1,
+                    max_in_flight_tokens=token_budget,
+                    max_model_len=max_model_len,
+                    **group_kwargs,
+                )
+            )
+        self.single_type_managers = tuple(managers)
         # vLLM #53614 aligns exported Mamba checkpoints with EAGLE replay.
         if use_eagle:
             for group_id, manager in enumerate(self.single_type_managers):
