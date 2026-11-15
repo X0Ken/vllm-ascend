@@ -17,6 +17,7 @@ from vllm_ascend.attention.dsa_v41 import (
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.models.deepseek_v41.cache_config import (
+    a3_kv8_index_unpacked,
     make_folded_index_cache_spec,
     make_index_cache_spec,
     uses_a5_packed_cache,
@@ -52,7 +53,11 @@ class DeepseekV41Indexer(nn.Module):
     ):
         super().__init__()
         self.owns_k = owns_k
-        self.packed_cache_ops = DeviceOperator.get_dsv41_packed_cache_ops()
+        # 解绑：KV8 记录走 packed 写/读，但 indexer/QLI 留在系统非 packed 路径
+        # （A3 无 mxfp4 QLI ABI，见 cache_config.a3_kv8_index_unpacked）。
+        self.packed_cache_ops = (
+            None if a3_kv8_index_unpacked() else DeviceOperator.get_dsv41_packed_cache_ops()
+        )
         self.no_candidate = getattr(get_ascend_config(), "enable_dsv41_qli_no_candidate", False) is True
         self.compress_ratio = compress_ratio
         self.n_heads = int(config.index_n_heads)
@@ -100,7 +105,7 @@ class DeepseekV41Indexer(nn.Module):
                     f"{prefix}.k_cache_folded",
                     make_folded_index_cache_spec(block_size=vllm_config.cache_config.block_size),
                 )
-                if is_candidate_source and uses_a5_packed_cache()
+                if is_candidate_source and uses_a5_packed_cache() and not a3_kv8_index_unpacked()
                 else None
             )
 
