@@ -6,6 +6,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+import os
+
 import torch
 import torch_npu
 from vllm.triton_utils import tl, triton
@@ -22,6 +24,38 @@ from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 from vllm_ascend.quantization.methods.kv_cache.turboquant import is_turboquant
 
 _BF16_KV_CACHE_DTYPES = frozenset({"bfloat16", "bf16"})
+
+
+# --- KV8 精度模拟（实验用，KV8_SIM=1 开启）------------------------------------
+# 存储仍为 BF16，但按 per-64-group FP8(E4M3) 量化->反量化，端到端测"真 KV8 掉多少分"。
+_KV8_SIM = os.environ.get("KV8_SIM", "0") == "1"
+_KV8_SIM_GROUP = int(os.environ.get("KV8_SIM_GROUP", "64"))
+_KV8_SIM_STATE = {"printed": False, "n": 0}
+
+def _kv8_sim_quant(x):
+    if not _KV8_SIM or x is None:
+        return x
+    try:
+        d = x.shape[-1]
+        g = _KV8_SIM_GROUP
+        if d % g != 0:
+            return x
+        xg = x.reshape(-1, d // g, g)
+        amax = xg.abs().amax(-1, keepdim=True).clamp_min(1e-12)
+        scale = (amax / 448.0).to(torch.bfloat16).to(x.dtype)
+        q = (xg / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        out = (q.to(x.dtype) * scale).reshape(x.shape)
+        if not _KV8_SIM_STATE["printed"]:
+            _KV8_SIM_STATE["printed"] = True
+            print(f"[KV8-SIM] quantize KV shape={tuple(x.shape)} dtype={x.dtype} group={g}", flush=True)
+        _KV8_SIM_STATE["n"] += 1
+        return out
+    except Exception as exc:
+        if not _KV8_SIM_STATE["printed"]:
+            _KV8_SIM_STATE["printed"] = True
+            print(f"[KV8-SIM] disabled: {type(exc).__name__}: {exc}", flush=True)
+        return x
+# ---------------------------------------------------------------------------
 
 
 def _supports_dsv4_compressed_cache() -> bool:
@@ -179,6 +213,7 @@ class DsaAttnKvPlan:
     def dsa_kv_compress_scatter(self, cache: torch.Tensor, x: torch.Tensor | None, slot_mapping: torch.Tensor) -> None:
         if x is None:
             return
+        x = _kv8_sim_quant(x)
         if self.uses_sparse_flash_mla:
             if slot_mapping.ndim != 1:
                 raise ValueError(f"BF16 DSA slot_mapping must be [num_tokens], got {tuple(slot_mapping.shape)}.")

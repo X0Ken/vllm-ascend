@@ -59,7 +59,14 @@ def _validate_turboquant_dsa(vllm_config) -> None:
     hf = getattr(model, "hf_text_config", None)
     if hf is None:
         hf = getattr(model, "hf_config", None)
-    if hf is None or getattr(hf, "model_type", None) != "deepseek_v4":
+    _allowed_model_types = {"deepseek_v4"}
+    import os as _os
+
+    if _os.environ.get("VLLM_ASCEND_A3_SOFT_KV8") == "1":
+        # A3 上的 tiny/测试形态模型可能用 deepseek_v41 之类的自定义 model_type，
+        # 但它们的 text_config 结构与 V4 一致，允许在开关打开时放行。
+        _allowed_model_types |= {"deepseek_v41", "deepseek_v41_text"}
+    if hf is None or getattr(hf, "model_type", None) not in _allowed_model_types:
         raise ValueError(f"Ascend {TURBOQUANT_CACHE_DTYPE} currently requires DeepSeek V4")
     if not vllm_config.use_v2_model_runner:
         raise ValueError("DeepSeek V4 TurboQuant requires VLLM_USE_V2_MODEL_RUNNER=1")

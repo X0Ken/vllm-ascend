@@ -410,7 +410,9 @@ def _ascend_get_packed_kv_cache_groups(
             additional.get("enable_dsv41_kv_repack", False), "enable_dsv41_kv_repack"
         )
         grouped_specs = group_cache_specs(kv_cache_spec, repack=repack)
-        groups = make_cache_groups(grouped_specs)
+        # PD/CED 下 ring 的 compressor state 必须可外部传输（见
+        # cache_config.ring_transfer_enabled）；非 PD 时这个参数不改变输出。
+        groups = make_cache_groups(grouped_specs, vllm_config=vllm_config)
     else:
         grouped_specs = group_and_unify_kv_cache_specs(kv_cache_spec)
         if grouped_specs is None:
