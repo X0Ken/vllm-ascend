@@ -42,6 +42,12 @@ from vllm_ascend.core.kv_cache_interface import (
     get_storage_block_size,
 )
 from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.models.deepseek_v41.cache_config import (
+    a3_kv8_index_unpacked,
+    a3_kv_dtype,
+    kv_slot_format,
+    kv_slot_quant_mode,
+)
 from vllm_ascend.models.deepseek_v41.ced import (
     CED_REPLAY_TOKENS,
     received_replay_positions,
@@ -53,7 +59,13 @@ from vllm_ascend.ops.rope_dsv4 import (
     get_full_cos_and_sin_dsa_for_layer,
 )
 from vllm_ascend.ops.triton.c2_ring_metadata import build_c2_ring_metadata
-from vllm_ascend.ops.triton.v41_kv_norm_rope_cache import kv_norm_rope_cache, supports
+from vllm_ascend.ops.triton.v41_kv_norm_rope_cache import (
+    A3_FUSED_WRITE_ENABLED,
+    kv_norm_rope_cache,
+    kv_norm_rope_cache_quant,
+    supports,
+    supports_quant,
+)
 from vllm_ascend.utils import (
     get_potential_max_tokens,
     npu_stream_switch,
@@ -66,7 +78,100 @@ from vllm_ascend.worker.device_metadata import (
     wait_for_device_metadata,
 )
 
-V41_METADATA_BUFFER_SIZE = 1024
+# arch22 的 metadata AICPU 用 s2BaseSize_=512 时需要 2048；默认仍 1024 以保持基线逐字节不变。
+V41_METADATA_BUFFER_SIZE = int(__import__("os").environ.get("V41_METADATA_BUFFER_SIZE", "1024"))
+
+# QLI（quant_lightning_indexer）metadata 与 SMLA metadata 不是同一个算子族：
+#   * SMLA metadata（arch22 / 自定义 2048 实现）由 _smla_metadata 承接，走 V41_METADATA_BUFFER_SIZE；
+#   * QLI metadata 由系统 CANN 的 quant_lightning_indexer_metadata 产生，输出长度是
+#     cann_ops_transformer/csrc/attention/quant_lightning_indexer.cpp 的 QLI_V2_METADATA_SIZE=1024
+#     （A3 现网 mode1 实测同样返回 1024）。
+# 二者共用一个 buffer 尺寸时，把 V41_METADATA_BUFFER_SIZE 提到 2048 会让 QLI 的 copy_ 报
+# "size of tensor self [2048] must match the size of tensor src [1024]"（EZ1007）。
+# 因此 QLI 单独一个 knob，默认 1024（= 改动前行为，逐字节不变）。
+V41_QLI_METADATA_BUFFER_SIZE = int(
+    __import__("os").environ.get("V41_QLI_METADATA_BUFFER_SIZE", "1024")
+)
+
+# --- KV8 精度模拟（KV8_SIM=1 开启）------------------------------------------
+# NPU 不支持 float8_e4m3fn 的 cast（vector core exception），
+# 这里用纯算术模拟 E4M3 的尾数量化（3 位尾数 => 相对精度 2^-3）。
+_KV8_SIM = __import__("os").environ.get("KV8_SIM", "0") == "1"
+_KV8_SIM_GROUP = int(__import__("os").environ.get("KV8_SIM_GROUP", "64"))
+_KV8_SIM_STATE = {"printed": False, "n": 0}
+
+
+def _a3_fused_quant_qfmt(cache, flat_slots):
+    """A3 融合写侧：返回 record 格式名（fp8/int8/int8_mixed），None = 走原路径。
+
+    ``flat_slots`` 是 packed cache 的扁平槽位（build_packed_cache_slot_mapping 产出）。
+    未开量化 / 未开融合 / 槽位不是 544、608 时一律返回 None，退回逐 op 打包器，
+    因此默认行为（不设任何 A3 KV8 env）逐字节不变。
+    """
+    if flat_slots is None or not A3_FUSED_WRITE_ENABLED:
+        return None
+    if cache.dim() < 2 or int(cache.shape[-1]) not in (544, 608):
+        return None
+    qfmt = kv_slot_format(int(cache.shape[-1]))
+    return qfmt if qfmt in ("fp8", "int8", "int8_mixed") else None
+_KV8_STATS = __import__("os").environ.get("KV8_STATS", "0") == "1"
+_KV8_STATS_BUDGET = int(__import__("os").environ.get("KV8_STATS_N", "4"))
+_E4M3_MAX = 448.0
+_E4M3_MANT = 3
+
+
+def _fp8_mant_round(x):
+    """把 FP32 量化到 4 位有效数字（1 隐含 + 3 尾数）= E4M3 的相对精度。
+
+    纯位操作：FP32 布局 [31]=符号 [30:23]=指数 [22:0]=尾数。
+    保留高 3 位尾数 => 清掉低 20 位，并加 0x80000 做 round-half-up。
+    NPU 原生支持 int32 位运算，比 log2/pow 快 2 个数量级，
+    也比 frexp（NPU 不支持，会 fallback CPU）快得多。
+    """
+    xi = x.view(torch.int32)
+    xi = (xi + 0x00080000) & ~0x000FFFFF
+    return xi.view(torch.float32)
+def _kv8_sim_quant(x):
+    if x is not None and _KV8_STATS and _KV8_SIM_STATE["n"] < _KV8_STATS_BUDGET:
+        try:
+            xf = x.detach().float()
+            flat = xf.reshape(-1, xf.shape[-1] // 64, 64)
+            gmax = flat.abs().amax(-1)                       # 每组的 amax
+            ax = xf.abs().flatten()
+            q_ = torch.quantile(ax, torch.tensor([0.5, 0.99, 0.999, 0.9999], device=ax.device))
+            print(f"[KV8-STATS] shape={tuple(x.shape)} "
+                  f"amax={ax.max().item():.5f} med={q_[0].item():.6f} "
+                  f"p99={q_[1].item():.5f} p999={q_[2].item():.5f} p9999={q_[3].item():.5f} "
+                  f"amax/med={(ax.max()/q_[0].clamp_min(1e-12)).item():.1f} "
+                  f"grp_amax_med={gmax.median().item():.6f} grp_amax_max={gmax.max().item():.5f} "
+                  f"grp_ratio={(gmax.max()/gmax.median().clamp_min(1e-12)).item():.1f}", flush=True)
+            _KV8_SIM_STATE["n"] += 1
+        except Exception as exc:
+            print(f"[KV8-STATS] fail: {type(exc).__name__}: {exc}", flush=True)
+    if not _KV8_SIM or x is None:
+        return x
+    try:
+        d = x.shape[-1]
+        g = _KV8_SIM_GROUP
+        if d % g != 0:
+            return x
+        xg = x.reshape(-1, d // g, g).to(torch.float32)
+        amax = xg.abs().amax(-1, keepdim=True).clamp_min(1e-12)
+        scale = amax / _E4M3_MAX
+        norm = (xg / scale).clamp(-_E4M3_MAX, _E4M3_MAX)
+        q = _fp8_mant_round(norm) * scale
+        out = q.to(x.dtype).reshape(x.shape)
+        if not _KV8_SIM_STATE["printed"]:
+            _KV8_SIM_STATE["printed"] = True
+            print(f"[KV8-SIM] quantize cache KV shape={tuple(x.shape)} dtype={x.dtype} group={g}", flush=True)
+        _KV8_SIM_STATE["n"] += 1
+        return out
+    except Exception as exc:
+        if not _KV8_SIM_STATE["printed"]:
+            _KV8_SIM_STATE["printed"] = True
+            print(f"[KV8-SIM] disabled: {type(exc).__name__}: {exc}", flush=True)
+        return x
+# ---------------------------------------------------------------------------
 
 
 @eager_break_during_capture
@@ -361,9 +466,19 @@ class AscendDSAV41Impl:
 
     @staticmethod
     def _write_swa_cache(attn, metadata, value):
+        value = _kv8_sim_quant(value)
         cache = attn.dsa_attn.swa_cache_layer.kv_cache[0]
         backend = getattr(attn, "packed_cache_ops", None)
         if backend is not None:
+            flat_slots = metadata.flat_slot_mapping
+            rows = flat_slots[: value.shape[0]] if flat_slots is not None else None
+            qfmt = _a3_fused_quant_qfmt(cache, rows)
+            if qfmt is not None and supports_quant(value, None, None, rows, cache, normalize=False, rope=0):
+                # value 已是 post-RoPE BF16：量化+打包+写 cache 一个 kernel 完成
+                kv_norm_rope_cache_quant(
+                    value, None, None, None, rows, cache, qfmt=qfmt, normalize=False, rope=0
+                )
+                return
             backend.write_attention_cache(
                 cache,
                 metadata.flat_slot_mapping[: value.shape[0]],
@@ -552,7 +667,20 @@ class AscendDSAV41Impl:
             aux_stream.wait_event(part3_start)
             cache = attn.dsa_attn.swa_cache_layer.kv_cache[0]
             slots = swa_metadata.slot_mapping
-            if not write_cache_on_main and supports(kv, attn.kv_norm, kv_cos, kv_sin, slots, cache):
+            flat_slots = swa_metadata.flat_slot_mapping
+            rows = flat_slots[: kv.shape[0]] if flat_slots is not None else None
+            qfmt = _a3_fused_quant_qfmt(cache, rows)
+            if (
+                not write_cache_on_main
+                and qfmt is not None
+                and supports_quant(kv, kv_cos, kv_sin, rows, cache, normalize=False)
+            ):
+                # norm+rope+量化+打包：中间 BF16 不回 GM，一个 kernel 写完 record
+                kv_norm_rope_cache_quant(
+                    attn.kv_norm(kv), attn.kv_norm, kv_cos, kv_sin, rows, cache,
+                    qfmt=qfmt, normalize=False,
+                )
+            elif not write_cache_on_main and supports(kv, attn.kv_norm, kv_cos, kv_sin, slots, cache):
                 kv_norm_rope_cache(attn.kv_norm(kv), attn.kv_norm, kv_cos, kv_sin, slots, cache, normalize=False)
             else:
                 kv = attn.kv_norm(kv).view(-1, 1, attn.head_dim)
@@ -619,18 +747,35 @@ class AscendDSAV41Impl:
             source_sin,
         )
         latent = latent.view(-1, 1, attn.head_dim)
-        AscendDSAV41Impl._apply_rotary(attn, latent, source_cos, source_sin)
         backend = getattr(attn, "packed_cache_ops", None)
+        cache = attn.long_kv_cache.kv_cache[0]
+        flat_slots = compressor_metadata.cache.flat_slot_mapping
+        rows = flat_slots[: positions.shape[0]] if flat_slots is not None else None
+        qfmt = _a3_fused_quant_qfmt(cache, rows)
+        if (
+            backend is not None
+            and qfmt is not None
+            and supports_quant(
+                latent.view(-1, attn.head_dim), source_cos, source_sin, rows, cache, normalize=False
+            )
+        ):
+            # latent 是 pre-RoPE：rope+量化+打包 一个 kernel 完成（不落中间 BF16）
+            kv_norm_rope_cache_quant(
+                latent.view(-1, attn.head_dim), None, source_cos, source_sin, rows, cache,
+                qfmt=qfmt, normalize=False,
+            )
+            return
+        AscendDSAV41Impl._apply_rotary(attn, latent, source_cos, source_sin)
         if backend is not None:
             backend.write_attention_cache(
-                attn.long_kv_cache.kv_cache[0],
-                compressor_metadata.cache.flat_slot_mapping[: positions.shape[0]],
+                cache,
+                rows,
                 latent.squeeze(1),
                 kind="cmp",
             )
         else:
             scatter_cache_sk(
-                attn.long_kv_cache.kv_cache[0],
+                cache,
                 long_slots,
                 latent.squeeze(1),
             )
@@ -859,9 +1004,14 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
             raise TypeError(f"Unsupported V4.1 cache spec: {type(kv_cache_spec).__name__}")
         self._device_backend = DeviceOperator.get_dsv41_packed_cache_ops()
         self._uses_a5_packed_cache = self._device_backend is not None
+        # 解绑后 index_k/index_k_folded 层的 QLI metadata 必须由系统
+        # npu_quant_lightning_indexer_v2_metadata 产生，才能喂给系统的
+        # npu_quant_lightning_indexer_v3（int8 q/k + fp16 w/descale）。
+        self._index_system = a3_kv8_index_unpacked() and self._cache_kind in ("index_k", "index_k_folded")
         text_config = vllm_config.model_config.hf_text_config
         window_size = int(_config_value(text_config, "sliding_window", 0))
         query_metadata_size = V41_METADATA_BUFFER_SIZE if build_query_metadata else 0
+        qli_metadata_size = V41_QLI_METADATA_BUFFER_SIZE if build_query_metadata else 0
         compressor_tokens = max_tokens if build_compressor_metadata else 0
         compressor_reqs = max_reqs if build_compressor_metadata else 0
         self._slot_mapping = torch.full((max_tokens,), -1, dtype=torch.int64, device=device)
@@ -874,7 +1024,7 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
         self._cache_seq_lens = torch.zeros(max_reqs, dtype=torch.int32, device=device)
         self._cmp_residual = torch.zeros(max_reqs, dtype=torch.int32, device=device)
         self._smla_metadata = torch.zeros(query_metadata_size, dtype=torch.int32, device=device)
-        self._qli_metadata = torch.zeros(query_metadata_size, dtype=torch.int32, device=device)
+        self._qli_metadata = torch.zeros(qli_metadata_size, dtype=torch.int32, device=device)
         if self._supports_device_ops and self._uses_a5_packed_cache and self._cache_kind == "swa":
             self._a5_causal_swa_indices = torch.empty((max_tokens, 1, window_size), dtype=torch.int32, device=device)
             self._a5_causal_swa_lengths = torch.empty((max_tokens, 1), dtype=torch.int32, device=device)
@@ -1319,19 +1469,71 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                     return
                 length_rows = self._a5_smla_length_rows[:metadata_tokens]
                 assert self._device_backend is not None
-                value = self._device_backend.mixed_quant_sparse_flash_mla_metadata(
-                    length_rows,
-                    length_rows,
-                    cu_seqlens_q=common.query_start_loc[: num_reqs + 1].int().contiguous(),
-                    num_heads_q=64,
-                    num_heads_kv=1,
-                    head_dim=512,
-                    quant_mode=1,
-                    layout_q="TND",
-                    layout_kv="PA_BBND",
-                    has_ori_kv=True,
-                    has_cmp_kv=True,
-                )
+                cu_seqlens_q = common.query_start_loc[: num_reqs + 1].int().contiguous()
+                seqused_ori_kv = seq_lens[:num_reqs].int().contiguous()
+                # metadata 与 attention 必须同源：AICPU 核按 quant_mode 选
+                # s2BaseSize_ = quant_mode==3 ? 512 : 128（..._metadata/op_kernel_aicpu/
+                # ..._aicpu.cpp:444），mask/窗口/cmp_ratio 也会改 tiling。
+                a3_record = kv_slot_format(int(spec.head_size)) if a3_kv_dtype() is not None else None
+                if a3_record is None or a3_record == "turboquant":
+                    # A5 / A3+TurboQuant：保持原调用不变（quant_mode 恒 1，cmp 侧常开）。
+                    # 注：TurboQuant 的 attention 仍用 quant_mode=3，这条不一致**未修**：
+                    # mode3 metadata 强制要求 cmp_residual_kv（容器实测 EZ0037），
+                    # 且 TQ 的 long-KV 写侧本就 NotImplementedError。
+                    value = self._device_backend.mixed_quant_sparse_flash_mla_metadata(
+                        length_rows,
+                        length_rows,
+                        cu_seqlens_q=cu_seqlens_q,
+                        # PA_BBND 布局下 has_ori_kv=True 时 seqused_ori_kv 必传
+                        seqused_ori_kv=seqused_ori_kv,
+                        # 同理 has_cmp_kv=True + PA_BBND 时 seqused_cmp_kv 也必传
+                        seqused_cmp_kv=seqused_ori_kv,
+                        num_heads_q=64,
+                        num_heads_kv=1,
+                        head_dim=512,
+                        quant_mode=1,
+                        layout_q="TND",
+                        layout_kv="PA_BBND",
+                        has_ori_kv=True,
+                        has_cmp_kv=True,
+                    )
+                else:
+                    # A3 连续量化（fp8/int8/int8_mixed）：与 qsmla 同一套槽字节判据 +
+                    # 同一组 mask/窗口/ratio（qsmla 侧见 mixed_quant_attention.qsmla）。
+                    quant_mode = kv_slot_quant_mode(int(spec.head_size))
+                    value = self._device_backend.mixed_quant_sparse_flash_mla_metadata(
+                        None,  # ori_topk_length：BAND mask 直接给窗口，不需要 topk 长度
+                        None,  # cmp_topk_length
+                        cu_seqlens_q=cu_seqlens_q,
+                        seqused_ori_kv=seqused_ori_kv,
+                        seqused_cmp_kv=None,  # cmp 侧本阶段全部关闭
+                        num_heads_q=n_local_heads,
+                        num_heads_kv=1,
+                        head_dim=head_dim,
+                        quant_mode=quant_mode,
+                        layout_q="TND",
+                        layout_kv="PA_BBND",
+                        has_ori_kv=True,
+                        has_cmp_kv=False,
+                        # qsmla 侧恒为 BAND(4) + window-1/0
+                        ori_mask_mode=4,
+                        cmp_mask_mode=0,
+                        cmp_ratio=1,
+                        ori_win_left=ori_win_left,
+                        ori_win_right=0,
+                        ori_topk=0,
+                        cmp_topk=0,
+                        rope_head_dim=64,
+                    )
+                if value.numel() != self._a5_smla_metadata.numel():
+                    # CANN README（INT8/mode1 表）写 metadata 为 (2048,)，而 A3 现网
+                    # mode1 实测返回 (1024,)；换成新实例后若变 2048，这里会明确报错，
+                    # 而不是让 copy_ 抛一个没有上下文的 size mismatch。
+                    raise RuntimeError(
+                        f"SMLA metadata is {value.numel()} int32, buffer is "
+                        f"{self._a5_smla_metadata.numel()}; 若新 CANN 实例返回 2048 需要同步"
+                        " V41_METADATA_BUFFER_SIZE"
+                    )
                 self._a5_smla_metadata.copy_(value)
 
             smla_metadata = self._publish_task(
@@ -1395,7 +1597,7 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
         if self._build_query_metadata and self._supports_device_ops and cache_kind == "index_k":
             residual = cmp_residual_buffer
 
-            if self._uses_a5_packed_cache:
+            if self._uses_a5_packed_cache and not self._index_system:
                 candidate_source = int(_config_value(text_config, "candidate_source_layer_id", -1))
                 ratios = _config_value(text_config, "compress_ratios")
                 emits_candidates = (
@@ -1424,6 +1626,8 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                         num_heads_k=1,
                         head_dim=int(_config_value(text_config, "index_head_dim")),
                         topk=index_topk,
+                        # QLI 的量化模式和 SMLA 不同：这里要 2
+                        quant_mode=2,
                         mask_mode=3,
                         cmp_ratio=ratio,
                         layout_q="TND",
