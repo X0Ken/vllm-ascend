@@ -51,6 +51,17 @@ class BaseDeviceAdaptor:
     @staticmethod
     def get_dsv41_packed_cache_ops() -> type["MixedQuantPackedCacheOps"] | None:
         """Return the packed-cache ABI implementation, or use standard caches."""
+        # 与 cache_config.uses_a5_packed_cache() 用**同一个**判据：否则只设
+        # VLLM_ASCEND_A3_KV_QUANT=fp8 时 cache 规格变 544B，但写侧仍走 A5 的
+        # bf16 scatter → 直接写坏 cache（且不报错）。
+        from vllm_ascend.models.deepseek_v41.cache_config import is_a3_soft_kv8
+
+        if is_a3_soft_kv8():
+            from vllm_ascend.models.deepseek_v41.mixed_quant_attention import (
+                MixedQuantPackedCacheOpsA3,
+            )
+
+            return MixedQuantPackedCacheOpsA3
         return None
 
     @staticmethod

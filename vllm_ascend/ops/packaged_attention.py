@@ -19,12 +19,109 @@ from importlib import import_module
 import torch
 
 
+class _A3NoDslOpsFallback:
+    """A3 没有 net native wheel 的顶层 ``ops`` DSL 包时的兜底实现。
+
+    签名对齐 DSL 版（同一个 dispatcher 契约），内部转调 cann_ops_transformer 的
+    torch.ops 实现；DSL 版多返回的两个 candidate 输出用空 int32 张量补齐
+    （A3 tiny 不开 candidate，candidate_topk_blocks<0）。
+    """
+
+    def __init__(self, name: str):
+        self._name = name
+        self._op = getattr(torch.ops.cann_ops_transformer, name)
+
+    def __call__(
+        self,
+        q,
+        k,
+        w,
+        descale_q,
+        descale_k,
+        topk,
+        quant_mode,
+        *,
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+        seqused_q=None,
+        seqused_k=None,
+        cmp_residual_k=None,
+        block_table=None,
+        output_idx_offset=None,
+        metadata=None,
+        max_seqlen_q=-1,
+        max_seqlen_k=-1,
+        mask_mode=0,
+        cmp_ratio=1,
+        layout_q="TND",
+        layout_k="TND",
+        return_value=False,
+        candidate_topk_blocks=-1,
+        candidate_block_size=-1,
+    ):
+        want_candidates = (
+            candidate_topk_blocks is not None
+            and isinstance(candidate_topk_blocks, int)
+            and candidate_topk_blocks > 0
+        )
+        indices, values = self._op(
+            q,
+            k,
+            w,
+            descale_q,
+            descale_k,
+            topk,
+            quant_mode,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=seqused_k,
+            cmp_residual_k=cmp_residual_k,
+            block_table=block_table,
+            metadata=metadata,
+            max_seqlen_q=max_seqlen_q,
+            layout_q=layout_q,
+            layout_k=layout_k,
+            mask_mode=mask_mode,
+            cmp_ratio=cmp_ratio,
+            return_value=int(bool(return_value)),
+        )
+        if not want_candidates:
+            empty = torch.empty((0,), dtype=torch.int32, device=q.device)
+            return indices, values, empty, empty
+
+        # A3 没有 candidate 输出实现：给「全量块」桩（见文件头说明）。
+        n_tok = int(q.shape[0])
+        k = int(candidate_topk_blocks)
+        blk = int(candidate_block_size) if candidate_block_size and candidate_block_size > 0 else 1
+        if seqused_k is not None and seqused_k.numel() > 0:
+            nblk = ((seqused_k.reshape(-1).to(torch.int64) + blk - 1) // blk).clamp(max=k).to(torch.int32)
+            if nblk.numel() < n_tok:
+                pad = torch.full((n_tok - nblk.numel(),), k, dtype=torch.int32, device=nblk.device)
+                nblk = torch.cat([nblk, pad])
+            cand_len = nblk[:n_tok].view(n_tok, 1).contiguous()
+        else:
+            cand_len = torch.full((n_tok, 1), k, dtype=torch.int32, device=q.device)
+        cand_ids = (
+            torch.arange(k, dtype=torch.int32, device=q.device)
+            .view(1, 1, -1)
+            .expand(n_tok, 1, -1)
+            .contiguous()
+        )
+        return indices, values, cand_ids, cand_len
+
+
 @cache
 def _get_dsl_ops(name: str):
     """Load matching compute and metadata APIs from the operator package."""
     suffix = "_dsl" if name in ("quant_lightning_indexer", "quant_sparse_lightning_indexer") else ""
-    compute = import_module(f"ops.{name}{suffix}")
-    metadata = import_module(f"ops.{name}_metadata{suffix}")
+    try:
+        compute = import_module(f"ops.{name}{suffix}")
+        metadata = import_module(f"ops.{name}_metadata{suffix}")
+    except ModuleNotFoundError:
+        # A3 镜像不带 net native wheel 的顶层 ops 包（见 _A3NoDslOpsFallback 注释）。
+        return (
+            _A3NoDslOpsFallback(name),
+            getattr(torch.ops.cann_ops_transformer, f"{name}_metadata"),
+        )
     return getattr(compute, name), getattr(metadata, f"{name}_metadata")
 
 

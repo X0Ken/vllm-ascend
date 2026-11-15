@@ -546,11 +546,50 @@ def build_layer_plan(config: Any) -> DeepseekV41Topology:
 
     ratios = ratios[:num_layers]
 
+    # --- topology fail-fast -------------------------------------------------
+    # 搬回旧基线 vllm-ascend-v41-base/vllm_ascend/models/deepseek_v41/model.py
+    # 的 source 校验（旧版 :134-173）。容器版曾整段丢掉这些检查：若
+    # kv_source_layer_ids 被误改（例如把 20 换成 21），层 20 会被
+    # _latest_source 静默解析成 14（ratio 2），ratio-1 的 query 去读 ratio-2
+    # 的 cache（2048 行 vs 4096 行），到运行期才炸或算错。
+    if num_layers <= 0:
+        raise ValueError("DeepSeek V4.1 num_hidden_layers must be positive")
+    if len(config.compress_ratios) < num_layers:
+        raise ValueError(
+            "DeepSeek V4.1 compress_ratios must cover every backbone layer: "
+            f"got {len(config.compress_ratios)} ratios for {num_layers} layers"
+        )
+    if any(ratio not in (0, 1, 2) for ratio in ratios):
+        raise ValueError(f"DeepSeek V4.1 backbone only supports compression ratios 0, 1 and 2; got {ratios}")
+    for name, sources in (("kv_source_layer_ids", kv_sources), ("index_source_layer_ids", index_sources)):
+        # 1) 升序且唯一：_latest_source 是「从后往前找第一个 ≤ n」，
+        #    列表乱序会静默选错 source。
+        if tuple(sorted(set(sources))) != sources:
+            raise ValueError(f"DeepSeek V4.1 {name} must be sorted and unique")
+        # 2) 不越界：越界的 source 在规划里不可见（_latest_source 会忽略），
+        #    但 is_kv_source 仍会是 True，配置与拓扑对不上。
+        if any(source < 0 or source >= num_layers for source in sources):
+            raise ValueError(f"DeepSeek V4.1 {name} contains a layer outside the backbone")
+        # 3) source 必须是长上下文层：ratio 0 的层没有压缩 KV 可共享。
+        if any(ratios[source] == 0 for source in sources):
+            raise ValueError(f"DeepSeek V4.1 {name} cannot point to a local-only layer")
+
     engram_slots = {layer_idx: slot for slot, layer_idx in enumerate(engram_layers)}
     roles: list[DeepseekV41LayerRole] = []
     for layer_idx, ratio in enumerate(ratios):
         kv_source = _latest_source(layer_idx, kv_sources) if ratio else None
         index_source = _latest_source(layer_idx, index_sources) if ratio else None
+        # 4a) 每个 ratio>0 的层都必须解析出 source。
+        if ratio and (kv_source is None or index_source is None):
+            raise ValueError(
+                f"DeepSeek V4.1 layer {layer_idx} has long-context attention but no source layer"
+            )
+        # 4b) source 的压缩比必须与消费者一致：ratio-1 的层不能读 ratio-2 的 cache。
+        if kv_source is not None and ratios[kv_source] != ratio:
+            raise ValueError(
+                f"DeepSeek V4.1 layer {layer_idx} has ratio {ratio}, but its KV source "
+                f"layer {kv_source} has ratio {ratios[kv_source]}"
+            )
 
         roles.append(
             DeepseekV41LayerRole(

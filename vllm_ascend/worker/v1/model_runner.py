@@ -180,6 +180,7 @@ from vllm_ascend.model_executor.offloader import create_offloader
 from vllm_ascend.models.deepseek_v41.cache_config import (
     get_deepseek_v41_cache_offsets,
     is_deepseek_v41_cache,
+    is_ring_state_spec,
 )
 from vllm_ascend.models.glm5next.cache_views import view_glm5_next_cache
 from vllm_ascend.models.glm5next.kv_cache import is_glm5_next_cache_spec
@@ -5914,8 +5915,18 @@ class NPUModelRunner(GPUModelRunner):
                 if layer_name in layer_tuple_strides:
                     block_stride = layer_tuple_strides[layer_name]
                     initial_offset = layer_tuple_offsets[layer_name]
+                    # ring 摘出池后有自己的 tensor（max_num_seqs+1 页），页数由
+                    # 自己那份 backing 决定，不能再用主池的 num_blocks
+                    # （否则会开出 num_blocks 页的视图，等于没省）。
+                    layer_num_blocks = kv_cache_config.num_blocks
+                    if is_ring_state_spec(current_kv_cache_spec):
+                        layer_num_blocks = int(kv_cache_raw_tensors[layer_name].numel()) // int(block_stride)
+                        if layer_num_blocks < 1:
+                            raise ValueError(
+                                "out-of-pool compressor ring backing is smaller than one page"
+                            )
                     kv_cache_shape = attn_backend.get_kv_cache_shape(
-                        kv_cache_config.num_blocks,
+                        layer_num_blocks,
                         get_storage_block_size(current_kv_cache_spec),
                         current_kv_cache_spec.num_kv_heads,
                         current_kv_cache_spec.head_size,
@@ -5929,7 +5940,7 @@ class NPUModelRunner(GPUModelRunner):
                     if is_index:
                         kv_cache_shape_list.append(
                             attn_backend.get_kv_cache_shape(
-                                kv_cache_config.num_blocks,
+                                layer_num_blocks,
                                 get_storage_block_size(current_kv_cache_spec),
                                 current_kv_cache_spec.num_kv_heads,
                                 current_kv_cache_spec.scale_dim,
